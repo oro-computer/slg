@@ -28,10 +28,12 @@ import {
   DT_LNK,
   DT_REG,
   DT_UNKNOWN,
+  ENOTDIR,
   MAP_FAILED,
   MAP_PRIVATE,
   PROT_READ,
   closedir,
+  errno,
   memchr,
   mmap,
   munmap,
@@ -111,6 +113,14 @@ fn stats_init () -> Stats {
   };
 }
 
+fn stats_add (mut a: &Stats, b: &Stats) -> void {
+  a.files_total = a.files_total + b.files_total;
+  a.files_searched = a.files_searched + b.files_searched;
+  a.files_matched = a.files_matched + b.files_matched;
+  a.match_lines = a.match_lines + b.match_lines;
+  a.errors = a.errors + b.errors;
+}
+
 /**
  * Cross-cutting runtime knobs for the engine.
  *
@@ -132,10 +142,7 @@ fn lock_maybe (lock: std::sync::MutexBorrow?) -> void {
   if lock == None {
     return;
   }
-  let m: std::sync::MutexBorrow = match (lock) {
-    Some(v) => v,
-    None => std::sync::Mutex.invalid().borrow(),
-  };
+  let m: std::sync::MutexBorrow = lock ?? std::sync::Mutex.invalid().borrow();
   let _ = m.lock();
 }
 
@@ -143,10 +150,7 @@ fn unlock_maybe (lock: std::sync::MutexBorrow?) -> void {
   if lock == None {
     return;
   }
-  let m: std::sync::MutexBorrow = match (lock) {
-    Some(v) => v,
-    None => std::sync::Mutex.invalid().borrow(),
-  };
+  let m: std::sync::MutexBorrow = lock ?? std::sync::Mutex.invalid().borrow();
   let _ = m.unlock();
 }
 
@@ -158,20 +162,20 @@ fn flush_locked (mut w: &Writer, lock: std::sync::MutexBorrow?) -> bool {
 }
 
 fn cancel_is_set (io: &IO) -> bool {
-  return match (io.cancel) {
-    Some(t) => t.is_cancelled(),
-    None => false,
-  };
+  if io.cancel == None {
+    return false;
+  }
+  let t: std::sync::CancellationTokenBorrow =
+    io.cancel ?? std::sync::CancellationToken.invalid().borrow();
+  return t.is_cancelled();
 }
 
 fn cancel_set (io: &IO) -> void {
   if io.cancel == None {
     return;
   }
-  let t: std::sync::CancellationTokenBorrow = match (io.cancel) {
-    Some(v) => v,
-    None => std::sync::CancellationToken.invalid().borrow(),
-  };
+  let t: std::sync::CancellationTokenBorrow =
+    io.cancel ?? std::sync::CancellationToken.invalid().borrow();
   t.cancel();
 }
 
@@ -316,10 +320,7 @@ fn append_match_line (
     if m_opt == None {
       break;
     }
-    let m: Match = match (m_opt) {
-      Some(v) => v,
-      None => Match{ start: 0, end: 0 },
-    };
+    let m: Match = m_opt ?? Match{ start: 0, end: 0 };
     if m.start < off {
       break;
     }
@@ -407,7 +408,13 @@ fn search_file (cfg: &Config, p: &Pattern, path: string, io: &IO, mut out: &Writ
   }
 
   let size: i64 = std::runtime::posix::fs::lseek(fd, 0, std::runtime::posix::fs::SEEK_END);
-  if size <= 0 {
+  if size < 0 {
+    stats.errors = stats.errors + 1;
+    write_error(mut err, io, path, "failed to read file size");
+    let _ = std::runtime::posix::fs::close(fd);
+    return outcome_none();
+  }
+  if size == 0 {
     let _ = std::runtime::posix::fs::close(fd);
     return outcome_none();
   }
@@ -464,10 +471,7 @@ fn search_file (cfg: &Config, p: &Pattern, path: string, io: &IO, mut out: &Writ
     let line: string = std::runtime::mem::string_from_ptr_len(line_ptr, line_len as int);
     let first_opt: Match? = next_match(p, line, 0);
     if first_opt != None {
-      let first: Match = match (first_opt) {
-        Some(v) => v,
-        None => Match{ start: 0, end: 0 },
-      };
+      let first: Match = first_opt ?? Match{ start: 0, end: 0 };
       matched_in_file = true;
       stats.match_lines = stats.match_lines + 1;
       match_lines_in_file = match_lines_in_file + 1;
@@ -533,6 +537,14 @@ fn walk_dir_files (cfg: &Config, open_path: string, io: &IO, mut path: &PathBuf,
 
   let dir: u64 = opendir(open_path);
   if dir == 0 {
+    let e: int = errno();
+    if e == ENOTDIR {
+      stats.files_total = stats.files_total + 1;
+      list_file(open_path, io, mut out);
+      return;
+    }
+    stats.errors = stats.errors + 1;
+    write_error(mut err, io, open_path, "failed to open directory");
     return;
   }
 
@@ -593,7 +605,13 @@ fn walk_dir_files (cfg: &Config, open_path: string, io: &IO, mut path: &PathBuf,
           let _ = closedir(tmp);
           is_dir = true;
         } else {
-          is_file = true;
+          let e: int = errno();
+          if e == ENOTDIR {
+            is_file = true;
+          } else {
+            stats.errors = stats.errors + 1;
+            write_error(mut err, io, child_path, "failed to open directory");
+          }
         }
       }
     } else if dtype == DT_UNKNOWN {
@@ -602,7 +620,13 @@ fn walk_dir_files (cfg: &Config, open_path: string, io: &IO, mut path: &PathBuf,
         let _ = closedir(tmp);
         is_dir = true;
       } else {
-        is_file = true;
+        let e: int = errno();
+        if e == ENOTDIR {
+          is_file = true;
+        } else {
+          stats.errors = stats.errors + 1;
+          write_error(mut err, io, child_path, "failed to open directory");
+        }
       }
     }
 
@@ -631,6 +655,13 @@ fn walk_dir_search (cfg: &Config, p: &Pattern, open_path: string, io: &IO, mut p
 
   let dir: u64 = opendir(open_path);
   if dir == 0 {
+    let e: int = errno();
+    if e == ENOTDIR {
+      stats.files_total = stats.files_total + 1;
+      return search_file(cfg, p, open_path, io, mut out, mut err, mut stats);
+    }
+    stats.errors = stats.errors + 1;
+    write_error(mut err, io, open_path, "failed to open directory");
     return outcome_none();
   }
 
@@ -694,7 +725,13 @@ fn walk_dir_search (cfg: &Config, p: &Pattern, open_path: string, io: &IO, mut p
           let _ = closedir(tmp);
           is_dir = true;
         } else {
-          is_file = true;
+          let e: int = errno();
+          if e == ENOTDIR {
+            is_file = true;
+          } else {
+            stats.errors = stats.errors + 1;
+            write_error(mut err, io, child_path, "failed to open directory");
+          }
         }
       }
     } else if dtype == DT_UNKNOWN {
@@ -703,7 +740,13 @@ fn walk_dir_search (cfg: &Config, p: &Pattern, open_path: string, io: &IO, mut p
         let _ = closedir(tmp);
         is_dir = true;
       } else {
-        is_file = true;
+        let e: int = errno();
+        if e == ENOTDIR {
+          is_file = true;
+        } else {
+          stats.errors = stats.errors + 1;
+          write_error(mut err, io, child_path, "failed to open directory");
+        }
       }
     }
 
@@ -749,8 +792,14 @@ fn handle_root_files (cfg: &Config, root: string, io: &IO, mut out: &Writer, mut
   }
   let dir: u64 = opendir(open_root);
   if dir == 0 {
-    stats.files_total = stats.files_total + 1;
-    list_file(open_root, io, mut out);
+    let e: int = errno();
+    if e == ENOTDIR {
+      stats.files_total = stats.files_total + 1;
+      list_file(open_root, io, mut out);
+      return;
+    }
+    stats.errors = stats.errors + 1;
+    write_error(mut err, io, open_root, "failed to open directory");
     return;
   }
   let _ = closedir(dir);
@@ -781,8 +830,14 @@ fn handle_root_search (cfg: &Config, p: &Pattern, root: string, io: &IO, mut out
   }
   let dir: u64 = opendir(open_root);
   if dir == 0 {
-    stats.files_total = stats.files_total + 1;
-    return search_file(cfg, p, open_root, io, mut out, mut err, mut stats);
+    let e: int = errno();
+    if e == ENOTDIR {
+      stats.files_total = stats.files_total + 1;
+      return search_file(cfg, p, open_root, io, mut out, mut err, mut stats);
+    }
+    stats.errors = stats.errors + 1;
+    write_error(mut err, io, open_root, "failed to open directory");
+    return outcome_none();
   }
   let _ = closedir(dir);
 
@@ -869,10 +924,16 @@ task fn worker_search_subtree (cfg: Config, pat_s: string, start_depth: int, mut
   var stop: bool = false;
 
   if dir == 0 {
-    stats.files_total = stats.files_total + 1;
-    let o: Outcome = search_file(cfg, &pat, open_path, &io, mut out, mut err, mut stats);
-    if o.found { found_any = true; }
-    if o.stop { found_any = true; stop = true; }
+    let e: int = errno();
+    if e == ENOTDIR {
+      stats.files_total = stats.files_total + 1;
+      let o: Outcome = search_file(cfg, &pat, open_path, &io, mut out, mut err, mut stats);
+      if o.found { found_any = true; }
+      if o.stop { found_any = true; stop = true; }
+    } else {
+      stats.errors = stats.errors + 1;
+      write_error(mut err, &io, open_path, "failed to open directory");
+    }
   } else {
     let _ = closedir(dir);
     let o: Outcome = walk_dir_search(cfg, &pat, open_path, &io, mut path, start_depth, mut out, mut err, mut stats);
@@ -892,6 +953,44 @@ task fn worker_search_subtree (cfg: Config, pat_s: string, start_depth: int, mut
   return WorkerResult{ stats: stats, found_any: found_any, stop: stop };
 }
 
+task fn worker_list_subtree (cfg: Config, start_depth: int, mut path: PathBuf, io: IO) -> WorkerResult {
+  let mut stats: Stats = stats_init();
+
+  let cm: ColorMode = color_mode_from_code(cfg.color_mode);
+  let stdout_color: bool = color_enabled(cm, FD_STDOUT);
+  let stderr_color: bool = color_enabled(cm, FD_STDERR);
+
+  let out_opt: Writer? = Writer.stdout(stdout_color, 16384);
+  if out_opt == None {
+    stats.errors = stats.errors + 1;
+    return WorkerResult{ stats: stats, found_any: false, stop: false };
+  }
+  let mut out: Writer = match (out_opt) {
+    Some(v) => v,
+    None => Writer{ fd: -1, color: false, buf: BufferU8.empty() },
+  };
+
+  let err_opt: Writer? = Writer.stderr(stderr_color, 8192);
+  if err_opt == None {
+    stats.errors = stats.errors + 1;
+    out.drop();
+    return WorkerResult{ stats: stats, found_any: false, stop: false };
+  }
+  let mut err: Writer = match (err_opt) {
+    Some(v) => v,
+    None => Writer{ fd: -1, color: false, buf: BufferU8.empty() },
+  };
+
+  let open_path: string = path.as_string();
+  walk_dir_files(cfg, open_path, &io, mut path, start_depth, mut out, mut err, mut stats);
+
+  out.drop();
+  err.drop();
+  path.drop();
+
+  return WorkerResult{ stats: stats, found_any: false, stop: false };
+}
+
 fn resolve_jobs (cfg: &Config) -> int {
   if cfg.jobs > 0 {
     return cfg.jobs;
@@ -902,11 +1001,22 @@ fn resolve_jobs (cfg: &Config) -> int {
   return n;
 }
 
-fn clamp_workers (jobs: int) -> int {
+fn clamp_workers (cfg: &Config, jobs: int) -> int {
   // `jobs` counts the orchestrator + worker tasks.
-  // We clamp to a small number because `task fn` calls currently spawn OS
-  // threads in the hosted subset (no global work-stealing pool yet).
-  let max_workers: int = 8;
+  //
+  // Notes:
+  // - `task fn` calls currently spawn OS threads in the hosted subset (no
+  //   global work-stealing pool yet).
+  // - `cfg.max_workers == 0` means “no cap” (within current implementation
+  //   limits).
+  let max_worker_slots: int = 32;
+  var max_workers: int = cfg.max_workers;
+  if max_workers <= 0 {
+    max_workers = max_worker_slots;
+  }
+  if max_workers > max_worker_slots {
+    max_workers = max_worker_slots;
+  }
   if jobs <= 1 { return 0; }
   let w: int = jobs - 1;
   if w <= 0 { return 0; }
@@ -924,14 +1034,15 @@ fn clamp_workers (jobs: int) -> int {
  * - Output is serialized with a mutex to avoid interleaving.
  */
 export async fn run_parallel (cfg: Config) -> int {
-  if cfg.mode == Mode::Files {
+  let mode: Mode = cfg.mode;
+  if mode == Mode::Files && !cfg.parallel_files {
     // `--files` is already I/O-bound and output-heavy; keep the simple
-    // single-threaded walk for now.
+    // single-threaded walk unless explicitly requested.
     return run(cfg);
   }
 
   let jobs: int = resolve_jobs(cfg);
-  let worker_budget: int = clamp_workers(jobs);
+  let worker_budget: int = clamp_workers(&cfg, jobs);
   if worker_budget <= 0 {
     return run(cfg);
   }
@@ -947,10 +1058,10 @@ export async fn run_parallel (cfg: Config) -> int {
   }
   let lock: std::sync::MutexBorrow = out_mutex.borrow();
 
-  // Quiet-mode cancellation.
+  // Quiet-mode cancellation (search mode only).
   let mut cancel_tok: std::sync::CancellationToken = std::sync::CancellationToken.invalid();
   var cancel_borrow: std::sync::CancellationTokenBorrow? = None;
-  if cfg.quiet {
+  if cfg.quiet && mode != Mode::Files {
     let t_r: std::sync::CancellationTokenResult = std::sync::CancellationToken.init();
     cancel_tok = match (t_r) {
       Ok(v) => v,
@@ -986,24 +1097,27 @@ export async fn run_parallel (cfg: Config) -> int {
 
   // Stats + task handles.
   let start_ns_opt: i64? = std::runtime::posix::time::monotonic_now_ns();
-  let start_ns: i64 = match (start_ns_opt) { Some(v) => v, None => 0 };
+  let start_ns: i64 = start_ns_opt ?? 0;
 
   let mut stats: Stats = stats_init();
   var found_any: bool = false;
 
-  // Pattern compilation for the orchestrator thread.
-  let pat_s: string = match (cfg.pattern) { Some(v) => v, None => "" };
-  let pr: PatternResult = compile_pattern(pat_s, cfg.fixed_string, cfg.ignore_case);
-  let pat_opt: Pattern? = match pr {
-    Ok(v) => Some(move v),
-    Err(e) => pattern_compile_error(mut err, &io, mut stats, e),
-  };
-  if pat_opt == None {
-    out.drop();
-    err.drop();
-    out_mutex.drop();
-    cancel_tok.drop();
-    return 2;
+  let pat_s: string = cfg.pattern ?? "";
+  var pat_opt: Pattern? = None;
+  if mode == Mode::Search {
+    // Pattern compilation for the orchestrator thread.
+    let pr: PatternResult = compile_pattern(pat_s, cfg.fixed_string, cfg.ignore_case);
+    pat_opt = match pr {
+      Ok(v) => Some(move v),
+      Err(e) => pattern_compile_error(mut err, &io, mut stats, e),
+    };
+    if pat_opt == None {
+      out.drop();
+      err.drop();
+      out_mutex.drop();
+      cancel_tok.drop();
+      return 2;
+    }
   }
   let mut pat: Pattern = match (pat_opt) {
     Some(v) => move v,
@@ -1019,6 +1133,30 @@ export async fn run_parallel (cfg: Config) -> int {
   var t5: Task(WorkerResult)? = None;
   var t6: Task(WorkerResult)? = None;
   var t7: Task(WorkerResult)? = None;
+  var t8: Task(WorkerResult)? = None;
+  var t9: Task(WorkerResult)? = None;
+  var t10: Task(WorkerResult)? = None;
+  var t11: Task(WorkerResult)? = None;
+  var t12: Task(WorkerResult)? = None;
+  var t13: Task(WorkerResult)? = None;
+  var t14: Task(WorkerResult)? = None;
+  var t15: Task(WorkerResult)? = None;
+  var t16: Task(WorkerResult)? = None;
+  var t17: Task(WorkerResult)? = None;
+  var t18: Task(WorkerResult)? = None;
+  var t19: Task(WorkerResult)? = None;
+  var t20: Task(WorkerResult)? = None;
+  var t21: Task(WorkerResult)? = None;
+  var t22: Task(WorkerResult)? = None;
+  var t23: Task(WorkerResult)? = None;
+  var t24: Task(WorkerResult)? = None;
+  var t25: Task(WorkerResult)? = None;
+  var t26: Task(WorkerResult)? = None;
+  var t27: Task(WorkerResult)? = None;
+  var t28: Task(WorkerResult)? = None;
+  var t29: Task(WorkerResult)? = None;
+  var t30: Task(WorkerResult)? = None;
+  var t31: Task(WorkerResult)? = None;
 
   // Walk roots, spawning workers for top-level subdirectories.
   let n: int = cfg.path_count();
@@ -1036,10 +1174,7 @@ export async fn run_parallel (cfg: Config) -> int {
     var root: string = ".";
     if n > 0 {
       let root_opt: string? = cfg.path_at(root_i);
-      root = match (root_opt) {
-        Some(v) => v,
-        None => ".",
-      };
+      root = root_opt ?? ".";
     }
 
     var open_root: string = root;
@@ -1047,11 +1182,23 @@ export async fn run_parallel (cfg: Config) -> int {
 
     let dir: u64 = opendir(open_root);
     if dir == 0 {
-      // Root is a file.
-      stats.files_total = stats.files_total + 1;
-      let o: Outcome = search_file(cfg, &pat, open_root, &io, mut out, mut err, mut stats);
-      if o.found { found_any = true; }
-      if o.stop { found_any = true; cancel_set(&io); break; }
+      let e: int = errno();
+      if e == ENOTDIR {
+        // Root is a file.
+        stats.files_total = stats.files_total + 1;
+        if mode == Mode::Files {
+          list_file(open_root, &io, mut out);
+        } else {
+          let o: Outcome = search_file(cfg, &pat, open_root, &io, mut out, mut err, mut stats);
+          if o.found { found_any = true; }
+          if o.stop { found_any = true; cancel_set(&io); break; }
+        }
+        root_i = root_i + 1;
+        continue;
+      }
+
+      stats.errors = stats.errors + 1;
+      write_error(mut err, &io, open_root, "failed to open directory");
       root_i = root_i + 1;
       continue;
     }
@@ -1117,7 +1264,13 @@ export async fn run_parallel (cfg: Config) -> int {
             let _ = closedir(tmp);
             is_dir = true;
           } else {
-            is_file = true;
+            let e: int = errno();
+            if e == ENOTDIR {
+              is_file = true;
+            } else {
+              stats.errors = stats.errors + 1;
+              write_error(mut err, &io, child_path, "failed to open directory");
+            }
           }
         }
       } else if dtype == DT_UNKNOWN {
@@ -1126,7 +1279,13 @@ export async fn run_parallel (cfg: Config) -> int {
           let _ = closedir(tmp);
           is_dir = true;
         } else {
-          is_file = true;
+          let e: int = errno();
+          if e == ENOTDIR {
+            is_file = true;
+          } else {
+            stats.errors = stats.errors + 1;
+            write_error(mut err, &io, child_path, "failed to open directory");
+          }
         }
       }
 
@@ -1137,46 +1296,94 @@ export async fn run_parallel (cfg: Config) -> int {
         } else {
           let has_slot: bool =
             t0 == None || t1 == None || t2 == None || t3 == None ||
-            t4 == None || t5 == None || t6 == None || t7 == None;
+            t4 == None || t5 == None || t6 == None || t7 == None ||
+            t8 == None || t9 == None || t10 == None || t11 == None ||
+            t12 == None || t13 == None || t14 == None || t15 == None ||
+            t16 == None || t17 == None || t18 == None || t19 == None ||
+            t20 == None || t21 == None || t22 == None || t23 == None ||
+            t24 == None || t25 == None || t26 == None || t27 == None ||
+            t28 == None || t29 == None || t30 == None || t31 == None;
           if budget > 0 && has_slot {
-          let child_r: PathBufResult = std::path::PathBuf.from_string(child_path);
-          if child_r.is_err() {
-            stats.errors = stats.errors + 1;
-            write_error(mut err, &io, child_path, "out of memory");
-          } else {
-            let child_pb: PathBuf = match (child_r) { PathBufResult::Ok(v) => v, PathBufResult::Err(_) => PathBuf{ ptr: 0, cap: 0, len: 0 } };
-            let task_h: Task(WorkerResult) = worker_search_subtree(cfg, pat_s, next_depth, child_pb, io);
-
-            var stored: bool = false;
-            if t0 == None { t0 = Some(move task_h); stored = true; }
-            else if t1 == None { t1 = Some(move task_h); stored = true; }
-            else if t2 == None { t2 = Some(move task_h); stored = true; }
-            else if t3 == None { t3 = Some(move task_h); stored = true; }
-            else if t4 == None { t4 = Some(move task_h); stored = true; }
-            else if t5 == None { t5 = Some(move task_h); stored = true; }
-            else if t6 == None { t6 = Some(move task_h); stored = true; }
-            else if t7 == None { t7 = Some(move task_h); stored = true; }
-
-            if stored {
-              budget = budget - 1;
+            let child_r: PathBufResult = std::path::PathBuf.from_string(child_path);
+            if child_r.is_err() {
+              stats.errors = stats.errors + 1;
+              write_error(mut err, &io, child_path, "out of memory");
             } else {
-              // No slot available; fall back to synchronous recursion.
+              let child_pb: PathBuf = match (child_r) {
+                PathBufResult::Ok(v) => v,
+                PathBufResult::Err(_) => PathBuf{ ptr: 0, cap: 0, len: 0 },
+              };
+              let task_h: Task(WorkerResult) = match (mode) {
+                Mode::Files => worker_list_subtree(cfg, next_depth, child_pb, io),
+                Mode::Search => worker_search_subtree(cfg, pat_s, next_depth, child_pb, io),
+              };
+
+              var stored: bool = false;
+              if t0 == None { t0 = Some(move task_h); stored = true; }
+              else if t1 == None { t1 = Some(move task_h); stored = true; }
+              else if t2 == None { t2 = Some(move task_h); stored = true; }
+              else if t3 == None { t3 = Some(move task_h); stored = true; }
+              else if t4 == None { t4 = Some(move task_h); stored = true; }
+              else if t5 == None { t5 = Some(move task_h); stored = true; }
+              else if t6 == None { t6 = Some(move task_h); stored = true; }
+              else if t7 == None { t7 = Some(move task_h); stored = true; }
+              else if t8 == None { t8 = Some(move task_h); stored = true; }
+              else if t9 == None { t9 = Some(move task_h); stored = true; }
+              else if t10 == None { t10 = Some(move task_h); stored = true; }
+              else if t11 == None { t11 = Some(move task_h); stored = true; }
+              else if t12 == None { t12 = Some(move task_h); stored = true; }
+              else if t13 == None { t13 = Some(move task_h); stored = true; }
+              else if t14 == None { t14 = Some(move task_h); stored = true; }
+              else if t15 == None { t15 = Some(move task_h); stored = true; }
+              else if t16 == None { t16 = Some(move task_h); stored = true; }
+              else if t17 == None { t17 = Some(move task_h); stored = true; }
+              else if t18 == None { t18 = Some(move task_h); stored = true; }
+              else if t19 == None { t19 = Some(move task_h); stored = true; }
+              else if t20 == None { t20 = Some(move task_h); stored = true; }
+              else if t21 == None { t21 = Some(move task_h); stored = true; }
+              else if t22 == None { t22 = Some(move task_h); stored = true; }
+              else if t23 == None { t23 = Some(move task_h); stored = true; }
+              else if t24 == None { t24 = Some(move task_h); stored = true; }
+              else if t25 == None { t25 = Some(move task_h); stored = true; }
+              else if t26 == None { t26 = Some(move task_h); stored = true; }
+              else if t27 == None { t27 = Some(move task_h); stored = true; }
+              else if t28 == None { t28 = Some(move task_h); stored = true; }
+              else if t29 == None { t29 = Some(move task_h); stored = true; }
+              else if t30 == None { t30 = Some(move task_h); stored = true; }
+              else if t31 == None { t31 = Some(move task_h); stored = true; }
+
+              if stored {
+                budget = budget - 1;
+              } else {
+                // No slot available; fall back to synchronous recursion.
+                if mode == Mode::Files {
+                  walk_dir_files(cfg, child_path, &io, mut path, next_depth, mut out, mut err, mut stats);
+                } else {
+                  let o: Outcome = walk_dir_search(cfg, &pat, child_path, &io, mut path, next_depth, mut out, mut err, mut stats);
+                  if o.found { found_any = true; }
+                  if o.stop { found_any = true; cancel_set(&io); path_truncate(mut path, saved_len); break; }
+                }
+              }
+            }
+          } else {
+            if mode == Mode::Files {
+              walk_dir_files(cfg, child_path, &io, mut path, next_depth, mut out, mut err, mut stats);
+            } else {
               let o: Outcome = walk_dir_search(cfg, &pat, child_path, &io, mut path, next_depth, mut out, mut err, mut stats);
               if o.found { found_any = true; }
               if o.stop { found_any = true; cancel_set(&io); path_truncate(mut path, saved_len); break; }
             }
           }
-          } else {
-            let o: Outcome = walk_dir_search(cfg, &pat, child_path, &io, mut path, next_depth, mut out, mut err, mut stats);
-            if o.found { found_any = true; }
-            if o.stop { found_any = true; cancel_set(&io); path_truncate(mut path, saved_len); break; }
-          }
         }
       } else if is_file {
         stats.files_total = stats.files_total + 1;
-        let o: Outcome = search_file(cfg, &pat, child_path, &io, mut out, mut err, mut stats);
-        if o.found { found_any = true; }
-        if o.stop { found_any = true; cancel_set(&io); path_truncate(mut path, saved_len); break; }
+        if mode == Mode::Files {
+          list_file(child_path, &io, mut out);
+        } else {
+          let o: Outcome = search_file(cfg, &pat, child_path, &io, mut out, mut err, mut stats);
+          if o.found { found_any = true; }
+          if o.stop { found_any = true; cancel_set(&io); path_truncate(mut path, saved_len); break; }
+        }
       }
 
       path_truncate(mut path, saved_len);
@@ -1198,11 +1405,7 @@ export async fn run_parallel (cfg: Config) -> int {
     if t0 != None {
       let h: Task(WorkerResult) = match (t0) { Some(v) => move v, None => worker_noop() };
       let r: WorkerResult = yield h;
-      stats.files_total = stats.files_total + r.stats.files_total;
-      stats.files_searched = stats.files_searched + r.stats.files_searched;
-      stats.files_matched = stats.files_matched + r.stats.files_matched;
-      stats.match_lines = stats.match_lines + r.stats.match_lines;
-      stats.errors = stats.errors + r.stats.errors;
+      stats_add(mut stats, &r.stats);
       if r.found_any { found_any = true; }
       if r.stop { found_any = true; }
       t0 = None;
@@ -1210,11 +1413,7 @@ export async fn run_parallel (cfg: Config) -> int {
     if t1 != None {
       let h: Task(WorkerResult) = match (t1) { Some(v) => move v, None => worker_noop() };
       let r: WorkerResult = yield h;
-      stats.files_total = stats.files_total + r.stats.files_total;
-      stats.files_searched = stats.files_searched + r.stats.files_searched;
-      stats.files_matched = stats.files_matched + r.stats.files_matched;
-      stats.match_lines = stats.match_lines + r.stats.match_lines;
-      stats.errors = stats.errors + r.stats.errors;
+      stats_add(mut stats, &r.stats);
       if r.found_any { found_any = true; }
       if r.stop { found_any = true; }
       t1 = None;
@@ -1222,11 +1421,7 @@ export async fn run_parallel (cfg: Config) -> int {
     if t2 != None {
       let h: Task(WorkerResult) = match (t2) { Some(v) => move v, None => worker_noop() };
       let r: WorkerResult = yield h;
-      stats.files_total = stats.files_total + r.stats.files_total;
-      stats.files_searched = stats.files_searched + r.stats.files_searched;
-      stats.files_matched = stats.files_matched + r.stats.files_matched;
-      stats.match_lines = stats.match_lines + r.stats.match_lines;
-      stats.errors = stats.errors + r.stats.errors;
+      stats_add(mut stats, &r.stats);
       if r.found_any { found_any = true; }
       if r.stop { found_any = true; }
       t2 = None;
@@ -1234,11 +1429,7 @@ export async fn run_parallel (cfg: Config) -> int {
     if t3 != None {
       let h: Task(WorkerResult) = match (t3) { Some(v) => move v, None => worker_noop() };
       let r: WorkerResult = yield h;
-      stats.files_total = stats.files_total + r.stats.files_total;
-      stats.files_searched = stats.files_searched + r.stats.files_searched;
-      stats.files_matched = stats.files_matched + r.stats.files_matched;
-      stats.match_lines = stats.match_lines + r.stats.match_lines;
-      stats.errors = stats.errors + r.stats.errors;
+      stats_add(mut stats, &r.stats);
       if r.found_any { found_any = true; }
       if r.stop { found_any = true; }
       t3 = None;
@@ -1246,11 +1437,7 @@ export async fn run_parallel (cfg: Config) -> int {
     if t4 != None {
       let h: Task(WorkerResult) = match (t4) { Some(v) => move v, None => worker_noop() };
       let r: WorkerResult = yield h;
-      stats.files_total = stats.files_total + r.stats.files_total;
-      stats.files_searched = stats.files_searched + r.stats.files_searched;
-      stats.files_matched = stats.files_matched + r.stats.files_matched;
-      stats.match_lines = stats.match_lines + r.stats.match_lines;
-      stats.errors = stats.errors + r.stats.errors;
+      stats_add(mut stats, &r.stats);
       if r.found_any { found_any = true; }
       if r.stop { found_any = true; }
       t4 = None;
@@ -1258,11 +1445,7 @@ export async fn run_parallel (cfg: Config) -> int {
     if t5 != None {
       let h: Task(WorkerResult) = match (t5) { Some(v) => move v, None => worker_noop() };
       let r: WorkerResult = yield h;
-      stats.files_total = stats.files_total + r.stats.files_total;
-      stats.files_searched = stats.files_searched + r.stats.files_searched;
-      stats.files_matched = stats.files_matched + r.stats.files_matched;
-      stats.match_lines = stats.match_lines + r.stats.match_lines;
-      stats.errors = stats.errors + r.stats.errors;
+      stats_add(mut stats, &r.stats);
       if r.found_any { found_any = true; }
       if r.stop { found_any = true; }
       t5 = None;
@@ -1270,11 +1453,7 @@ export async fn run_parallel (cfg: Config) -> int {
     if t6 != None {
       let h: Task(WorkerResult) = match (t6) { Some(v) => move v, None => worker_noop() };
       let r: WorkerResult = yield h;
-      stats.files_total = stats.files_total + r.stats.files_total;
-      stats.files_searched = stats.files_searched + r.stats.files_searched;
-      stats.files_matched = stats.files_matched + r.stats.files_matched;
-      stats.match_lines = stats.match_lines + r.stats.match_lines;
-      stats.errors = stats.errors + r.stats.errors;
+      stats_add(mut stats, &r.stats);
       if r.found_any { found_any = true; }
       if r.stop { found_any = true; }
       t6 = None;
@@ -1282,19 +1461,207 @@ export async fn run_parallel (cfg: Config) -> int {
     if t7 != None {
       let h: Task(WorkerResult) = match (t7) { Some(v) => move v, None => worker_noop() };
       let r: WorkerResult = yield h;
-      stats.files_total = stats.files_total + r.stats.files_total;
-      stats.files_searched = stats.files_searched + r.stats.files_searched;
-      stats.files_matched = stats.files_matched + r.stats.files_matched;
-      stats.match_lines = stats.match_lines + r.stats.match_lines;
-      stats.errors = stats.errors + r.stats.errors;
+      stats_add(mut stats, &r.stats);
       if r.found_any { found_any = true; }
       if r.stop { found_any = true; }
       t7 = None;
     }
+    if t8 != None {
+      let h: Task(WorkerResult) = match (t8) { Some(v) => move v, None => worker_noop() };
+      let r: WorkerResult = yield h;
+      stats_add(mut stats, &r.stats);
+      if r.found_any { found_any = true; }
+      if r.stop { found_any = true; }
+      t8 = None;
+    }
+    if t9 != None {
+      let h: Task(WorkerResult) = match (t9) { Some(v) => move v, None => worker_noop() };
+      let r: WorkerResult = yield h;
+      stats_add(mut stats, &r.stats);
+      if r.found_any { found_any = true; }
+      if r.stop { found_any = true; }
+      t9 = None;
+    }
+    if t10 != None {
+      let h: Task(WorkerResult) = match (t10) { Some(v) => move v, None => worker_noop() };
+      let r: WorkerResult = yield h;
+      stats_add(mut stats, &r.stats);
+      if r.found_any { found_any = true; }
+      if r.stop { found_any = true; }
+      t10 = None;
+    }
+    if t11 != None {
+      let h: Task(WorkerResult) = match (t11) { Some(v) => move v, None => worker_noop() };
+      let r: WorkerResult = yield h;
+      stats_add(mut stats, &r.stats);
+      if r.found_any { found_any = true; }
+      if r.stop { found_any = true; }
+      t11 = None;
+    }
+    if t12 != None {
+      let h: Task(WorkerResult) = match (t12) { Some(v) => move v, None => worker_noop() };
+      let r: WorkerResult = yield h;
+      stats_add(mut stats, &r.stats);
+      if r.found_any { found_any = true; }
+      if r.stop { found_any = true; }
+      t12 = None;
+    }
+    if t13 != None {
+      let h: Task(WorkerResult) = match (t13) { Some(v) => move v, None => worker_noop() };
+      let r: WorkerResult = yield h;
+      stats_add(mut stats, &r.stats);
+      if r.found_any { found_any = true; }
+      if r.stop { found_any = true; }
+      t13 = None;
+    }
+    if t14 != None {
+      let h: Task(WorkerResult) = match (t14) { Some(v) => move v, None => worker_noop() };
+      let r: WorkerResult = yield h;
+      stats_add(mut stats, &r.stats);
+      if r.found_any { found_any = true; }
+      if r.stop { found_any = true; }
+      t14 = None;
+    }
+    if t15 != None {
+      let h: Task(WorkerResult) = match (t15) { Some(v) => move v, None => worker_noop() };
+      let r: WorkerResult = yield h;
+      stats_add(mut stats, &r.stats);
+      if r.found_any { found_any = true; }
+      if r.stop { found_any = true; }
+      t15 = None;
+    }
+    if t16 != None {
+      let h: Task(WorkerResult) = match (t16) { Some(v) => move v, None => worker_noop() };
+      let r: WorkerResult = yield h;
+      stats_add(mut stats, &r.stats);
+      if r.found_any { found_any = true; }
+      if r.stop { found_any = true; }
+      t16 = None;
+    }
+    if t17 != None {
+      let h: Task(WorkerResult) = match (t17) { Some(v) => move v, None => worker_noop() };
+      let r: WorkerResult = yield h;
+      stats_add(mut stats, &r.stats);
+      if r.found_any { found_any = true; }
+      if r.stop { found_any = true; }
+      t17 = None;
+    }
+    if t18 != None {
+      let h: Task(WorkerResult) = match (t18) { Some(v) => move v, None => worker_noop() };
+      let r: WorkerResult = yield h;
+      stats_add(mut stats, &r.stats);
+      if r.found_any { found_any = true; }
+      if r.stop { found_any = true; }
+      t18 = None;
+    }
+    if t19 != None {
+      let h: Task(WorkerResult) = match (t19) { Some(v) => move v, None => worker_noop() };
+      let r: WorkerResult = yield h;
+      stats_add(mut stats, &r.stats);
+      if r.found_any { found_any = true; }
+      if r.stop { found_any = true; }
+      t19 = None;
+    }
+    if t20 != None {
+      let h: Task(WorkerResult) = match (t20) { Some(v) => move v, None => worker_noop() };
+      let r: WorkerResult = yield h;
+      stats_add(mut stats, &r.stats);
+      if r.found_any { found_any = true; }
+      if r.stop { found_any = true; }
+      t20 = None;
+    }
+    if t21 != None {
+      let h: Task(WorkerResult) = match (t21) { Some(v) => move v, None => worker_noop() };
+      let r: WorkerResult = yield h;
+      stats_add(mut stats, &r.stats);
+      if r.found_any { found_any = true; }
+      if r.stop { found_any = true; }
+      t21 = None;
+    }
+    if t22 != None {
+      let h: Task(WorkerResult) = match (t22) { Some(v) => move v, None => worker_noop() };
+      let r: WorkerResult = yield h;
+      stats_add(mut stats, &r.stats);
+      if r.found_any { found_any = true; }
+      if r.stop { found_any = true; }
+      t22 = None;
+    }
+    if t23 != None {
+      let h: Task(WorkerResult) = match (t23) { Some(v) => move v, None => worker_noop() };
+      let r: WorkerResult = yield h;
+      stats_add(mut stats, &r.stats);
+      if r.found_any { found_any = true; }
+      if r.stop { found_any = true; }
+      t23 = None;
+    }
+    if t24 != None {
+      let h: Task(WorkerResult) = match (t24) { Some(v) => move v, None => worker_noop() };
+      let r: WorkerResult = yield h;
+      stats_add(mut stats, &r.stats);
+      if r.found_any { found_any = true; }
+      if r.stop { found_any = true; }
+      t24 = None;
+    }
+    if t25 != None {
+      let h: Task(WorkerResult) = match (t25) { Some(v) => move v, None => worker_noop() };
+      let r: WorkerResult = yield h;
+      stats_add(mut stats, &r.stats);
+      if r.found_any { found_any = true; }
+      if r.stop { found_any = true; }
+      t25 = None;
+    }
+    if t26 != None {
+      let h: Task(WorkerResult) = match (t26) { Some(v) => move v, None => worker_noop() };
+      let r: WorkerResult = yield h;
+      stats_add(mut stats, &r.stats);
+      if r.found_any { found_any = true; }
+      if r.stop { found_any = true; }
+      t26 = None;
+    }
+    if t27 != None {
+      let h: Task(WorkerResult) = match (t27) { Some(v) => move v, None => worker_noop() };
+      let r: WorkerResult = yield h;
+      stats_add(mut stats, &r.stats);
+      if r.found_any { found_any = true; }
+      if r.stop { found_any = true; }
+      t27 = None;
+    }
+    if t28 != None {
+      let h: Task(WorkerResult) = match (t28) { Some(v) => move v, None => worker_noop() };
+      let r: WorkerResult = yield h;
+      stats_add(mut stats, &r.stats);
+      if r.found_any { found_any = true; }
+      if r.stop { found_any = true; }
+      t28 = None;
+    }
+    if t29 != None {
+      let h: Task(WorkerResult) = match (t29) { Some(v) => move v, None => worker_noop() };
+      let r: WorkerResult = yield h;
+      stats_add(mut stats, &r.stats);
+      if r.found_any { found_any = true; }
+      if r.stop { found_any = true; }
+      t29 = None;
+    }
+    if t30 != None {
+      let h: Task(WorkerResult) = match (t30) { Some(v) => move v, None => worker_noop() };
+      let r: WorkerResult = yield h;
+      stats_add(mut stats, &r.stats);
+      if r.found_any { found_any = true; }
+      if r.stop { found_any = true; }
+      t30 = None;
+    }
+    if t31 != None {
+      let h: Task(WorkerResult) = match (t31) { Some(v) => move v, None => worker_noop() };
+      let r: WorkerResult = yield h;
+      stats_add(mut stats, &r.stats);
+      if r.found_any { found_any = true; }
+      if r.stop { found_any = true; }
+      t31 = None;
+    }
   }
 
   let end_ns_opt: i64? = std::runtime::posix::time::monotonic_now_ns();
-  let end_ns: i64 = match (end_ns_opt) { Some(v) => v, None => start_ns };
+  let end_ns: i64 = end_ns_opt ?? start_ns;
   let elapsed_ns: i64 = end_ns - start_ns;
   print_stats(mut err, &io, cfg, stats, elapsed_ns);
 
@@ -1306,6 +1673,9 @@ export async fn run_parallel (cfg: Config) -> int {
 
   if stats.errors > 0 {
     return 2;
+  }
+  if mode == Mode::Files {
+    return 0;
   }
   if found_any {
     return 0;
@@ -1356,10 +1726,7 @@ export fn run (cfg: Config) -> int {
   };
 
   let start_ns_opt: i64? = std::runtime::posix::time::monotonic_now_ns();
-  let start_ns: i64 = match (start_ns_opt) {
-    Some(v) => v,
-    None => 0,
-  };
+  let start_ns: i64 = start_ns_opt ?? 0;
   let mut stats: Stats = stats_init();
   var found_any: bool = false;
 
@@ -1371,19 +1738,13 @@ export fn run (cfg: Config) -> int {
       var i: int = 0;
       while i < n {
         let root_opt: string? = cfg.path_at(i);
-        let root: string = match (root_opt) {
-          Some(v) => v,
-          None => ".",
-        };
+        let root: string = root_opt ?? ".";
         handle_root_files(cfg, root, &io, mut out, mut err, mut stats);
         i = i + 1;
       }
     }
   } else {
-    let pat_s: string = match (cfg.pattern) {
-      Some(v) => v,
-      None => "",
-    };
+    let pat_s: string = cfg.pattern ?? "";
     let pr: PatternResult = compile_pattern(pat_s, cfg.fixed_string, cfg.ignore_case);
     let pat_opt: Pattern? = match pr {
       Ok(v) => Some(move v),
@@ -1407,10 +1768,7 @@ export fn run (cfg: Config) -> int {
       var i: int = 0;
       while i < n {
         let root_opt: string? = cfg.path_at(i);
-        let root: string = match (root_opt) {
-          Some(v) => v,
-          None => ".",
-        };
+        let root: string = root_opt ?? ".";
         let o: Outcome = handle_root_search(cfg, &pat, root, &io, mut out, mut err, mut stats);
         if o.found { found_any = true; }
         if o.stop { found_any = true; break; }
@@ -1422,10 +1780,7 @@ export fn run (cfg: Config) -> int {
   }
 
   let end_ns_opt: i64? = std::runtime::posix::time::monotonic_now_ns();
-  let end_ns: i64 = match (end_ns_opt) {
-    Some(v) => v,
-    None => start_ns,
-  };
+  let end_ns: i64 = end_ns_opt ?? start_ns;
   let elapsed_ns: i64 = end_ns - start_ns;
   print_stats(mut err, &io, cfg, stats, elapsed_ns);
 

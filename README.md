@@ -5,7 +5,7 @@
 ## Build & run
 
 ```bash
-cd sg
+cd slg
 silk build
 install -b build/bin/slg ~/.local/bin/slg
 slg --help
@@ -71,8 +71,11 @@ slg --max-depth 2 "TODO" .
 
 # Parallelism control:
 #   --jobs 0 = auto (default), --jobs 1 = single-threaded, --no-parallel = --jobs 1
+#   --max-workers 8 = cap worker tasks (default), --max-workers 0 = no cap
+#   --parallel-files enables parallel traversal for --files when jobs > 1
 slg --jobs 1 "TODO" .
-slg --jobs 8 "TODO" .
+slg --jobs 0 --max-workers 0 "TODO" .
+slg --files --parallel-files --jobs 0 .
 
 # Print stats to stderr
 slg --stats "TODO" .
@@ -108,7 +111,7 @@ Use `--text` to force searching those files anyway.
 Unit + end-to-end tests use Silk Test syntax and run via:
 
 ```bash
-cd sg
+cd slg
 silk test
 ```
 

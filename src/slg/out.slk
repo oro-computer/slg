@@ -67,10 +67,7 @@ fn writer_init (fd: int, color: bool, cap: i64) -> Writer? {
   if b_opt == None {
     return None;
   }
-  let b: BufferU8 = match (b_opt) {
-    Some(v) => v,
-    None => BufferU8.empty(),
-  };
+  let b: BufferU8 = b_opt ?? BufferU8.empty();
   return Some(Writer{ fd: fd, color: color, buf: b });
 }
 

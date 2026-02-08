@@ -74,6 +74,19 @@ export ext memchr = fn (u64, int, i64) -> u64;
 export ext memmem = fn (u64, i64, u64, i64) -> u64;
 
 /**
+ * `memcpy(3)` — copy bytes from `src` to `dst` (glibc).
+ *
+ * Notes:
+ * - This does not support overlapping ranges (use `memmove` for that).
+ *
+ * @param dst: u64 Destination pointer.
+ * @param src: u64 Source pointer.
+ * @param len: i64 Byte length.
+ * @returns u64 `dst`.
+ */
+export ext memcpy = fn (u64, u64, i64) -> u64;
+
+/**
  * `mmap(2)` — map a file into memory (POSIX hosted baseline).
  */
 export ext mmap = fn (u64, i64, int, int, int, i64) -> u64;
@@ -87,6 +100,9 @@ export ext munmap = fn (u64, i64) -> int;
 export const PROT_READ: int = 1;
 export const MAP_PRIVATE: int = 2;
 export const MAP_FAILED: u64 = 18446744073709551615;
+
+// `errno` values (linux hosted baseline).
+export const ENOTDIR: int = 20;
 
 // `dirent.d_type` constants (linux hosted baseline).
 export const DT_UNKNOWN: u8 = 0;

@@ -4,6 +4,8 @@ import std::interfaces;
 import std::runtime::mem;
 import { OutOfMemory } from "std/memory";
 
+import { memcpy } from "./os.slk";
+
 /**
  * A non-owning byte slice view (`ptr`, `len`).
  *
@@ -141,14 +143,8 @@ impl BufferU8 {
     if err != None {
       return err;
     }
-
-    var i: i64 = 0;
-    while i < len {
-      let b: u8 = std::runtime::mem::load_u8(ptr, i);
-      std::runtime::mem::store_u8(self.ptr, self.len + i, b);
-      i = i + 1;
-    }
-
+    let dst: u64 = self.ptr + (self.len as u64);
+    let _ = memcpy(dst, ptr, len);
     self.len = self.len + len;
     return None;
   }

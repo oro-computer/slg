@@ -53,6 +53,14 @@ Parallel tasks.
 \fB0\fR means auto (use available CPUs).
 \fB1\fR forces single-threaded mode.
 .TP
+.BR --max-workers " " \fIn\fR
+Cap worker tasks for parallel traversal.
+\fB0\fR means no cap (within current implementation limits).
+Default: \fB8\fR.
+.TP
+.B --parallel-files
+Parallelize \fB--files\fR traversal when \fB--jobs\fR > 1.
+.TP
 .B --no-parallel
 Same as \fB--jobs 1\fR.
 .SS File Handling

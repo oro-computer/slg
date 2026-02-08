@@ -9,7 +9,7 @@ import std::runtime::posix::io;
 import { Config, parse_cli, print_help, print_version } from "./slg/cli.slk";
 import { run_auto } from "./slg/engine.slk";
 import { BufferU8 } from "./slg/buf.slk";
-import { dup, memmem } from "./slg/os.slk";
+import { dup, memcpy, memmem } from "./slg/os.slk";
 import { smoke as formal_smoke } from "./slg/formal.slk";
 
 async fn run_cfg (cfg: Config) -> int {
@@ -82,12 +82,7 @@ fn cstr_alloc (s: string) -> u64 {
   }
 
   let src: u64 = std::runtime::mem::string_ptr(s);
-  var i: i64 = 0;
-  while i < len {
-    let b: u8 = std::runtime::mem::load_u8(src, i);
-    std::runtime::mem::store_u8(ptr, i, b);
-    i = i + 1;
-  }
+  let _ = memcpy(ptr, src, len);
   std::runtime::mem::store_u8(ptr, len, 0);
   return ptr;
 }
@@ -284,10 +279,7 @@ fn read_all_fd (fd: int) -> BufferU8? {
   if b_opt == None {
     return None;
   }
-  let mut b: BufferU8 = match (b_opt) {
-    Some(v) => v,
-    None => BufferU8.empty(),
-  };
+  let mut b: BufferU8 = b_opt ?? BufferU8.empty();
 
   let chunk_size: i64 = 4096;
   let chunk: u64 = std::runtime::mem::alloc(chunk_size);
@@ -406,17 +398,14 @@ async fn capture_stdout_run_cfg (cfg: Config) -> Capture? {
   if out_opt == None {
     return None;
   }
-  let out: BufferU8 = match (out_opt) {
-    Some(v) => v,
-    None => BufferU8.empty(),
-  };
+  let out: BufferU8 = out_opt ?? BufferU8.empty();
   return Some(Capture{ code: code, out: out });
 }
 
 test "slg e2e - help is descriptive" {
   let av_opt: ArgvOwned? = argv_alloc_2("slg", "--help");
   assert(av_opt != None, "argv alloc failed");
-  let mut av: ArgvOwned = match (av_opt) { Some(v) => v, None => ArgvOwned{ argc: 0, argv: 0 } };
+  let mut av: ArgvOwned = av_opt ?? ArgvOwned{ argc: 0, argv: 0 };
 
   let args: Args = Args.init(av.argc, av.argv);
   let cfg_opt: Config? = parse_cli(args);
@@ -427,14 +416,42 @@ test "slg e2e - help is descriptive" {
     None => None,
   };
   assert(cap_opt != None, "capture failed");
-  let mut cap: Capture = match (cap_opt) { Some(v) => v, None => Capture{ code: 2, out: BufferU8.empty() } };
+  let mut cap: Capture = cap_opt ?? Capture{ code: 2, out: BufferU8.empty() };
 
   assert(cap.code == 0, "expected exit code 0");
   let out_s: string = buffer_as_string(cap.out);
   assert(contains(out_s, "USAGE:"), "help output should include USAGE");
   assert(contains(out_s, "EXAMPLES:"), "help output should include EXAMPLES");
   assert(contains(out_s, "--jobs"), "help output should include --jobs");
+  assert(contains(out_s, "--max-workers"), "help output should include --max-workers");
+  assert(contains(out_s, "--parallel-files"), "help output should include --parallel-files");
   assert(contains(out_s, "--no-parallel"), "help output should include --no-parallel");
+
+  cap.drop();
+  av.drop();
+}
+
+test "slg e2e - --files can run in parallel" {
+  let av_opt: ArgvOwned? = argv_alloc_5("slg", "--files", "--parallel-files", "--jobs=4", "testdata/basic");
+  assert(av_opt != None, "argv alloc failed");
+  let mut av: ArgvOwned = av_opt ?? ArgvOwned{ argc: 0, argv: 0 };
+
+  let args: Args = Args.init(av.argc, av.argv);
+  let cfg_opt: Config? = parse_cli(args);
+  assert(cfg_opt != None, "parse_cli should succeed");
+
+  let cap_opt: Capture? = match (cfg_opt) {
+    Some(cfg) => await capture_stdout_run_cfg(cfg),
+    None => None,
+  };
+  assert(cap_opt != None, "capture failed");
+  let mut cap: Capture = cap_opt ?? Capture{ code: 2, out: BufferU8.empty() };
+
+  assert(cap.code == 0, "expected exit code 0");
+  let out_s: string = buffer_as_string(cap.out);
+  assert(contains(out_s, "testdata/basic/a.txt"), "expected a file path in output");
+  assert(contains(out_s, "testdata/basic/sub/b.txt"), "expected a file path in output");
+  assert(!contains(out_s, ".hidden.txt"), "should not include hidden files by default");
 
   cap.drop();
   av.drop();
@@ -443,7 +460,7 @@ test "slg e2e - help is descriptive" {
 test "slg e2e - fixed search finds a match" {
   let av_opt: ArgvOwned? = argv_alloc_4("slg", "-F", "TODO", "testdata/basic");
   assert(av_opt != None, "argv alloc failed");
-  let mut av: ArgvOwned = match (av_opt) { Some(v) => v, None => ArgvOwned{ argc: 0, argv: 0 } };
+  let mut av: ArgvOwned = av_opt ?? ArgvOwned{ argc: 0, argv: 0 };
 
   let args: Args = Args.init(av.argc, av.argv);
   let cfg_opt: Config? = parse_cli(args);
@@ -454,7 +471,7 @@ test "slg e2e - fixed search finds a match" {
     None => None,
   };
   assert(cap_opt != None, "capture failed");
-  let mut cap: Capture = match (cap_opt) { Some(v) => v, None => Capture{ code: 2, out: BufferU8.empty() } };
+  let mut cap: Capture = cap_opt ?? Capture{ code: 2, out: BufferU8.empty() };
 
   assert(cap.code == 0, "expected exit code 0 (match found)");
   let out_s: string = buffer_as_string(cap.out);
@@ -468,7 +485,7 @@ test "slg e2e - fixed search finds a match" {
 test "slg e2e - --jobs 1 forces single-threaded" {
   let av_opt: ArgvOwned? = argv_alloc_5("slg", "--jobs=1", "-F", "TODO", "testdata/basic");
   assert(av_opt != None, "argv alloc failed");
-  let mut av: ArgvOwned = match (av_opt) { Some(v) => v, None => ArgvOwned{ argc: 0, argv: 0 } };
+  let mut av: ArgvOwned = av_opt ?? ArgvOwned{ argc: 0, argv: 0 };
 
   let args: Args = Args.init(av.argc, av.argv);
   let cfg_opt: Config? = parse_cli(args);
@@ -479,7 +496,7 @@ test "slg e2e - --jobs 1 forces single-threaded" {
     None => None,
   };
   assert(cap_opt != None, "capture failed");
-  let mut cap: Capture = match (cap_opt) { Some(v) => v, None => Capture{ code: 2, out: BufferU8.empty() } };
+  let mut cap: Capture = cap_opt ?? Capture{ code: 2, out: BufferU8.empty() };
 
   assert(cap.code == 0, "expected exit code 0 (match found)");
   let out_s: string = buffer_as_string(cap.out);
@@ -494,7 +511,7 @@ test "slg e2e - hidden files require --hidden" {
   // Without --hidden: no matches.
   let av1_opt: ArgvOwned? = argv_alloc_4("slg", "-F", "needle_hidden", "testdata/basic");
   assert(av1_opt != None, "argv alloc failed");
-  let mut av1: ArgvOwned = match (av1_opt) { Some(v) => v, None => ArgvOwned{ argc: 0, argv: 0 } };
+  let mut av1: ArgvOwned = av1_opt ?? ArgvOwned{ argc: 0, argv: 0 };
 
   let args1: Args = Args.init(av1.argc, av1.argv);
   let cfg1_opt: Config? = parse_cli(args1);
@@ -504,7 +521,7 @@ test "slg e2e - hidden files require --hidden" {
     None => None,
   };
   assert(cap1_opt != None, "capture failed");
-  let mut cap1: Capture = match (cap1_opt) { Some(v) => v, None => Capture{ code: 2, out: BufferU8.empty() } };
+  let mut cap1: Capture = cap1_opt ?? Capture{ code: 2, out: BufferU8.empty() };
 
   assert(cap1.code == 1, "expected exit code 1 (no match)");
   let out1: string = buffer_as_string(cap1.out);
@@ -517,7 +534,7 @@ test "slg e2e - hidden files require --hidden" {
   // With --hidden: match appears.
   let av2_opt: ArgvOwned? = argv_alloc_5("slg", "-F", "--hidden", "needle_hidden", "testdata/basic");
   assert(av2_opt != None, "argv alloc failed");
-  let mut av2: ArgvOwned = match (av2_opt) { Some(v) => v, None => ArgvOwned{ argc: 0, argv: 0 } };
+  let mut av2: ArgvOwned = av2_opt ?? ArgvOwned{ argc: 0, argv: 0 };
 
   let args2: Args = Args.init(av2.argc, av2.argv);
   let cfg2_opt: Config? = parse_cli(args2);
@@ -527,7 +544,7 @@ test "slg e2e - hidden files require --hidden" {
     None => None,
   };
   assert(cap2_opt != None, "capture failed");
-  let mut cap2: Capture = match (cap2_opt) { Some(v) => v, None => Capture{ code: 2, out: BufferU8.empty() } };
+  let mut cap2: Capture = cap2_opt ?? Capture{ code: 2, out: BufferU8.empty() };
 
   assert(cap2.code == 0, "expected exit code 0 (match found)");
   let out2: string = buffer_as_string(cap2.out);
@@ -541,7 +558,7 @@ test "slg e2e - hidden files require --hidden" {
 test "slg e2e - --files lists searchable files" {
   let av_opt: ArgvOwned? = argv_alloc_3("slg", "--files", "testdata/basic");
   assert(av_opt != None, "argv alloc failed");
-  let mut av: ArgvOwned = match (av_opt) { Some(v) => v, None => ArgvOwned{ argc: 0, argv: 0 } };
+  let mut av: ArgvOwned = av_opt ?? ArgvOwned{ argc: 0, argv: 0 };
 
   let args: Args = Args.init(av.argc, av.argv);
   let cfg_opt: Config? = parse_cli(args);
@@ -552,7 +569,7 @@ test "slg e2e - --files lists searchable files" {
     None => None,
   };
   assert(cap_opt != None, "capture failed");
-  let mut cap: Capture = match (cap_opt) { Some(v) => v, None => Capture{ code: 2, out: BufferU8.empty() } };
+  let mut cap: Capture = cap_opt ?? Capture{ code: 2, out: BufferU8.empty() };
 
   assert(cap.code == 0, "expected exit code 0");
   let out_s: string = buffer_as_string(cap.out);

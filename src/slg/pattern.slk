@@ -219,10 +219,7 @@ export fn compile (text: string, fixed: bool, ignore_case: bool) -> PatternResul
   let r: ReCompileResult = std::regex::RegExp.compile(text, flags);
   if r.is_err() {
     let e_opt: std::regex::CompileFailed? = ReCompileResult.err_value(r);
-    let e: std::regex::CompileFailed = match (e_opt) {
-      Some(v) => v,
-      None => std::regex::CompileFailed{ code: 0 },
-    };
+    let e: std::regex::CompileFailed = e_opt ?? std::regex::CompileFailed{ code: 0 };
     return Err(failed(PatternErrorKind::RegexCompileFailed, e.code));
   }
 
@@ -294,10 +291,7 @@ test "slg::pattern - fixed case-sensitive" {
 
   let m0: Match? = next_match(p, "xxabaxxaba", 0);
   assert(m0 != None, "expected match");
-  let m: Match = match (m0) {
-    Some(v) => v,
-    None => Match{ start: -1, end: -1 },
-  };
+  let m: Match = m0 ?? Match{ start: -1, end: -1 };
   assert(m.start == 2 && m.end == 5, "unexpected match location");
 }
 
@@ -311,10 +305,7 @@ test "slg::pattern - fixed ignore-case (ASCII)" {
 
   let m0: Match? = next_match(p, "--abc--", 0);
   assert(m0 != None, "expected match");
-  let m: Match = match (m0) {
-    Some(v) => v,
-    None => Match{ start: -1, end: -1 },
-  };
+  let m: Match = m0 ?? Match{ start: -1, end: -1 };
   assert(m.start == 2 && m.end == 5, "unexpected match location");
 }
 
@@ -328,9 +319,6 @@ test "slg::pattern - regex basic" {
 
   let m0: Match? = next_match(p, "xxTODOyy", 0);
   assert(m0 != None, "expected match");
-  let m: Match = match (m0) {
-    Some(v) => v,
-    None => Match{ start: -1, end: -1 },
-  };
+  let m: Match = m0 ?? Match{ start: -1, end: -1 };
   assert(m.start == 2 && m.end == 6, "unexpected match location");
 }
