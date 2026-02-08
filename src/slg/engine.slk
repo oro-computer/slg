@@ -1,0 +1,1445 @@
+module slg::engine;
+
+import std::sync;
+import std::task;
+import std::path;
+import std::runtime::mem;
+import std::runtime::posix::fs;
+import std::runtime::posix::time;
+
+import {
+  BOLD,
+  ColorMode,
+  FD_STDERR,
+  FD_STDOUT,
+  FG_CYAN,
+  FG_GRAY,
+  FG_GREEN,
+  FG_RED,
+  MATCH_HI,
+  RESET,
+  UNDERLINE,
+  enabled as color_enabled,
+} from "./color.slk";
+
+import { Config, Mode } from "./cli.slk";
+import {
+  DT_DIR,
+  DT_LNK,
+  DT_REG,
+  DT_UNKNOWN,
+  MAP_FAILED,
+  MAP_PRIVATE,
+  PROT_READ,
+  closedir,
+  memchr,
+  mmap,
+  munmap,
+  opendir,
+  readdir
+} from "./os.slk";
+import { Writer } from "./out.slk";
+import { BufferU8 } from "./buf.slk";
+import {
+  Match,
+  Pattern,
+  PatternFailed,
+  PatternKind,
+  PatternResult,
+  compile as compile_pattern,
+  next_match,
+} from "./pattern.slk";
+
+type PathBuf = std::path::PathBuf;
+type PathBufResult = std::path::PathBufResult;
+
+fn color_mode_from_code (code: int) -> ColorMode {
+  if code == 1 { return ColorMode::Always; }
+  if code == 2 { return ColorMode::Never; }
+  return ColorMode::Auto;
+}
+
+/**
+ * Truncate a `std::path::PathBuf` to `new_len` bytes (O(1)).
+ *
+ * `slg` uses a single mutable path buffer in hot directory-walk loops:
+ * - append a component (`PathBuf.push(...)`),
+ * - process the child path,
+ * - restore the previous length.
+ *
+ * Today `std::path::PathBuf` does not expose a public truncate API, so we
+ * maintain the `{ptr,len}` invariants manually by writing the trailing NUL.
+ *
+ * @param p: &mut PathBuf Path buffer to truncate.
+ * @param new_len: i64 New logical length (in bytes).
+ */
+fn path_truncate (mut p: &PathBuf, new_len: i64) -> void {
+  if new_len < 0 {
+    p.len = 0;
+    if p.ptr != 0 {
+      std::runtime::mem::store_u8(p.ptr, 0, 0);
+    }
+    return;
+  }
+  if new_len >= p.len {
+    return;
+  }
+  p.len = new_len;
+  if p.ptr != 0 {
+    std::runtime::mem::store_u8(p.ptr, new_len, 0);
+  }
+}
+
+/**
+ * Running counters for a search invocation.
+ */
+struct Stats {
+  files_total: i64,
+  files_searched: i64,
+  files_matched: i64,
+  match_lines: i64,
+  errors: i64,
+}
+
+fn stats_init () -> Stats {
+  return Stats{
+    files_total: 0,
+    files_searched: 0,
+    files_matched: 0,
+    match_lines: 0,
+    errors: 0,
+  };
+}
+
+/**
+ * Cross-cutting runtime knobs for the engine.
+ *
+ * This is threaded through hot paths so `slg` can:
+ * - serialize stdout/stderr output when running multiple tasks,
+ * - short-circuit work when quiet-mode cancellation is requested.
+ */
+struct IO {
+  out_lock: std::sync::MutexBorrow?,
+  err_lock: std::sync::MutexBorrow?,
+  cancel: std::sync::CancellationTokenBorrow?,
+}
+
+fn io_none () -> IO {
+  return IO{ out_lock: None, err_lock: None, cancel: None };
+}
+
+fn lock_maybe (lock: std::sync::MutexBorrow?) -> void {
+  if lock == None {
+    return;
+  }
+  let m: std::sync::MutexBorrow = match (lock) {
+    Some(v) => v,
+    None => std::sync::Mutex.invalid().borrow(),
+  };
+  let _ = m.lock();
+}
+
+fn unlock_maybe (lock: std::sync::MutexBorrow?) -> void {
+  if lock == None {
+    return;
+  }
+  let m: std::sync::MutexBorrow = match (lock) {
+    Some(v) => v,
+    None => std::sync::Mutex.invalid().borrow(),
+  };
+  let _ = m.unlock();
+}
+
+fn flush_locked (mut w: &Writer, lock: std::sync::MutexBorrow?) -> bool {
+  lock_maybe(lock);
+  let ok: bool = w.flush();
+  unlock_maybe(lock);
+  return ok;
+}
+
+fn cancel_is_set (io: &IO) -> bool {
+  return match (io.cancel) {
+    Some(t) => t.is_cancelled(),
+    None => false,
+  };
+}
+
+fn cancel_set (io: &IO) -> void {
+  if io.cancel == None {
+    return;
+  }
+  let t: std::sync::CancellationTokenBorrow = match (io.cancel) {
+    Some(v) => v,
+    None => std::sync::CancellationToken.invalid().borrow(),
+  };
+  t.cancel();
+}
+
+/**
+ * Outcome for an operation that may short-circuit (quiet mode).
+ */
+struct Outcome {
+  found: bool,
+  stop: bool,
+}
+
+fn outcome_none () -> Outcome {
+  return Outcome{ found: false, stop: false };
+}
+
+fn outcome_found (stop: bool) -> Outcome {
+  return Outcome{ found: true, stop: stop };
+}
+
+fn is_dot_or_dotdot (name: string) -> bool {
+  return name == "." || name == "..";
+}
+
+fn is_hidden_name (name: string) -> bool {
+  let n: i64 = std::runtime::mem::string_len(name);
+  if n <= 0 {
+    return false;
+  }
+  let ptr: u64 = std::runtime::mem::string_ptr(name);
+  return std::runtime::mem::load_u8(ptr, 0) == 46; // '.'
+}
+
+fn is_vcs_dir_name (name: string) -> bool {
+  return name == ".git" || name == ".hg" || name == ".svn";
+}
+
+fn cstr_len (cstr: u64, max: i64) -> i64 {
+  if cstr == 0 || max <= 0 {
+    return 0;
+  }
+  var i: i64 = 0;
+  while i < max {
+    if std::runtime::mem::load_u8(cstr, i) == 0 {
+      return i;
+    }
+    i = i + 1;
+  }
+  return max;
+}
+
+// Linux/glibc `struct dirent` layout (hosted baseline).
+fn dirent_d_type (dent: u64) -> u8 {
+  return std::runtime::mem::load_u8(dent, 18);
+}
+
+fn dirent_name_ptr (dent: u64) -> u64 {
+  return dent + 19;
+}
+
+fn detect_binary (ptr: u64, len: i64) -> bool {
+  if ptr == 0 || len <= 0 {
+    return false;
+  }
+  let scan: i64 = if len < 1024 { len } else { 1024 };
+  return memchr(ptr, 0, scan) != 0;
+}
+
+fn write_error (mut err: &Writer, io: &IO, path: string, msg: string) -> void {
+  let fg_red: string = FG_RED();
+  let reset: string = RESET();
+  err.clear();
+  if err.color { let _ = err.push_str(fg_red); }
+  let _ = err.push_str("slg: ");
+  let _ = err.push_str(msg);
+  let _ = err.push_str(": ");
+  let _ = err.push_str(path);
+  if err.color { let _ = err.push_str(reset); }
+  let _ = err.push_u8(10);
+  let _ = flush_locked(mut err, io.err_lock);
+}
+
+fn print_heading (mut out: &Writer, io: &IO, path: string) -> void {
+  let bold: string = BOLD();
+  let underline: string = UNDERLINE();
+  let reset: string = RESET();
+  out.clear();
+  if out.color {
+    let _ = out.push_str(bold);
+    let _ = out.push_str(underline);
+  }
+  let _ = out.push_str(path);
+  if out.color { let _ = out.push_str(reset); }
+  let _ = out.push_u8(10);
+  let _ = flush_locked(mut out, io.out_lock);
+}
+
+fn append_match_line (
+  mut out: &Writer,
+  io: &IO,
+  cfg: &Config,
+  p: &Pattern,
+  path: string,
+  line_no: i64,
+  line_ptr: u64,
+  line_len: i64,
+  first_match: Match
+) -> bool {
+  let fg_cyan: string = FG_CYAN();
+  let fg_green: string = FG_GREEN();
+  let match_hi: string = MATCH_HI();
+  let reset: string = RESET();
+  out.clear();
+
+  // Prefix.
+  if !cfg.heading {
+    if out.color { let _ = out.push_str(fg_cyan); }
+    let _ = out.push_str(path);
+    if out.color { let _ = out.push_str(reset); }
+    let _ = out.push_u8(58); // ':'
+  }
+
+  if cfg.line_number {
+    if out.color { let _ = out.push_str(fg_green); }
+    let _ = out.push_i64(line_no);
+    if out.color { let _ = out.push_str(reset); }
+    let _ = out.push_u8(58); // ':'
+  }
+
+  if cfg.column {
+    let col: i64 = first_match.start + 1;
+    if out.color { let _ = out.push_str(fg_green); }
+    let _ = out.push_i64(col);
+    if out.color { let _ = out.push_str(reset); }
+    let _ = out.push_u8(58); // ':'
+  }
+
+  // Highlight all matches.
+  let line: string = std::runtime::mem::string_from_ptr_len(line_ptr, line_len as int);
+  var off: i64 = 0;
+  while true {
+    let m_opt: Match? = next_match(p, line, off);
+    if m_opt == None {
+      break;
+    }
+    let m: Match = match (m_opt) {
+      Some(v) => v,
+      None => Match{ start: 0, end: 0 },
+    };
+    if m.start < off {
+      break;
+    }
+
+    let seg_len: i64 = m.start - off;
+    if seg_len > 0 {
+      let _ = out.push_ptr_len(line_ptr + (off as u64), seg_len);
+    }
+
+    if out.color { let _ = out.push_str(match_hi); }
+    let match_len: i64 = m.end - m.start;
+    if match_len > 0 {
+      let _ = out.push_ptr_len(line_ptr + (m.start as u64), match_len);
+    }
+    if out.color { let _ = out.push_str(reset); }
+
+    off = m.end;
+    if m.end == m.start {
+      off = off + 1;
+    }
+    if off >= line_len {
+      break;
+    }
+  }
+
+  if off < line_len {
+    let _ = out.push_ptr_len(line_ptr + (off as u64), line_len - off);
+  }
+
+  let _ = out.push_u8(10);
+  return flush_locked(mut out, io.out_lock);
+}
+
+fn print_stats (mut err: &Writer, io: &IO, cfg: &Config, stats: &Stats, elapsed_ns: i64) -> void {
+  let fg_gray: string = FG_GRAY();
+  let reset: string = RESET();
+  if !cfg.stats {
+    return;
+  }
+  let ms: i64 = if elapsed_ns >= 0 { elapsed_ns / 1000000 } else { -1 };
+
+  err.clear();
+  if err.color { let _ = err.push_str(fg_gray); }
+  let _ = err.push_str("slg stats: files_searched=");
+  let _ = err.push_i64(stats.files_searched);
+  let _ = err.push_str(" files_matched=");
+  let _ = err.push_i64(stats.files_matched);
+  let _ = err.push_str(" match_lines=");
+  let _ = err.push_i64(stats.match_lines);
+  let _ = err.push_str(" errors=");
+  let _ = err.push_i64(stats.errors);
+  let _ = err.push_str(" time_ms=");
+  let _ = err.push_i64(ms);
+  if err.color { let _ = err.push_str(reset); }
+  let _ = err.push_u8(10);
+  let _ = flush_locked(mut err, io.err_lock);
+}
+
+fn pattern_compile_error (mut err: &Writer, io: &IO, mut stats: &Stats, e: PatternFailed) -> Pattern? {
+  let fg_red: string = FG_RED();
+  let reset: string = RESET();
+  stats.errors = stats.errors + 1;
+
+  err.clear();
+  if err.color { let _ = err.push_str(fg_red); }
+  let _ = err.push_str("slg: invalid pattern");
+  if e.code == 2 {
+    let _ = err.push_str(" (regex compile failed)");
+  }
+  if err.color { let _ = err.push_str(reset); }
+  let _ = err.push_u8(10);
+  let _ = flush_locked(mut err, io.err_lock);
+
+  return None;
+}
+
+fn search_file (cfg: &Config, p: &Pattern, path: string, io: &IO, mut out: &Writer, mut err: &Writer, mut stats: &Stats) -> Outcome {
+  stats.files_searched = stats.files_searched + 1;
+
+  let fd: int = std::runtime::posix::fs::open(path, std::runtime::posix::fs::O_RDONLY, 0) as int;
+  if fd < 0 {
+    stats.errors = stats.errors + 1;
+    write_error(mut err, io, path, "failed to open");
+    return outcome_none();
+  }
+
+  let size: i64 = std::runtime::posix::fs::lseek(fd, 0, std::runtime::posix::fs::SEEK_END);
+  if size <= 0 {
+    let _ = std::runtime::posix::fs::close(fd);
+    return outcome_none();
+  }
+
+  // Map read-only.
+  let ptr: u64 = mmap(0, size, PROT_READ, MAP_PRIVATE, fd, 0);
+  if ptr == MAP_FAILED {
+    stats.errors = stats.errors + 1;
+    write_error(mut err, io, path, "failed to mmap");
+    let _ = std::runtime::posix::fs::close(fd);
+    return outcome_none();
+  }
+
+  if !cfg.text && detect_binary(ptr, size) {
+    let _ = munmap(ptr, size);
+    let _ = std::runtime::posix::fs::close(fd);
+    return outcome_none();
+  }
+
+  var matched_in_file: bool = false;
+  var match_lines_in_file: i64 = 0;
+  var line_no: i64 = 1;
+
+  var tick: i64 = 0;
+  var off: i64 = 0;
+  while off <= size {
+    if io.cancel != None && (tick & 127) == 0 {
+      if cancel_is_set(io) {
+        let _ = munmap(ptr, size);
+        let _ = std::runtime::posix::fs::close(fd);
+        return Outcome{ found: true, stop: true };
+      }
+    }
+    tick = tick + 1;
+
+    let tail_ptr: u64 = ptr + (off as u64);
+    let tail_len: i64 = size - off;
+    let nl_ptr: u64 = if tail_len > 0 { memchr(tail_ptr, 10, tail_len) } else { 0 };
+
+    var line_end: i64 = size;
+    var next_off: i64 = size + 1;
+    if nl_ptr != 0 {
+      line_end = (nl_ptr - ptr) as i64;
+      next_off = line_end + 1;
+    }
+
+    if line_end < off {
+      break;
+    }
+
+    let line_len: i64 = line_end - off;
+    let line_ptr: u64 = ptr + (off as u64);
+
+    let line: string = std::runtime::mem::string_from_ptr_len(line_ptr, line_len as int);
+    let first_opt: Match? = next_match(p, line, 0);
+    if first_opt != None {
+      let first: Match = match (first_opt) {
+        Some(v) => v,
+        None => Match{ start: 0, end: 0 },
+      };
+      matched_in_file = true;
+      stats.match_lines = stats.match_lines + 1;
+      match_lines_in_file = match_lines_in_file + 1;
+
+      if cfg.files_with_matches {
+        out.clear();
+        let _ = out.push_str(path);
+        let _ = out.push_u8(10);
+        let _ = flush_locked(mut out, io.out_lock);
+        let _ = munmap(ptr, size);
+        let _ = std::runtime::posix::fs::close(fd);
+        if cfg.quiet {
+          return outcome_found(true);
+        }
+        break;
+      }
+
+      if cfg.heading && match_lines_in_file == 1 {
+        print_heading(mut out, io, path);
+      }
+
+      let _ = append_match_line(mut out, io, cfg, p, path, line_no, line_ptr, line_len, first);
+
+      if cfg.max_count > 0 && (match_lines_in_file as int) >= cfg.max_count {
+        break;
+      }
+
+      if cfg.quiet {
+        let _ = munmap(ptr, size);
+        let _ = std::runtime::posix::fs::close(fd);
+        return outcome_found(true);
+      }
+    }
+
+    if nl_ptr == 0 {
+      break;
+    }
+
+    off = next_off;
+    line_no = line_no + 1;
+  }
+
+  if matched_in_file {
+    stats.files_matched = stats.files_matched + 1;
+  }
+
+  let _ = munmap(ptr, size);
+  let _ = std::runtime::posix::fs::close(fd);
+  return Outcome{ found: matched_in_file, stop: false };
+}
+
+fn list_file (path: string, io: &IO, mut out: &Writer) -> void {
+  out.clear();
+  let _ = out.push_str(path);
+  let _ = out.push_u8(10);
+  let _ = flush_locked(mut out, io.out_lock);
+}
+
+fn walk_dir_files (cfg: &Config, open_path: string, io: &IO, mut path: &PathBuf, depth: int, mut out: &Writer, mut err: &Writer, mut stats: &Stats) -> void {
+  if cfg.max_depth >= 0 && depth > cfg.max_depth {
+    return;
+  }
+
+  let dir: u64 = opendir(open_path);
+  if dir == 0 {
+    return;
+  }
+
+  var tick: i64 = 0;
+  while true {
+    if io.cancel != None && (tick & 255) == 0 {
+      if cancel_is_set(io) {
+        break;
+      }
+    }
+    tick = tick + 1;
+
+    let dent: u64 = readdir(dir);
+    if dent == 0 {
+      break;
+    }
+
+    let dtype: u8 = dirent_d_type(dent);
+    let name_ptr: u64 = dirent_name_ptr(dent);
+    let name_len: i64 = cstr_len(name_ptr, 255);
+    if name_len <= 0 {
+      continue;
+    }
+
+    let name: string = std::runtime::mem::string_from_ptr_len(name_ptr, name_len as int);
+    if is_dot_or_dotdot(name) {
+      continue;
+    }
+    if !cfg.hidden && is_hidden_name(name) {
+      continue;
+    }
+    if cfg.ignore_vcs && is_vcs_dir_name(name) {
+      continue;
+    }
+
+    let saved_len: i64 = path.len;
+    let perr = path.push(name);
+    if perr != None {
+      stats.errors = stats.errors + 1;
+      write_error(mut err, io, open_path, "out of memory");
+      path_truncate(mut path, saved_len);
+      continue;
+    }
+
+    let child_path: string = path.as_string();
+
+    var is_dir: bool = false;
+    var is_file: bool = false;
+
+    if dtype == DT_DIR {
+      is_dir = true;
+    } else if dtype == DT_REG {
+      is_file = true;
+    } else if dtype == DT_LNK {
+      if cfg.follow {
+        let tmp: u64 = opendir(child_path);
+        if tmp != 0 {
+          let _ = closedir(tmp);
+          is_dir = true;
+        } else {
+          is_file = true;
+        }
+      }
+    } else if dtype == DT_UNKNOWN {
+      let tmp: u64 = opendir(child_path);
+      if tmp != 0 {
+        let _ = closedir(tmp);
+        is_dir = true;
+      } else {
+        is_file = true;
+      }
+    }
+
+    if is_dir {
+      let next_depth: int = depth + 1;
+      if cfg.max_depth >= 0 && next_depth > cfg.max_depth {
+        // Don't recurse.
+      } else {
+        walk_dir_files(cfg, child_path, io, mut path, next_depth, mut out, mut err, mut stats);
+      }
+    } else if is_file {
+      stats.files_total = stats.files_total + 1;
+      list_file(child_path, io, mut out);
+    }
+
+    path_truncate(mut path, saved_len);
+  }
+
+  let _ = closedir(dir);
+}
+
+fn walk_dir_search (cfg: &Config, p: &Pattern, open_path: string, io: &IO, mut path: &PathBuf, depth: int, mut out: &Writer, mut err: &Writer, mut stats: &Stats) -> Outcome {
+  if cfg.max_depth >= 0 && depth > cfg.max_depth {
+    return outcome_none();
+  }
+
+  let dir: u64 = opendir(open_path);
+  if dir == 0 {
+    return outcome_none();
+  }
+
+  var found_any: bool = false;
+
+  var tick: i64 = 0;
+  while true {
+    if io.cancel != None && (tick & 255) == 0 {
+      if cancel_is_set(io) {
+        let _ = closedir(dir);
+        return Outcome{ found: true, stop: true };
+      }
+    }
+    tick = tick + 1;
+
+    let dent: u64 = readdir(dir);
+    if dent == 0 {
+      break;
+    }
+
+    let dtype: u8 = dirent_d_type(dent);
+    let name_ptr: u64 = dirent_name_ptr(dent);
+    let name_len: i64 = cstr_len(name_ptr, 255);
+    if name_len <= 0 {
+      continue;
+    }
+
+    let name: string = std::runtime::mem::string_from_ptr_len(name_ptr, name_len as int);
+    if is_dot_or_dotdot(name) {
+      continue;
+    }
+    if !cfg.hidden && is_hidden_name(name) {
+      continue;
+    }
+    if cfg.ignore_vcs && is_vcs_dir_name(name) {
+      continue;
+    }
+
+    let saved_len: i64 = path.len;
+    let perr = path.push(name);
+    if perr != None {
+      stats.errors = stats.errors + 1;
+      write_error(mut err, io, open_path, "out of memory");
+      path_truncate(mut path, saved_len);
+      continue;
+    }
+
+    let child_path: string = path.as_string();
+
+    var is_dir: bool = false;
+    var is_file: bool = false;
+
+    if dtype == DT_DIR {
+      is_dir = true;
+    } else if dtype == DT_REG {
+      is_file = true;
+    } else if dtype == DT_LNK {
+      if cfg.follow {
+        let tmp: u64 = opendir(child_path);
+        if tmp != 0 {
+          let _ = closedir(tmp);
+          is_dir = true;
+        } else {
+          is_file = true;
+        }
+      }
+    } else if dtype == DT_UNKNOWN {
+      let tmp: u64 = opendir(child_path);
+      if tmp != 0 {
+        let _ = closedir(tmp);
+        is_dir = true;
+      } else {
+        is_file = true;
+      }
+    }
+
+    if is_dir {
+      let next_depth: int = depth + 1;
+      if cfg.max_depth >= 0 && next_depth > cfg.max_depth {
+        // Don't recurse.
+      } else {
+        let o: Outcome = walk_dir_search(cfg, p, child_path, io, mut path, next_depth, mut out, mut err, mut stats);
+        if o.found {
+          found_any = true;
+        }
+        if o.stop {
+          let _ = closedir(dir);
+          path_truncate(mut path, saved_len);
+          return Outcome{ found: true, stop: true };
+        }
+      }
+    } else if is_file {
+      stats.files_total = stats.files_total + 1;
+      let o: Outcome = search_file(cfg, p, child_path, io, mut out, mut err, mut stats);
+      if o.found {
+        found_any = true;
+      }
+      if o.stop {
+        let _ = closedir(dir);
+        path_truncate(mut path, saved_len);
+        return Outcome{ found: true, stop: true };
+      }
+    }
+
+    path_truncate(mut path, saved_len);
+  }
+
+  let _ = closedir(dir);
+  return Outcome{ found: found_any, stop: false };
+}
+
+fn handle_root_files (cfg: &Config, root: string, io: &IO, mut out: &Writer, mut err: &Writer, mut stats: &Stats) -> void {
+  var open_root: string = root;
+  if open_root == "" {
+    open_root = ".";
+  }
+  let dir: u64 = opendir(open_root);
+  if dir == 0 {
+    stats.files_total = stats.files_total + 1;
+    list_file(open_root, io, mut out);
+    return;
+  }
+  let _ = closedir(dir);
+
+  var base: string = open_root;
+  if root == "." {
+    base = "";
+  }
+  let pb_r: PathBufResult = std::path::PathBuf.from_string(base);
+  if pb_r.is_err() {
+    stats.errors = stats.errors + 1;
+    write_error(mut err, io, open_root, "out of memory");
+    return;
+  }
+  let mut path: PathBuf = match (pb_r) {
+    PathBufResult::Ok(v) => v,
+    PathBufResult::Err(_) => PathBuf{ ptr: 0, cap: 0, len: 0 },
+  };
+
+  walk_dir_files(cfg, open_root, io, mut path, 0, mut out, mut err, mut stats);
+  path.drop();
+}
+
+fn handle_root_search (cfg: &Config, p: &Pattern, root: string, io: &IO, mut out: &Writer, mut err: &Writer, mut stats: &Stats) -> Outcome {
+  var open_root: string = root;
+  if open_root == "" {
+    open_root = ".";
+  }
+  let dir: u64 = opendir(open_root);
+  if dir == 0 {
+    stats.files_total = stats.files_total + 1;
+    return search_file(cfg, p, open_root, io, mut out, mut err, mut stats);
+  }
+  let _ = closedir(dir);
+
+  var base: string = open_root;
+  if root == "." {
+    base = "";
+  }
+  let pb_r: PathBufResult = std::path::PathBuf.from_string(base);
+  if pb_r.is_err() {
+    stats.errors = stats.errors + 1;
+    write_error(mut err, io, open_root, "out of memory");
+    return outcome_none();
+  }
+  let mut path: PathBuf = match (pb_r) {
+    PathBufResult::Ok(v) => v,
+    PathBufResult::Err(_) => PathBuf{ ptr: 0, cap: 0, len: 0 },
+  };
+
+  let o: Outcome = walk_dir_search(cfg, p, open_root, io, mut path, 0, mut out, mut err, mut stats);
+  path.drop();
+  return o;
+}
+
+/**
+ * Per-worker summary returned from parallel tasks.
+ */
+struct WorkerResult {
+  stats: Stats,
+  found_any: bool,
+  stop: bool,
+}
+
+fn worker_result_empty () -> WorkerResult {
+  return WorkerResult{ stats: stats_init(), found_any: false, stop: false };
+}
+
+// Used only as an unreachable fallback when unwrapping optional task handles.
+task fn worker_noop () -> WorkerResult {
+  return worker_result_empty();
+}
+
+task fn worker_search_subtree (cfg: Config, pat_s: string, start_depth: int, mut path: PathBuf, io: IO) -> WorkerResult {
+  let mut stats: Stats = stats_init();
+
+  let cm: ColorMode = color_mode_from_code(cfg.color_mode);
+  let stdout_color: bool = color_enabled(cm, FD_STDOUT);
+  let stderr_color: bool = color_enabled(cm, FD_STDERR);
+
+  let out_opt: Writer? = Writer.stdout(stdout_color, 16384);
+  if out_opt == None {
+    stats.errors = stats.errors + 1;
+    return WorkerResult{ stats: stats, found_any: false, stop: true };
+  }
+  let mut out: Writer = match (out_opt) { Some(v) => v, None => Writer{ fd: -1, color: false, buf: BufferU8.empty() } };
+
+  let err_opt: Writer? = Writer.stderr(stderr_color, 8192);
+  if err_opt == None {
+    stats.errors = stats.errors + 1;
+    out.drop();
+    return WorkerResult{ stats: stats, found_any: false, stop: true };
+  }
+  let mut err: Writer = match (err_opt) { Some(v) => v, None => Writer{ fd: -1, color: false, buf: BufferU8.empty() } };
+
+  let pr: PatternResult = compile_pattern(pat_s, cfg.fixed_string, cfg.ignore_case);
+  let pat_opt: Pattern? = match pr {
+    Ok(v) => Some(move v),
+    Err(e) => pattern_compile_error(mut err, &io, mut stats, e),
+  };
+  if pat_opt == None {
+    out.drop();
+    err.drop();
+    path.drop();
+    return WorkerResult{ stats: stats, found_any: false, stop: true };
+  }
+  let mut pat: Pattern = match (pat_opt) {
+    Some(v) => move v,
+    None => Pattern{ kind: PatternKind::Fixed, needle: "", ignore_case: false, regex: std::regex::RegExp.empty() },
+  };
+
+  let open_path: string = path.as_string();
+  let dir: u64 = opendir(open_path);
+
+  var found_any: bool = false;
+  var stop: bool = false;
+
+  if dir == 0 {
+    stats.files_total = stats.files_total + 1;
+    let o: Outcome = search_file(cfg, &pat, open_path, &io, mut out, mut err, mut stats);
+    if o.found { found_any = true; }
+    if o.stop { found_any = true; stop = true; }
+  } else {
+    let _ = closedir(dir);
+    let o: Outcome = walk_dir_search(cfg, &pat, open_path, &io, mut path, start_depth, mut out, mut err, mut stats);
+    if o.found { found_any = true; }
+    if o.stop { found_any = true; stop = true; }
+  }
+
+  if stop {
+    cancel_set(&io);
+  }
+
+  pat.drop();
+  out.drop();
+  err.drop();
+  path.drop();
+
+  return WorkerResult{ stats: stats, found_any: found_any, stop: stop };
+}
+
+fn resolve_jobs (cfg: &Config) -> int {
+  if cfg.jobs > 0 {
+    return cfg.jobs;
+  }
+  // Auto mode.
+  let n: int = std::task::available_parallelism();
+  if n <= 0 { return 1; }
+  return n;
+}
+
+fn clamp_workers (jobs: int) -> int {
+  // `jobs` counts the orchestrator + worker tasks.
+  // We clamp to a small number because `task fn` calls currently spawn OS
+  // threads in the hosted subset (no global work-stealing pool yet).
+  let max_workers: int = 8;
+  if jobs <= 1 { return 0; }
+  let w: int = jobs - 1;
+  if w <= 0 { return 0; }
+  if w > max_workers { return max_workers; }
+  return w;
+}
+
+/**
+ * Parallel runner (task-based).
+ *
+ * Notes:
+ * - This currently parallelizes at the root-directory level by spawning up to
+ *   `--jobs-1` worker tasks for top-level subdirectories. Remaining work is
+ *   handled in the orchestrator thread.
+ * - Output is serialized with a mutex to avoid interleaving.
+ */
+export async fn run_parallel (cfg: Config) -> int {
+  if cfg.mode == Mode::Files {
+    // `--files` is already I/O-bound and output-heavy; keep the simple
+    // single-threaded walk for now.
+    return run(cfg);
+  }
+
+  let jobs: int = resolve_jobs(cfg);
+  let worker_budget: int = clamp_workers(jobs);
+  if worker_budget <= 0 {
+    return run(cfg);
+  }
+
+  // Shared output lock for stdout/stderr.
+  let m_r: std::sync::MutexResult = std::sync::Mutex.init();
+  let mut out_mutex: std::sync::Mutex = match (m_r) {
+    Ok(v) => v,
+    Err(_) => std::sync::Mutex.invalid(),
+  };
+  if !out_mutex.is_valid() {
+    return run(cfg);
+  }
+  let lock: std::sync::MutexBorrow = out_mutex.borrow();
+
+  // Quiet-mode cancellation.
+  let mut cancel_tok: std::sync::CancellationToken = std::sync::CancellationToken.invalid();
+  var cancel_borrow: std::sync::CancellationTokenBorrow? = None;
+  if cfg.quiet {
+    let t_r: std::sync::CancellationTokenResult = std::sync::CancellationToken.init();
+    cancel_tok = match (t_r) {
+      Ok(v) => v,
+      Err(_) => std::sync::CancellationToken.invalid(),
+    };
+    if cancel_tok.is_valid() {
+      cancel_borrow = Some(cancel_tok.borrow());
+    }
+  }
+
+  let io: IO = IO{ out_lock: Some(lock), err_lock: Some(lock), cancel: cancel_borrow };
+
+  let cm: ColorMode = color_mode_from_code(cfg.color_mode);
+  let stdout_color: bool = color_enabled(cm, FD_STDOUT);
+  let stderr_color: bool = color_enabled(cm, FD_STDERR);
+
+  let out_opt: Writer? = Writer.stdout(stdout_color, 16384);
+  if out_opt == None {
+    out_mutex.drop();
+    cancel_tok.drop();
+    return 2;
+  }
+  let mut out: Writer = match (out_opt) { Some(v) => v, None => Writer{ fd: -1, color: false, buf: BufferU8.empty() } };
+
+  let err_opt: Writer? = Writer.stderr(stderr_color, 8192);
+  if err_opt == None {
+    out.drop();
+    out_mutex.drop();
+    cancel_tok.drop();
+    return 2;
+  }
+  let mut err: Writer = match (err_opt) { Some(v) => v, None => Writer{ fd: -1, color: false, buf: BufferU8.empty() } };
+
+  // Stats + task handles.
+  let start_ns_opt: i64? = std::runtime::posix::time::monotonic_now_ns();
+  let start_ns: i64 = match (start_ns_opt) { Some(v) => v, None => 0 };
+
+  let mut stats: Stats = stats_init();
+  var found_any: bool = false;
+
+  // Pattern compilation for the orchestrator thread.
+  let pat_s: string = match (cfg.pattern) { Some(v) => v, None => "" };
+  let pr: PatternResult = compile_pattern(pat_s, cfg.fixed_string, cfg.ignore_case);
+  let pat_opt: Pattern? = match pr {
+    Ok(v) => Some(move v),
+    Err(e) => pattern_compile_error(mut err, &io, mut stats, e),
+  };
+  if pat_opt == None {
+    out.drop();
+    err.drop();
+    out_mutex.drop();
+    cancel_tok.drop();
+    return 2;
+  }
+  let mut pat: Pattern = match (pat_opt) {
+    Some(v) => move v,
+    None => Pattern{ kind: PatternKind::Fixed, needle: "", ignore_case: false, regex: std::regex::RegExp.empty() },
+  };
+
+  var budget: int = worker_budget;
+  var t0: Task(WorkerResult)? = None;
+  var t1: Task(WorkerResult)? = None;
+  var t2: Task(WorkerResult)? = None;
+  var t3: Task(WorkerResult)? = None;
+  var t4: Task(WorkerResult)? = None;
+  var t5: Task(WorkerResult)? = None;
+  var t6: Task(WorkerResult)? = None;
+  var t7: Task(WorkerResult)? = None;
+
+  // Walk roots, spawning workers for top-level subdirectories.
+  let n: int = cfg.path_count();
+  var root_end: int = 1;
+  if n > 0 {
+    root_end = n;
+  }
+  var root_i: int = 0;
+  while root_i < root_end {
+    if cancel_is_set(&io) {
+      found_any = true;
+      break;
+    }
+
+    var root: string = ".";
+    if n > 0 {
+      let root_opt: string? = cfg.path_at(root_i);
+      root = match (root_opt) {
+        Some(v) => v,
+        None => ".",
+      };
+    }
+
+    var open_root: string = root;
+    if open_root == "" { open_root = "."; }
+
+    let dir: u64 = opendir(open_root);
+    if dir == 0 {
+      // Root is a file.
+      stats.files_total = stats.files_total + 1;
+      let o: Outcome = search_file(cfg, &pat, open_root, &io, mut out, mut err, mut stats);
+      if o.found { found_any = true; }
+      if o.stop { found_any = true; cancel_set(&io); break; }
+      root_i = root_i + 1;
+      continue;
+    }
+
+    // Root is a directory: iterate its entries and split at depth=1.
+    var base: string = open_root;
+    if root == "." { base = ""; }
+    let pb_r: PathBufResult = std::path::PathBuf.from_string(base);
+    if pb_r.is_err() {
+      stats.errors = stats.errors + 1;
+      write_error(mut err, &io, open_root, "out of memory");
+      let _ = closedir(dir);
+      root_i = root_i + 1;
+      continue;
+    }
+    let mut path: PathBuf = match (pb_r) { PathBufResult::Ok(v) => v, PathBufResult::Err(_) => PathBuf{ ptr: 0, cap: 0, len: 0 } };
+
+    while true {
+      if cancel_is_set(&io) {
+        found_any = true;
+        break;
+      }
+
+      let dent: u64 = readdir(dir);
+      if dent == 0 {
+        break;
+      }
+
+      let dtype: u8 = dirent_d_type(dent);
+      let name_ptr: u64 = dirent_name_ptr(dent);
+      let name_len: i64 = cstr_len(name_ptr, 255);
+      if name_len <= 0 {
+        continue;
+      }
+
+      let name: string = std::runtime::mem::string_from_ptr_len(name_ptr, name_len as int);
+      if is_dot_or_dotdot(name) { continue; }
+      if !cfg.hidden && is_hidden_name(name) { continue; }
+      if cfg.ignore_vcs && is_vcs_dir_name(name) { continue; }
+
+      let saved_len: i64 = path.len;
+      let perr = path.push(name);
+      if perr != None {
+        stats.errors = stats.errors + 1;
+        write_error(mut err, &io, open_root, "out of memory");
+        path_truncate(mut path, saved_len);
+        continue;
+      }
+
+      let child_path: string = path.as_string();
+
+      var is_dir: bool = false;
+      var is_file: bool = false;
+
+      if dtype == DT_DIR {
+        is_dir = true;
+      } else if dtype == DT_REG {
+        is_file = true;
+      } else if dtype == DT_LNK {
+        if cfg.follow {
+          let tmp: u64 = opendir(child_path);
+          if tmp != 0 {
+            let _ = closedir(tmp);
+            is_dir = true;
+          } else {
+            is_file = true;
+          }
+        }
+      } else if dtype == DT_UNKNOWN {
+        let tmp: u64 = opendir(child_path);
+        if tmp != 0 {
+          let _ = closedir(tmp);
+          is_dir = true;
+        } else {
+          is_file = true;
+        }
+      }
+
+      if is_dir {
+        let next_depth: int = 1;
+        if cfg.max_depth >= 0 && next_depth > cfg.max_depth {
+          // Don't recurse.
+        } else {
+          let has_slot: bool =
+            t0 == None || t1 == None || t2 == None || t3 == None ||
+            t4 == None || t5 == None || t6 == None || t7 == None;
+          if budget > 0 && has_slot {
+          let child_r: PathBufResult = std::path::PathBuf.from_string(child_path);
+          if child_r.is_err() {
+            stats.errors = stats.errors + 1;
+            write_error(mut err, &io, child_path, "out of memory");
+          } else {
+            let child_pb: PathBuf = match (child_r) { PathBufResult::Ok(v) => v, PathBufResult::Err(_) => PathBuf{ ptr: 0, cap: 0, len: 0 } };
+            let task_h: Task(WorkerResult) = worker_search_subtree(cfg, pat_s, next_depth, child_pb, io);
+
+            var stored: bool = false;
+            if t0 == None { t0 = Some(move task_h); stored = true; }
+            else if t1 == None { t1 = Some(move task_h); stored = true; }
+            else if t2 == None { t2 = Some(move task_h); stored = true; }
+            else if t3 == None { t3 = Some(move task_h); stored = true; }
+            else if t4 == None { t4 = Some(move task_h); stored = true; }
+            else if t5 == None { t5 = Some(move task_h); stored = true; }
+            else if t6 == None { t6 = Some(move task_h); stored = true; }
+            else if t7 == None { t7 = Some(move task_h); stored = true; }
+
+            if stored {
+              budget = budget - 1;
+            } else {
+              // No slot available; fall back to synchronous recursion.
+              let o: Outcome = walk_dir_search(cfg, &pat, child_path, &io, mut path, next_depth, mut out, mut err, mut stats);
+              if o.found { found_any = true; }
+              if o.stop { found_any = true; cancel_set(&io); path_truncate(mut path, saved_len); break; }
+            }
+          }
+          } else {
+            let o: Outcome = walk_dir_search(cfg, &pat, child_path, &io, mut path, next_depth, mut out, mut err, mut stats);
+            if o.found { found_any = true; }
+            if o.stop { found_any = true; cancel_set(&io); path_truncate(mut path, saved_len); break; }
+          }
+        }
+      } else if is_file {
+        stats.files_total = stats.files_total + 1;
+        let o: Outcome = search_file(cfg, &pat, child_path, &io, mut out, mut err, mut stats);
+        if o.found { found_any = true; }
+        if o.stop { found_any = true; cancel_set(&io); path_truncate(mut path, saved_len); break; }
+      }
+
+      path_truncate(mut path, saved_len);
+    }
+
+    let _ = closedir(dir);
+    path.drop();
+
+    if cancel_is_set(&io) {
+      found_any = true;
+      break;
+    }
+
+    root_i = root_i + 1;
+  }
+
+  // Join worker tasks and merge stats.
+  task {
+    if t0 != None {
+      let h: Task(WorkerResult) = match (t0) { Some(v) => move v, None => worker_noop() };
+      let r: WorkerResult = yield h;
+      stats.files_total = stats.files_total + r.stats.files_total;
+      stats.files_searched = stats.files_searched + r.stats.files_searched;
+      stats.files_matched = stats.files_matched + r.stats.files_matched;
+      stats.match_lines = stats.match_lines + r.stats.match_lines;
+      stats.errors = stats.errors + r.stats.errors;
+      if r.found_any { found_any = true; }
+      if r.stop { found_any = true; }
+      t0 = None;
+    }
+    if t1 != None {
+      let h: Task(WorkerResult) = match (t1) { Some(v) => move v, None => worker_noop() };
+      let r: WorkerResult = yield h;
+      stats.files_total = stats.files_total + r.stats.files_total;
+      stats.files_searched = stats.files_searched + r.stats.files_searched;
+      stats.files_matched = stats.files_matched + r.stats.files_matched;
+      stats.match_lines = stats.match_lines + r.stats.match_lines;
+      stats.errors = stats.errors + r.stats.errors;
+      if r.found_any { found_any = true; }
+      if r.stop { found_any = true; }
+      t1 = None;
+    }
+    if t2 != None {
+      let h: Task(WorkerResult) = match (t2) { Some(v) => move v, None => worker_noop() };
+      let r: WorkerResult = yield h;
+      stats.files_total = stats.files_total + r.stats.files_total;
+      stats.files_searched = stats.files_searched + r.stats.files_searched;
+      stats.files_matched = stats.files_matched + r.stats.files_matched;
+      stats.match_lines = stats.match_lines + r.stats.match_lines;
+      stats.errors = stats.errors + r.stats.errors;
+      if r.found_any { found_any = true; }
+      if r.stop { found_any = true; }
+      t2 = None;
+    }
+    if t3 != None {
+      let h: Task(WorkerResult) = match (t3) { Some(v) => move v, None => worker_noop() };
+      let r: WorkerResult = yield h;
+      stats.files_total = stats.files_total + r.stats.files_total;
+      stats.files_searched = stats.files_searched + r.stats.files_searched;
+      stats.files_matched = stats.files_matched + r.stats.files_matched;
+      stats.match_lines = stats.match_lines + r.stats.match_lines;
+      stats.errors = stats.errors + r.stats.errors;
+      if r.found_any { found_any = true; }
+      if r.stop { found_any = true; }
+      t3 = None;
+    }
+    if t4 != None {
+      let h: Task(WorkerResult) = match (t4) { Some(v) => move v, None => worker_noop() };
+      let r: WorkerResult = yield h;
+      stats.files_total = stats.files_total + r.stats.files_total;
+      stats.files_searched = stats.files_searched + r.stats.files_searched;
+      stats.files_matched = stats.files_matched + r.stats.files_matched;
+      stats.match_lines = stats.match_lines + r.stats.match_lines;
+      stats.errors = stats.errors + r.stats.errors;
+      if r.found_any { found_any = true; }
+      if r.stop { found_any = true; }
+      t4 = None;
+    }
+    if t5 != None {
+      let h: Task(WorkerResult) = match (t5) { Some(v) => move v, None => worker_noop() };
+      let r: WorkerResult = yield h;
+      stats.files_total = stats.files_total + r.stats.files_total;
+      stats.files_searched = stats.files_searched + r.stats.files_searched;
+      stats.files_matched = stats.files_matched + r.stats.files_matched;
+      stats.match_lines = stats.match_lines + r.stats.match_lines;
+      stats.errors = stats.errors + r.stats.errors;
+      if r.found_any { found_any = true; }
+      if r.stop { found_any = true; }
+      t5 = None;
+    }
+    if t6 != None {
+      let h: Task(WorkerResult) = match (t6) { Some(v) => move v, None => worker_noop() };
+      let r: WorkerResult = yield h;
+      stats.files_total = stats.files_total + r.stats.files_total;
+      stats.files_searched = stats.files_searched + r.stats.files_searched;
+      stats.files_matched = stats.files_matched + r.stats.files_matched;
+      stats.match_lines = stats.match_lines + r.stats.match_lines;
+      stats.errors = stats.errors + r.stats.errors;
+      if r.found_any { found_any = true; }
+      if r.stop { found_any = true; }
+      t6 = None;
+    }
+    if t7 != None {
+      let h: Task(WorkerResult) = match (t7) { Some(v) => move v, None => worker_noop() };
+      let r: WorkerResult = yield h;
+      stats.files_total = stats.files_total + r.stats.files_total;
+      stats.files_searched = stats.files_searched + r.stats.files_searched;
+      stats.files_matched = stats.files_matched + r.stats.files_matched;
+      stats.match_lines = stats.match_lines + r.stats.match_lines;
+      stats.errors = stats.errors + r.stats.errors;
+      if r.found_any { found_any = true; }
+      if r.stop { found_any = true; }
+      t7 = None;
+    }
+  }
+
+  let end_ns_opt: i64? = std::runtime::posix::time::monotonic_now_ns();
+  let end_ns: i64 = match (end_ns_opt) { Some(v) => v, None => start_ns };
+  let elapsed_ns: i64 = end_ns - start_ns;
+  print_stats(mut err, &io, cfg, stats, elapsed_ns);
+
+  pat.drop();
+  out.drop();
+  err.drop();
+  out_mutex.drop();
+  cancel_tok.drop();
+
+  if stats.errors > 0 {
+    return 2;
+  }
+  if found_any {
+    return 0;
+  }
+  return 1;
+}
+
+/**
+ * Async entrypoint that selects a runner based on `Config.jobs`.
+ */
+export async fn run_auto (cfg: Config) -> int {
+  let jobs: int = resolve_jobs(cfg);
+  if jobs <= 1 || cfg.jobs == 1 {
+    return run(cfg);
+  }
+  return await run_parallel(cfg);
+}
+
+/**
+ * Run `slg` with a parsed `Config`.
+ *
+ * @returns int Exit code: 0 (match found), 1 (no match), 2 (error).
+ */
+export fn run (cfg: Config) -> int {
+  let mode: Mode = cfg.mode;
+  let io: IO = io_none();
+
+  let cm: ColorMode = color_mode_from_code(cfg.color_mode);
+  let stdout_color: bool = color_enabled(cm, FD_STDOUT);
+  let stderr_color: bool = color_enabled(cm, FD_STDERR);
+
+  let out_opt: Writer? = Writer.stdout(stdout_color, 16384);
+  if out_opt == None {
+    return 2;
+  }
+  let err_opt: Writer? = Writer.stderr(stderr_color, 8192);
+  if err_opt == None {
+    return 2;
+  }
+
+  let mut out: Writer = match (out_opt) {
+    Some(v) => v,
+    None => Writer{ fd: 1, color: false, buf: BufferU8.empty() },
+  };
+  let mut err: Writer = match (err_opt) {
+    Some(v) => v,
+    None => Writer{ fd: 2, color: false, buf: BufferU8.empty() },
+  };
+
+  let start_ns_opt: i64? = std::runtime::posix::time::monotonic_now_ns();
+  let start_ns: i64 = match (start_ns_opt) {
+    Some(v) => v,
+    None => 0,
+  };
+  let mut stats: Stats = stats_init();
+  var found_any: bool = false;
+
+  if mode == Mode::Files {
+    let n: int = cfg.path_count();
+    if n <= 0 {
+      handle_root_files(cfg, ".", &io, mut out, mut err, mut stats);
+    } else {
+      var i: int = 0;
+      while i < n {
+        let root_opt: string? = cfg.path_at(i);
+        let root: string = match (root_opt) {
+          Some(v) => v,
+          None => ".",
+        };
+        handle_root_files(cfg, root, &io, mut out, mut err, mut stats);
+        i = i + 1;
+      }
+    }
+  } else {
+    let pat_s: string = match (cfg.pattern) {
+      Some(v) => v,
+      None => "",
+    };
+    let pr: PatternResult = compile_pattern(pat_s, cfg.fixed_string, cfg.ignore_case);
+    let pat_opt: Pattern? = match pr {
+      Ok(v) => Some(move v),
+      Err(e) => pattern_compile_error(mut err, &io, mut stats, e),
+    };
+    if pat_opt == None {
+      out.drop();
+      err.drop();
+      return 2;
+    }
+    let mut pat: Pattern = match (pat_opt) {
+      Some(v) => move v,
+      None => Pattern{ kind: PatternKind::Fixed, needle: "", ignore_case: false, regex: std::regex::RegExp.empty() },
+    };
+
+    let n: int = cfg.path_count();
+    if n <= 0 {
+      let o: Outcome = handle_root_search(cfg, &pat, ".", &io, mut out, mut err, mut stats);
+      if o.found { found_any = true; }
+    } else {
+      var i: int = 0;
+      while i < n {
+        let root_opt: string? = cfg.path_at(i);
+        let root: string = match (root_opt) {
+          Some(v) => v,
+          None => ".",
+        };
+        let o: Outcome = handle_root_search(cfg, &pat, root, &io, mut out, mut err, mut stats);
+        if o.found { found_any = true; }
+        if o.stop { found_any = true; break; }
+        i = i + 1;
+      }
+    }
+
+    pat.drop();
+  }
+
+  let end_ns_opt: i64? = std::runtime::posix::time::monotonic_now_ns();
+  let end_ns: i64 = match (end_ns_opt) {
+    Some(v) => v,
+    None => start_ns,
+  };
+  let elapsed_ns: i64 = end_ns - start_ns;
+  print_stats(mut err, &io, cfg, stats, elapsed_ns);
+
+  out.drop();
+  err.drop();
+
+  if stats.errors > 0 {
+    return 2;
+  }
+  if mode == Mode::Files {
+    return 0;
+  }
+  if found_any {
+    return 0;
+  }
+  return 1;
+}

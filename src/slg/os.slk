@@ -1,0 +1,109 @@
+module slg::os;
+
+import std::runtime::posix::fs;
+
+// ---------------------------------------------------------------------------
+// POSIX/libc bindings used by `slg`.
+//
+// NOTE: These are intentionally kept in a single module so:
+// - platform assumptions are centralized,
+// - tests and diagnostics can reference one place,
+// - future ports can swap the implementation behind a stable interface.
+
+/**
+ * `opendir(3)` — open a directory stream.
+ *
+ * @param path: string Directory path.
+ * @returns u64 DIR* pointer, or 0 on failure.
+ */
+export ext opendir = fn (string) -> u64;
+
+/**
+ * `readdir(3)` — read the next directory entry.
+ *
+ * @param dir: u64 DIR*.
+ * @returns u64 `struct dirent*`, or 0 on end-of-directory (or error).
+ */
+export ext readdir = fn (u64) -> u64;
+
+/**
+ * `closedir(3)` — close a directory stream.
+ *
+ * @param dir: u64 DIR*.
+ * @returns int 0 on success, otherwise -1.
+ */
+export ext closedir = fn (u64) -> int;
+
+/**
+ * `isatty(3)` — test whether a file descriptor refers to a terminal.
+ *
+ * @param fd: int File descriptor.
+ * @returns int 1 for yes, 0 for no, -1 for error.
+ */
+export ext isatty = fn (int) -> int;
+
+/**
+ * `dup(2)` — duplicate a file descriptor.
+ *
+ * This is used by end-to-end tests to temporarily redirect stdout/stderr.
+ *
+ * @param fd: int Existing file descriptor.
+ * @returns int New file descriptor on success, otherwise -1.
+ */
+export ext dup = fn (int) -> int;
+
+/**
+ * `memchr(3)` — find the first byte in a memory region.
+ *
+ * @param hay: u64 Pointer to bytes.
+ * @param needle: int Byte value (0..255).
+ * @param len: i64 Byte length.
+ * @returns u64 Pointer to the match, or 0.
+ */
+export ext memchr = fn (u64, int, i64) -> u64;
+
+/**
+ * `memmem(3)` — find a byte substring in a memory region (glibc).
+ *
+ * @param hay_ptr: u64 Haystack pointer.
+ * @param hay_len: i64 Haystack length.
+ * @param needle_ptr: u64 Needle pointer.
+ * @param needle_len: i64 Needle length.
+ * @returns u64 Pointer to the first match, or 0.
+ */
+export ext memmem = fn (u64, i64, u64, i64) -> u64;
+
+/**
+ * `mmap(2)` — map a file into memory (POSIX hosted baseline).
+ */
+export ext mmap = fn (u64, i64, int, int, int, i64) -> u64;
+
+/**
+ * `munmap(2)` — unmap a memory mapping.
+ */
+export ext munmap = fn (u64, i64) -> int;
+
+// `mmap` constants (linux hosted baseline).
+export const PROT_READ: int = 1;
+export const MAP_PRIVATE: int = 2;
+export const MAP_FAILED: u64 = 18446744073709551615;
+
+// `dirent.d_type` constants (linux hosted baseline).
+export const DT_UNKNOWN: u8 = 0;
+export const DT_FIFO: u8 = 1;
+export const DT_CHR: u8 = 2;
+export const DT_DIR: u8 = 4;
+export const DT_BLK: u8 = 6;
+export const DT_REG: u8 = 8;
+export const DT_LNK: u8 = 10;
+export const DT_SOCK: u8 = 12;
+export const DT_WHT: u8 = 14;
+
+/**
+ * Read `errno` via the hosted POSIX backend.
+ *
+ * @returns int errno value (0 when unavailable).
+ */
+export fn errno () -> int {
+  return std::runtime::posix::fs::errno();
+}

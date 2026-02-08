@@ -1,0 +1,49 @@
+[package]
+name = "slg"
+version = "0.1.0"
+description = "slg (Silk Line Grep) - fast recursive file + pattern search"
+
+# Note: the Silk compiler currently only consumes `name` and `version`.
+# Extra metadata is included for downstream tooling and future use.
+license = "MIT"
+readme = "README.md"
+documentation = "man/slg.1"
+notes = "NOTES.md"
+keywords = [
+  "search",
+  "grep",
+  "ripgrep",
+  "regex",
+  "cli"
+]
+categories = [
+  "command-line-utilities",
+  "text-processing"
+]
+
+[sources]
+include = [
+  "src/**/*.slk"
+]
+
+[build]
+default_target = "slg"
+profile = "release"
+
+[test]
+command = "silk test --package ."
+e2e = true
+testdata = [
+  "testdata/basic"
+]
+
+[docs]
+man_pages = [
+  "man/slg.1"
+]
+
+[[target]]
+name = "slg"
+kind = "executable"
+entry = "src/main.slk"
+output = "build/bin/slg"

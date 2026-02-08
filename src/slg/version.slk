@@ -1,0 +1,17 @@
+module slg::version;
+
+/**
+ * Package version string.
+ *
+ * Keep this in sync with `silk.toml` `package.version`.
+ */
+export fn VERSION () -> string {
+  return "0.1.0";
+}
+
+/**
+ * Program name for display.
+ */
+export fn NAME () -> string {
+  return "slg";
+}

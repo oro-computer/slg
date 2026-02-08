@@ -1,0 +1,565 @@
+package slg;
+
+import { Args } from "std/args";
+import std::interfaces;
+import std::runtime::mem;
+import std::runtime::posix::fs;
+import std::runtime::posix::io;
+
+import { Config, parse_cli, print_help, print_version } from "./slg/cli.slk";
+import { run_auto } from "./slg/engine.slk";
+import { BufferU8 } from "./slg/buf.slk";
+import { dup, memmem } from "./slg/os.slk";
+import { smoke as formal_smoke } from "./slg/formal.slk";
+
+async fn run_cfg (cfg: Config) -> int {
+  if cfg.help {
+    print_help();
+    return 0;
+  }
+  if cfg.version {
+    print_version();
+    return 0;
+  }
+  return await run_auto(cfg);
+}
+
+/**
+ * `slg` (Silk Line Grep) — fast recursive file + pattern search.
+ *
+ * This is the program entrypoint used by `silk build` for the `slg` target.
+ *
+ * @param argc: int Argument count (C `argc`).
+ * @param argv: u64 Pointer to argv (C `argv`).
+ * @returns int Exit code (0: match found, 1: no match, 2: error).
+ */
+export async fn main (argc: int, argv: u64) -> int {
+  let args: Args = Args.init(argc, argv);
+  let cfg_opt: Config? = parse_cli(args);
+  return match (cfg_opt) {
+    Some(cfg) => await run_cfg(cfg),
+    None => 2,
+  };
+}
+
+/**
+ * Minimal `argv` owner for end-to-end CLI tests.
+ *
+ * This allocates:
+ * - one `char**` pointer list (`argv`),
+ * - one NUL-terminated allocation per argument (`argv[i]`).
+ */
+struct ArgvOwned {
+  argc: int,
+  argv: u64,
+}
+
+/**
+ * Load a little-endian 32-bit integer from `ptr + offset`.
+ */
+fn load_i32_le (ptr: u64, offset: i64) -> int {
+  let b0: u64 = std::runtime::mem::load_u8(ptr, offset + 0) as u64;
+  let b1: u64 = std::runtime::mem::load_u8(ptr, offset + 1) as u64;
+  let b2: u64 = std::runtime::mem::load_u8(ptr, offset + 2) as u64;
+  let b3: u64 = std::runtime::mem::load_u8(ptr, offset + 3) as u64;
+  let v: u64 = b0 | (b1 << 8) | (b2 << 16) | (b3 << 24);
+  return v as int;
+}
+
+/**
+ * Allocate a NUL-terminated C string copy of `s`.
+ *
+ * @returns u64 Pointer on success, otherwise 0 on OOM.
+ */
+fn cstr_alloc (s: string) -> u64 {
+  let len: i64 = std::runtime::mem::string_len(s);
+  if len < 0 {
+    return 0;
+  }
+  let ptr: u64 = std::runtime::mem::alloc(len + 1);
+  if ptr == 0 {
+    return 0;
+  }
+
+  let src: u64 = std::runtime::mem::string_ptr(s);
+  var i: i64 = 0;
+  while i < len {
+    let b: u8 = std::runtime::mem::load_u8(src, i);
+    std::runtime::mem::store_u8(ptr, i, b);
+    i = i + 1;
+  }
+  std::runtime::mem::store_u8(ptr, len, 0);
+  return ptr;
+}
+
+/**
+ * Free the first `count` `argv[i]` allocations in a `char**` list.
+ */
+fn argv_free_partial (argv: u64, count: int) -> void {
+  if argv == 0 || count <= 0 {
+    return;
+  }
+  var i: int = 0;
+  while i < count {
+    let p: u64 = std::runtime::mem::load_u64(argv, (i * 8) as i64);
+    std::runtime::mem::free(p);
+    i = i + 1;
+  }
+}
+
+/**
+ * Allocate an owned argv list with 3 entries.
+ */
+fn argv_alloc_3 (a0: string, a1: string, a2: string) -> ArgvOwned? {
+  let argc: int = 3;
+  let argv: u64 = std::runtime::mem::alloc((argc * 8) as i64);
+  if argv == 0 {
+    return None;
+  }
+
+  let p0: u64 = cstr_alloc(a0);
+  if p0 == 0 {
+    std::runtime::mem::free(argv);
+    return None;
+  }
+  std::runtime::mem::store_u64(argv, 0, p0);
+
+  let p1: u64 = cstr_alloc(a1);
+  if p1 == 0 {
+    argv_free_partial(argv, 1);
+    std::runtime::mem::free(argv);
+    return None;
+  }
+  std::runtime::mem::store_u64(argv, 8, p1);
+
+  let p2: u64 = cstr_alloc(a2);
+  if p2 == 0 {
+    argv_free_partial(argv, 2);
+    std::runtime::mem::free(argv);
+    return None;
+  }
+  std::runtime::mem::store_u64(argv, 16, p2);
+
+  return Some(ArgvOwned{ argc: argc, argv: argv });
+}
+
+/**
+ * Allocate an owned argv list with 4 entries.
+ */
+fn argv_alloc_4 (a0: string, a1: string, a2: string, a3: string) -> ArgvOwned? {
+  let argc: int = 4;
+  let argv: u64 = std::runtime::mem::alloc((argc * 8) as i64);
+  if argv == 0 {
+    return None;
+  }
+
+  let p0: u64 = cstr_alloc(a0);
+  if p0 == 0 {
+    std::runtime::mem::free(argv);
+    return None;
+  }
+  std::runtime::mem::store_u64(argv, 0, p0);
+
+  let p1: u64 = cstr_alloc(a1);
+  if p1 == 0 {
+    argv_free_partial(argv, 1);
+    std::runtime::mem::free(argv);
+    return None;
+  }
+  std::runtime::mem::store_u64(argv, 8, p1);
+
+  let p2: u64 = cstr_alloc(a2);
+  if p2 == 0 {
+    argv_free_partial(argv, 2);
+    std::runtime::mem::free(argv);
+    return None;
+  }
+  std::runtime::mem::store_u64(argv, 16, p2);
+
+  let p3: u64 = cstr_alloc(a3);
+  if p3 == 0 {
+    argv_free_partial(argv, 3);
+    std::runtime::mem::free(argv);
+    return None;
+  }
+  std::runtime::mem::store_u64(argv, 24, p3);
+
+  return Some(ArgvOwned{ argc: argc, argv: argv });
+}
+
+/**
+ * Allocate an owned argv list with 5 entries.
+ */
+fn argv_alloc_5 (a0: string, a1: string, a2: string, a3: string, a4: string) -> ArgvOwned? {
+  let argc: int = 5;
+  let argv: u64 = std::runtime::mem::alloc((argc * 8) as i64);
+  if argv == 0 {
+    return None;
+  }
+
+  let p0: u64 = cstr_alloc(a0);
+  if p0 == 0 {
+    std::runtime::mem::free(argv);
+    return None;
+  }
+  std::runtime::mem::store_u64(argv, 0, p0);
+
+  let p1: u64 = cstr_alloc(a1);
+  if p1 == 0 {
+    argv_free_partial(argv, 1);
+    std::runtime::mem::free(argv);
+    return None;
+  }
+  std::runtime::mem::store_u64(argv, 8, p1);
+
+  let p2: u64 = cstr_alloc(a2);
+  if p2 == 0 {
+    argv_free_partial(argv, 2);
+    std::runtime::mem::free(argv);
+    return None;
+  }
+  std::runtime::mem::store_u64(argv, 16, p2);
+
+  let p3: u64 = cstr_alloc(a3);
+  if p3 == 0 {
+    argv_free_partial(argv, 3);
+    std::runtime::mem::free(argv);
+    return None;
+  }
+  std::runtime::mem::store_u64(argv, 24, p3);
+
+  let p4: u64 = cstr_alloc(a4);
+  if p4 == 0 {
+    argv_free_partial(argv, 4);
+    std::runtime::mem::free(argv);
+    return None;
+  }
+  std::runtime::mem::store_u64(argv, 32, p4);
+
+  return Some(ArgvOwned{ argc: argc, argv: argv });
+}
+
+/**
+ * Allocate an owned argv list with 2 entries.
+ */
+fn argv_alloc_2 (a0: string, a1: string) -> ArgvOwned? {
+  let argc: int = 2;
+  let argv: u64 = std::runtime::mem::alloc((argc * 8) as i64);
+  if argv == 0 {
+    return None;
+  }
+
+  let p0: u64 = cstr_alloc(a0);
+  if p0 == 0 {
+    std::runtime::mem::free(argv);
+    return None;
+  }
+  std::runtime::mem::store_u64(argv, 0, p0);
+
+  let p1: u64 = cstr_alloc(a1);
+  if p1 == 0 {
+    argv_free_partial(argv, 1);
+    std::runtime::mem::free(argv);
+    return None;
+  }
+  std::runtime::mem::store_u64(argv, 8, p1);
+
+  return Some(ArgvOwned{ argc: argc, argv: argv });
+}
+
+impl ArgvOwned as std::interfaces::Drop {
+  public fn drop (mut self: &ArgvOwned) -> void {
+    argv_free_partial(self.argv, self.argc);
+    std::runtime::mem::free(self.argv);
+    self.argc = 0;
+    self.argv = 0;
+  }
+}
+
+/**
+ * Read all bytes from `fd` into a growable buffer.
+ */
+fn read_all_fd (fd: int) -> BufferU8? {
+  let b_opt: BufferU8? = BufferU8.init(4096);
+  if b_opt == None {
+    return None;
+  }
+  let mut b: BufferU8 = match (b_opt) {
+    Some(v) => v,
+    None => BufferU8.empty(),
+  };
+
+  let chunk_size: i64 = 4096;
+  let chunk: u64 = std::runtime::mem::alloc(chunk_size);
+  if chunk == 0 {
+    b.drop();
+    return None;
+  }
+
+  while true {
+    let n: int = std::runtime::posix::io::read(fd, chunk, chunk_size);
+    if n <= 0 {
+      break;
+    }
+    let err = b.push_ptr_len(chunk, n as i64);
+    if err != None {
+      std::runtime::mem::free(chunk);
+      b.drop();
+      return None;
+    }
+  }
+
+  std::runtime::mem::free(chunk);
+  return Some(b);
+}
+
+/**
+ * View the buffer bytes as a `string` without UTF-8 validation.
+ */
+fn buffer_as_string (b: &BufferU8) -> string {
+  let bytes = b.as_bytes();
+  if bytes.len <= 0 || bytes.ptr == 0 {
+    return "";
+  }
+  let len_i64: i64 = bytes.len;
+  let max_i32: i64 = 2147483647 as i64;
+  let len: int = if len_i64 > max_i32 { max_i32 as int } else { len_i64 as int };
+  return std::runtime::mem::string_from_ptr_len(bytes.ptr, len);
+}
+
+/**
+ * Return whether `hay` contains `needle` as a byte substring.
+ */
+fn contains (hay: string, needle: string) -> bool {
+  let n_len: i64 = std::runtime::mem::string_len(needle);
+  if n_len <= 0 {
+    return true;
+  }
+  let h_ptr: u64 = std::runtime::mem::string_ptr(hay);
+  let h_len: i64 = std::runtime::mem::string_len(hay);
+  let n_ptr: u64 = std::runtime::mem::string_ptr(needle);
+  return memmem(h_ptr, h_len, n_ptr, n_len) != 0;
+}
+
+/**
+ * Captured stdout output from `slg` for end-to-end tests.
+ */
+struct Capture {
+  code: int,
+  out: BufferU8,
+}
+
+impl Capture as std::interfaces::Drop {
+  /**
+   * Release captured output.
+   *
+   * Note: we avoid calling methods on `mut` field-access receivers in the
+   * current subset by moving the field into a local, dropping it, then
+   * resetting the field to an inert value.
+   */
+  public fn drop (mut self: &Capture) -> void {
+    let mut out: BufferU8 = self.out;
+    self.out = BufferU8.empty();
+    out.drop();
+    self.code = 0;
+  }
+}
+
+/**
+ * Run `slg` while capturing stdout to memory (used by end-to-end tests).
+ */
+async fn capture_stdout_run_cfg (cfg: Config) -> Capture? {
+  // Create a pipe for capturing stdout.
+  let fds_ptr: u64 = std::runtime::mem::alloc(8);
+  if fds_ptr == 0 {
+    return None;
+  }
+  let prc: int = std::runtime::posix::io::pipe(fds_ptr) as int;
+  if prc != 0 {
+    std::runtime::mem::free(fds_ptr);
+    return None;
+  }
+  let rfd: int = load_i32_le(fds_ptr, 0);
+  let wfd: int = load_i32_le(fds_ptr, 4);
+  std::runtime::mem::free(fds_ptr);
+
+  // Save stdout, then redirect fd=1 into the pipe.
+  let saved: int = dup(1);
+  if saved < 0 {
+    let _ = std::runtime::posix::fs::close(rfd);
+    let _ = std::runtime::posix::fs::close(wfd);
+    return None;
+  }
+  let _ = std::runtime::posix::io::dup2(wfd, 1);
+  let _ = std::runtime::posix::fs::close(wfd);
+
+  // Run.
+  let code: int = await run_cfg(cfg);
+
+  // Restore stdout (closes the pipe write end).
+  let _ = std::runtime::posix::io::dup2(saved, 1);
+  let _ = std::runtime::posix::fs::close(saved);
+
+  // Drain captured output.
+  let out_opt: BufferU8? = read_all_fd(rfd);
+  let _ = std::runtime::posix::fs::close(rfd);
+  if out_opt == None {
+    return None;
+  }
+  let out: BufferU8 = match (out_opt) {
+    Some(v) => v,
+    None => BufferU8.empty(),
+  };
+  return Some(Capture{ code: code, out: out });
+}
+
+test "slg e2e - help is descriptive" {
+  let av_opt: ArgvOwned? = argv_alloc_2("slg", "--help");
+  assert(av_opt != None, "argv alloc failed");
+  let mut av: ArgvOwned = match (av_opt) { Some(v) => v, None => ArgvOwned{ argc: 0, argv: 0 } };
+
+  let args: Args = Args.init(av.argc, av.argv);
+  let cfg_opt: Config? = parse_cli(args);
+  assert(cfg_opt != None, "parse_cli should succeed");
+
+  let cap_opt: Capture? = match (cfg_opt) {
+    Some(cfg) => await capture_stdout_run_cfg(cfg),
+    None => None,
+  };
+  assert(cap_opt != None, "capture failed");
+  let mut cap: Capture = match (cap_opt) { Some(v) => v, None => Capture{ code: 2, out: BufferU8.empty() } };
+
+  assert(cap.code == 0, "expected exit code 0");
+  let out_s: string = buffer_as_string(cap.out);
+  assert(contains(out_s, "USAGE:"), "help output should include USAGE");
+  assert(contains(out_s, "EXAMPLES:"), "help output should include EXAMPLES");
+  assert(contains(out_s, "--jobs"), "help output should include --jobs");
+  assert(contains(out_s, "--no-parallel"), "help output should include --no-parallel");
+
+  cap.drop();
+  av.drop();
+}
+
+test "slg e2e - fixed search finds a match" {
+  let av_opt: ArgvOwned? = argv_alloc_4("slg", "-F", "TODO", "testdata/basic");
+  assert(av_opt != None, "argv alloc failed");
+  let mut av: ArgvOwned = match (av_opt) { Some(v) => v, None => ArgvOwned{ argc: 0, argv: 0 } };
+
+  let args: Args = Args.init(av.argc, av.argv);
+  let cfg_opt: Config? = parse_cli(args);
+  assert(cfg_opt != None, "parse_cli should succeed");
+
+  let cap_opt: Capture? = match (cfg_opt) {
+    Some(cfg) => await capture_stdout_run_cfg(cfg),
+    None => None,
+  };
+  assert(cap_opt != None, "capture failed");
+  let mut cap: Capture = match (cap_opt) { Some(v) => v, None => Capture{ code: 2, out: BufferU8.empty() } };
+
+  assert(cap.code == 0, "expected exit code 0 (match found)");
+  let out_s: string = buffer_as_string(cap.out);
+  assert(contains(out_s, "testdata/basic/a.txt"), "expected matched file path in output");
+  assert(contains(out_s, "TODO"), "expected match text in output");
+
+  cap.drop();
+  av.drop();
+}
+
+test "slg e2e - --jobs 1 forces single-threaded" {
+  let av_opt: ArgvOwned? = argv_alloc_5("slg", "--jobs=1", "-F", "TODO", "testdata/basic");
+  assert(av_opt != None, "argv alloc failed");
+  let mut av: ArgvOwned = match (av_opt) { Some(v) => v, None => ArgvOwned{ argc: 0, argv: 0 } };
+
+  let args: Args = Args.init(av.argc, av.argv);
+  let cfg_opt: Config? = parse_cli(args);
+  assert(cfg_opt != None, "parse_cli should succeed");
+
+  let cap_opt: Capture? = match (cfg_opt) {
+    Some(cfg) => await capture_stdout_run_cfg(cfg),
+    None => None,
+  };
+  assert(cap_opt != None, "capture failed");
+  let mut cap: Capture = match (cap_opt) { Some(v) => v, None => Capture{ code: 2, out: BufferU8.empty() } };
+
+  assert(cap.code == 0, "expected exit code 0 (match found)");
+  let out_s: string = buffer_as_string(cap.out);
+  assert(contains(out_s, "testdata/basic/a.txt"), "expected matched file path in output");
+  assert(contains(out_s, "TODO"), "expected match text in output");
+
+  cap.drop();
+  av.drop();
+}
+
+test "slg e2e - hidden files require --hidden" {
+  // Without --hidden: no matches.
+  let av1_opt: ArgvOwned? = argv_alloc_4("slg", "-F", "needle_hidden", "testdata/basic");
+  assert(av1_opt != None, "argv alloc failed");
+  let mut av1: ArgvOwned = match (av1_opt) { Some(v) => v, None => ArgvOwned{ argc: 0, argv: 0 } };
+
+  let args1: Args = Args.init(av1.argc, av1.argv);
+  let cfg1_opt: Config? = parse_cli(args1);
+  assert(cfg1_opt != None, "parse_cli should succeed");
+  let cap1_opt: Capture? = match (cfg1_opt) {
+    Some(cfg) => await capture_stdout_run_cfg(cfg),
+    None => None,
+  };
+  assert(cap1_opt != None, "capture failed");
+  let mut cap1: Capture = match (cap1_opt) { Some(v) => v, None => Capture{ code: 2, out: BufferU8.empty() } };
+
+  assert(cap1.code == 1, "expected exit code 1 (no match)");
+  let out1: string = buffer_as_string(cap1.out);
+  assert(!contains(out1, ".hidden.txt"), "should not search hidden files by default");
+  assert(!contains(out1, "needle_hidden"), "should not match hidden content by default");
+
+  cap1.drop();
+  av1.drop();
+
+  // With --hidden: match appears.
+  let av2_opt: ArgvOwned? = argv_alloc_5("slg", "-F", "--hidden", "needle_hidden", "testdata/basic");
+  assert(av2_opt != None, "argv alloc failed");
+  let mut av2: ArgvOwned = match (av2_opt) { Some(v) => v, None => ArgvOwned{ argc: 0, argv: 0 } };
+
+  let args2: Args = Args.init(av2.argc, av2.argv);
+  let cfg2_opt: Config? = parse_cli(args2);
+  assert(cfg2_opt != None, "parse_cli should succeed");
+  let cap2_opt: Capture? = match (cfg2_opt) {
+    Some(cfg) => await capture_stdout_run_cfg(cfg),
+    None => None,
+  };
+  assert(cap2_opt != None, "capture failed");
+  let mut cap2: Capture = match (cap2_opt) { Some(v) => v, None => Capture{ code: 2, out: BufferU8.empty() } };
+
+  assert(cap2.code == 0, "expected exit code 0 (match found)");
+  let out2: string = buffer_as_string(cap2.out);
+  assert(contains(out2, ".hidden.txt"), "expected hidden file path in output");
+  assert(contains(out2, "needle_hidden"), "expected hidden match text in output");
+
+  cap2.drop();
+  av2.drop();
+}
+
+test "slg e2e - --files lists searchable files" {
+  let av_opt: ArgvOwned? = argv_alloc_3("slg", "--files", "testdata/basic");
+  assert(av_opt != None, "argv alloc failed");
+  let mut av: ArgvOwned = match (av_opt) { Some(v) => v, None => ArgvOwned{ argc: 0, argv: 0 } };
+
+  let args: Args = Args.init(av.argc, av.argv);
+  let cfg_opt: Config? = parse_cli(args);
+  assert(cfg_opt != None, "parse_cli should succeed");
+
+  let cap_opt: Capture? = match (cfg_opt) {
+    Some(cfg) => await capture_stdout_run_cfg(cfg),
+    None => None,
+  };
+  assert(cap_opt != None, "capture failed");
+  let mut cap: Capture = match (cap_opt) { Some(v) => v, None => Capture{ code: 2, out: BufferU8.empty() } };
+
+  assert(cap.code == 0, "expected exit code 0");
+  let out_s: string = buffer_as_string(cap.out);
+  assert(contains(out_s, "testdata/basic/a.txt"), "expected a.txt in file list");
+  assert(contains(out_s, "testdata/basic/sub/b.txt"), "expected b.txt in file list");
+  assert(!contains(out_s, ".hidden.txt"), "hidden files should be skipped unless --hidden");
+
+  cap.drop();
+  av.drop();
+}

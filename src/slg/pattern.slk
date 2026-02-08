@@ -1,0 +1,336 @@
+module slg::pattern;
+
+import std::interfaces;
+import std::limits;
+import std::regex;
+import std::result;
+import std::runtime::mem;
+
+import { memmem } from "./os.slk";
+
+/**
+ * Concrete `Result` specialization for runtime regex compilation.
+ *
+ * We use a named alias so we can call static helper methods like
+ * `ReCompileResult.unwrap_or(...)`.
+ */
+type ReCompileResult = std::result::Result(std::regex::RegExp, std::regex::CompileFailed);
+
+/**
+ * Pattern matching mode.
+ */
+export enum PatternKind {
+  Fixed,
+  Regex,
+}
+
+/**
+ * A single match location within a line (byte offsets).
+ */
+export struct Match {
+  start: i64,
+  end: i64,
+}
+
+/**
+ * A compiled search pattern.
+ *
+ * Notes:
+ * - When `kind == Fixed`, `regex` stays empty.
+ * - When `kind == Regex`, `needle` stores the original pattern text.
+ */
+export struct Pattern {
+  kind: PatternKind,
+  needle: string,
+  ignore_case: bool,
+  // Compiled regex bytecode (owned).
+  regex: std::regex::RegExp,
+}
+
+impl Pattern as std::interfaces::Drop {
+  /**
+   * Reset the value.
+   */
+  public fn drop (mut self: &Pattern) -> void {
+    self.kind = PatternKind::Fixed;
+    self.needle = "";
+    self.ignore_case = false;
+    self.regex = std::regex::RegExp.empty();
+  }
+}
+
+export enum PatternErrorKind {
+  EmptyPattern,
+  RegexCompileFailed,
+  InvalidInput,
+}
+
+export error PatternFailed {
+  code: int,
+  detail: int,
+}
+
+impl PatternFailed {
+  public fn kind (self: &PatternFailed) -> PatternErrorKind {
+    if self.code == 1 { return PatternErrorKind::EmptyPattern; }
+    if self.code == 2 { return PatternErrorKind::RegexCompileFailed; }
+    return PatternErrorKind::InvalidInput;
+  }
+}
+
+fn failed (kind: PatternErrorKind, detail: int) -> PatternFailed {
+  let code: int = match (kind) {
+    PatternErrorKind::EmptyPattern => 1,
+    PatternErrorKind::RegexCompileFailed => 2,
+    PatternErrorKind::InvalidInput => 0,
+  };
+  return PatternFailed{ code: code, detail: detail };
+}
+
+/**
+ * `Pattern.compile(...)` result.
+ *
+ * We use a local result enum for explicit, allocation-free error handling.
+ *
+ * Historical note: older hosted-backend snapshots rejected some generic
+ * applications in type positions; this no longer reproduces in this workspace
+ * as of 2026-02-07.
+ */
+export enum PatternResult {
+  Ok(Pattern),
+  Err(PatternFailed),
+}
+
+impl PatternResult {
+  public fn is_ok (self: &PatternResult) -> bool {
+    return match self {
+      Ok(_) => true,
+      Err(_) => false,
+    };
+  }
+
+  public fn is_err (self: &PatternResult) -> bool {
+    return match self {
+      Ok(_) => false,
+      Err(_) => true,
+    };
+  }
+}
+
+fn is_ascii_upper (b: u8) -> bool {
+  return b >= 65 && b <= 90;
+}
+
+fn ascii_lower (b: u8) -> u8 {
+  if is_ascii_upper(b) {
+    return b + 32;
+  }
+  return b;
+}
+
+fn eq_ascii_case_insensitive (a_ptr: u64, b_ptr: u64, n: i64) -> bool {
+  if n <= 0 {
+    return true;
+  }
+  var i: i64 = 0;
+  while i < n {
+    let a: u8 = ascii_lower(std::runtime::mem::load_u8(a_ptr, i));
+    let b: u8 = ascii_lower(std::runtime::mem::load_u8(b_ptr, i));
+    if a != b {
+      return false;
+    }
+    i = i + 1;
+  }
+  return true;
+}
+
+fn next_fixed_case_sensitive (hay_ptr: u64, hay_len: i64, needle_ptr: u64, needle_len: i64, start: i64) -> Match? {
+  if needle_len <= 0 {
+    return None;
+  }
+  if start < 0 || start > hay_len {
+    return None;
+  }
+  let tail_ptr: u64 = hay_ptr + (start as u64);
+  let tail_len: i64 = hay_len - start;
+  let p: u64 = memmem(tail_ptr, tail_len, needle_ptr, needle_len);
+  if p == 0 {
+    return None;
+  }
+  let off: i64 = (p - hay_ptr) as i64;
+  return Some(Match{ start: off, end: off + needle_len });
+}
+
+fn next_fixed_ascii_case_insensitive (hay_ptr: u64, hay_len: i64, needle_ptr: u64, needle_len: i64, start: i64) -> Match? {
+  if needle_len <= 0 {
+    return None;
+  }
+  if start < 0 || start > hay_len {
+    return None;
+  }
+  if hay_len < needle_len {
+    return None;
+  }
+
+  let last: i64 = hay_len - needle_len;
+  var i: i64 = start;
+  while i <= last {
+    let a_ptr: u64 = hay_ptr + (i as u64);
+    if eq_ascii_case_insensitive(a_ptr, needle_ptr, needle_len) {
+      return Some(Match{ start: i, end: i + needle_len });
+    }
+    i = i + 1;
+  }
+  return None;
+}
+
+/**
+ * Compile a search pattern from CLI flags.
+ *
+ * @param text: string Raw pattern string.
+ * @param fixed: bool When true, treat `text` as a literal byte substring.
+ * @param ignore_case: bool When true, use case-insensitive matching.
+ * @returns PatternResult Compiled pattern or `PatternFailed`.
+ */
+export fn compile (text: string, fixed: bool, ignore_case: bool) -> PatternResult {
+  let n: i64 = std::runtime::mem::string_len(text);
+  if n <= 0 {
+    return Err(failed(PatternErrorKind::EmptyPattern, 0));
+  }
+
+  if fixed {
+    return Ok(Pattern{
+      kind: PatternKind::Fixed,
+      needle: text,
+      ignore_case: ignore_case,
+      regex: std::regex::RegExp.empty(),
+    });
+  }
+
+  var flags: string = "";
+  if ignore_case {
+    flags = "i";
+  }
+
+  // Note: prefer `std::result::Result.unwrap_or(...)` instead of destructuring
+  // the regex compile result directly. This avoids a known class of "by-value
+  // enum payload" move-tracking bugs in the hosted subset that can lead to
+  // use-after-free crashes when the owning `RegExp` gets dropped unexpectedly.
+  let r: ReCompileResult = std::regex::RegExp.compile(text, flags);
+  if r.is_err() {
+    let e_opt: std::regex::CompileFailed? = ReCompileResult.err_value(r);
+    let e: std::regex::CompileFailed = match (e_opt) {
+      Some(v) => v,
+      None => std::regex::CompileFailed{ code: 0 },
+    };
+    return Err(failed(PatternErrorKind::RegexCompileFailed, e.code));
+  }
+
+  let re: std::regex::RegExp = ReCompileResult.unwrap_or(r, std::regex::RegExp.empty());
+  return Ok(Pattern{
+    kind: PatternKind::Regex,
+    needle: text,
+    ignore_case: ignore_case,
+    regex: move re,
+  });
+}
+
+/**
+ * Return the first match at or after `start` within `line`.
+ *
+ * @param p: &Pattern Compiled pattern.
+ * @param line: string Line to search.
+ * @param start: i64 Byte start offset.
+ * @returns Match? Match location, or `None`.
+ */
+export fn next_match (p: &Pattern, line: string, start: i64) -> Match? {
+  let ptr: u64 = std::runtime::mem::string_ptr(line);
+  let len: i64 = std::runtime::mem::string_len(line);
+
+  if start < 0 || start > len {
+    return None;
+  }
+
+  if p.kind == PatternKind::Fixed {
+    let needle_ptr: u64 = std::runtime::mem::string_ptr(p.needle);
+    let needle_len: i64 = std::runtime::mem::string_len(p.needle);
+    if p.ignore_case {
+      return next_fixed_ascii_case_insensitive(ptr, len, needle_ptr, needle_len, start);
+    }
+    return next_fixed_case_sensitive(ptr, len, needle_ptr, needle_len, start);
+  }
+
+  // Regex.
+  if len < 0 || len > (std::limits::I32_MAX as i64) {
+    return None;
+  }
+  let r: std::regex::ExecResult = std::regex::search(p.regex.as_regexp(), line, start as int);
+  if r.code != std::regex::EXEC_MATCH {
+    return None;
+  }
+
+  let s: i64 = r.start as i64;
+  let e: i64 = r.end as i64;
+  if e < s {
+    return None;
+  }
+  return Some(Match{ start: s, end: e });
+}
+
+/**
+ * Return whether `line` matches `p`.
+ */
+export fn is_match (p: &Pattern, line: string) -> bool {
+  return next_match(p, line, 0) != None;
+}
+
+test "slg::pattern - fixed case-sensitive" {
+  let p_r: PatternResult = compile("aba", true, false);
+  assert(p_r.is_ok(), "compile should succeed");
+  let p: Pattern = match (p_r) {
+    Ok(v) => v,
+    Err(_) => Pattern{ kind: PatternKind::Fixed, needle: "", ignore_case: false, regex: std::regex::RegExp.empty() },
+  };
+
+  let m0: Match? = next_match(p, "xxabaxxaba", 0);
+  assert(m0 != None, "expected match");
+  let m: Match = match (m0) {
+    Some(v) => v,
+    None => Match{ start: -1, end: -1 },
+  };
+  assert(m.start == 2 && m.end == 5, "unexpected match location");
+}
+
+test "slg::pattern - fixed ignore-case (ASCII)" {
+  let p_r: PatternResult = compile("AbC", true, true);
+  assert(p_r.is_ok(), "compile should succeed");
+  let p: Pattern = match (p_r) {
+    Ok(v) => v,
+    Err(_) => Pattern{ kind: PatternKind::Fixed, needle: "", ignore_case: true, regex: std::regex::RegExp.empty() },
+  };
+
+  let m0: Match? = next_match(p, "--abc--", 0);
+  assert(m0 != None, "expected match");
+  let m: Match = match (m0) {
+    Some(v) => v,
+    None => Match{ start: -1, end: -1 },
+  };
+  assert(m.start == 2 && m.end == 5, "unexpected match location");
+}
+
+test "slg::pattern - regex basic" {
+  let p_r: PatternResult = compile("T.DO", false, false);
+  assert(p_r.is_ok(), "compile should succeed");
+  let p: Pattern = match (p_r) {
+    Ok(v) => v,
+    Err(_) => Pattern{ kind: PatternKind::Fixed, needle: "", ignore_case: false, regex: std::regex::RegExp.empty() },
+  };
+
+  let m0: Match? = next_match(p, "xxTODOyy", 0);
+  assert(m0 != None, "expected match");
+  let m: Match = match (m0) {
+    Some(v) => v,
+    None => Match{ start: -1, end: -1 },
+  };
+  assert(m.start == 2 && m.end == 6, "unexpected match location");
+}

@@ -1,0 +1,122 @@
+.TH SLG 1 "February 2026" "slg 0.1.0" "User Commands"
+.SH NAME
+slg \- Silk Line Grep (fast recursive file + pattern search)
+.SH SYNOPSIS
+.B slg
+.RI [ options ] " <pattern> " [ path ... ]
+.br
+.B slg
+.B --files
+.RI [ options ] [ path ... ]
+.SH DESCRIPTION
+\fBslg\fR is a fast command line search tool written in Silk.
+It recursively walks directory trees and searches file contents.
+.PP
+By default, \fIpattern\fR is a regular expression (Silk runtime regex).
+With \fB-F\fR/\fB--fixed-string\fR, \fIpattern\fR is treated as a literal byte substring (fast path).
+.PP
+Options must appear before \fIpattern\fR.
+Any arguments after \fIpattern\fR are treated as \fIpath\fR values.
+If no paths are provided, \fBslg\fR searches the current directory (\fB.\fR).
+.SH OPTIONS
+.SS Pattern / Matching
+.TP
+.BR -F ", " --fixed-string
+Treat \fIpattern\fR as a literal byte substring.
+.TP
+.BR -i ", " --ignore-case
+Case-insensitive matching.
+With \fB-F\fR, this is ASCII-only.
+.TP
+.BR -m ", " --max-count " " \fIn\fR
+Stop after \fIn\fR matching lines per file.
+Use \fB0\fR for unlimited.
+.SS Traversal
+.TP
+.B --hidden
+Include hidden files and directories (names starting with \fB.\fR).
+.TP
+.B --follow
+Follow symlinks (may loop).
+.TP
+.BR --max-depth " " \fIn\fR
+Limit recursion depth.
+Use \fB0\fR for only the root(s).
+.TP
+.B --no-ignore-vcs
+Do not skip \fB.git\fR/\fB.hg\fR/\fB.svn\fR directories.
+Note: these names are also hidden; use \fB--hidden\fR to traverse them.
+.SS Parallelism
+.TP
+.BR -j ", " --jobs " " \fIn\fR
+Parallel tasks.
+\fB0\fR means auto (use available CPUs).
+\fB1\fR forces single-threaded mode.
+.TP
+.B --no-parallel
+Same as \fB--jobs 1\fR.
+.SS File Handling
+.TP
+.B --text
+Search files even if they look binary (contain NUL in the first 1024 bytes).
+.SS Output
+.TP
+.BR -l ", " --files-with-matches
+Print only file paths with at least one match.
+.TP
+.B --heading
+Print a file header before its matches.
+.TP
+.BR -n ", " --line-number
+Show 1-based line numbers (default: on).
+.TP
+.B --column
+Show the 1-based match column (byte offset).
+.TP
+.B --stats
+Print a summary to stderr.
+.TP
+.BR -q ", " --quiet
+Exit immediately on the first match.
+.TP
+.B --files
+List files that would be searched (no content search).
+.SS Color
+.TP
+.BR --color " " \fImode\fR
+Color mode: \fBauto\fR | \fBalways\fR | \fBnever\fR (default: \fBauto\fR).
+.TP
+.B --no-color
+Same as \fB--color never\fR.
+.SS Meta
+.TP
+.BR -h ", " --help
+Show help text.
+.TP
+.BR -V ", " --version
+Print version and exit.
+.SH EXIT STATUS
+.TP
+.B 0
+At least one match was found (or \fB--files\fR listed files successfully).
+.TP
+.B 1
+No matches were found.
+.TP
+.B 2
+An error occurred.
+.SH ENVIRONMENT
+.TP
+.B NO_COLOR
+When set, disables color in \fB--color auto\fR mode.
+.SH EXAMPLES
+.nf
+slg "TODO" .
+slg -i "error" src
+slg -F "needle" --hidden .
+slg --files .
+.fi
+.SH NOTES
+\fBslg\fR is built against the current Silk compiler subset and intentionally avoids
+some high-level standard library modules for now.
+See \fBNOTES.md\fR in the project directory for details and planned improvements.

@@ -1,0 +1,49 @@
+module slg::formal;
+
+/**
+ * Formal Silk proofs and invariants for `slg`.
+ *
+ * `slg` is primarily a low-level, syscall-heavy program, and much of the
+ * production code lives outside the currently-verifiable subset (raw pointers,
+ * external calls, mmap, etc.).
+ *
+ * This module keeps a small set of compile-time-only Formal Silk checks that
+ * are:
+ * - representative of how `slg` intends to model invariants,
+ * - cheap to verify,
+ * - and independent of the POSIX bindings.
+ */
+
+/**
+ * A simple proof bundle used as a smoke test for Formal Silk integration.
+ */
+theory non_zero_sum (x: int, y: int) {
+  #const z = x + y;
+  #invariant x != 0 && y != 0;
+  #invariant z > 1;
+}
+
+/**
+ * A compile-time-only verification smoke test.
+ *
+ * This function is not called by `slg` at runtime; it exists to ensure the
+ * Formal Silk toolchain is exercised by this project.
+ */
+export fn smoke () -> int {
+  let x: int = 2;
+  let y: int = 3;
+  #theory non_zero_sum(x, y);
+
+  let limit: int = 8;
+  #const original_limit = limit;
+
+  var i: int = 0;
+  #invariant i >= 0;
+  #invariant i <= original_limit;
+  #variant original_limit - i;
+  while i < limit {
+    i = i + 1;
+  }
+
+  return 0;
+}

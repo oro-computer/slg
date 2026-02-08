@@ -1,0 +1,640 @@
+module slg::cli;
+
+import { Args } from "std/args";
+import std::runtime::mem;
+
+import { write_str } from "./out.slk";
+import { ColorMode, parse_mode } from "./color.slk";
+import { NAME, VERSION } from "./version.slk";
+
+/**
+ * `slg` primary operation mode.
+ */
+export enum Mode {
+  Search,
+  Files,
+}
+
+/**
+ * Parsed CLI configuration for `slg`.
+ *
+ * This struct is intentionally “borrow-only”:
+ * - `args` is a view into `argv` memory (no allocation),
+ * - `pattern` and the `paths_*` indices refer to argument strings.
+ *
+ * This keeps startup fast and avoids depending on `std::vector` /
+ * `std::strings::String` for basic argument plumbing.
+ */
+export struct Config {
+  // argv view
+  args: Args,
+
+  // Mode selection.
+  mode: Mode,
+
+  // Search query (Mode::Search only).
+  pattern: string?,
+
+  // Root path arguments (indices into `args`).
+  paths_start: int,
+  paths_count: int,
+
+  // Matching.
+  fixed_string: bool,
+  ignore_case: bool,
+
+  // Traversal.
+  hidden: bool,
+  follow: bool,
+  max_depth: int,
+  ignore_vcs: bool,
+
+  // Parallelism.
+  //
+  // Semantics:
+  // - `jobs == 0` means “auto” (pick a default at runtime).
+  // - `jobs == 1` means “single-threaded”.
+  // - `jobs > 1` enables task-based parallel traversal/search.
+  jobs: int,
+
+  // File handling.
+  text: bool,
+
+  // Output selection.
+  files_with_matches: bool,
+  heading: bool,
+  line_number: bool,
+  column: bool,
+  stats: bool,
+  quiet: bool,
+
+  // Limits.
+  max_count: int,
+
+  // Colors.
+  // Encoding:
+  // - 0 = auto
+  // - 1 = always
+  // - 2 = never
+  //
+  // NOTE: Storing `ColorMode` directly here currently triggers a backend
+  // lowering bug when `Config` is exported and this module exports functions.
+  // Keep it as an `int` until the toolchain fixes cross-module enum fields.
+  color_mode: int,
+
+  // Meta.
+  help: bool,
+  version: bool,
+}
+
+impl Config {
+  /**
+   * Return the number of configured root paths.
+   *
+   * When this is 0, callers should treat the root as `"."`.
+   */
+  public fn path_count (self: &Config) -> int {
+    return self.paths_count;
+  }
+
+  /**
+   * Return the `index`th root path from argv, or `None` when out of range.
+   */
+  public fn path_at (self: &Config, index: int) -> string? {
+    if index < 0 || index >= self.paths_count {
+      return None;
+    }
+    return Some(self.args.get(self.paths_start + index));
+  }
+
+}
+
+fn color_mode_code (m: ColorMode) -> int {
+  return match (m) {
+    ColorMode::Auto => 0,
+    ColorMode::Always => 1,
+    ColorMode::Never => 2,
+  };
+}
+
+fn usage_text () -> string {
+  return "
+slg — Silk Line Grep (fast recursive file + pattern search)
+
+USAGE:
+  slg [options] <pattern> [path ...]
+  slg --files [options] [path ...]
+
+NOTES:
+  Options must appear before <pattern> (flags after the pattern are treated as paths).
+  Exit status: 0 match found (or --files), 1 no match, 2 error.
+
+PATTERN:
+  By default, <pattern> is a regular expression (Silk runtime regex).
+  Use -F/--fixed-string for a literal byte substring (fast path).
+
+SEARCH OPTIONS:
+  -F, --fixed-string        Treat <pattern> as a literal byte substring
+  -i, --ignore-case         Case-insensitive matching (ASCII for -F)
+  -m, --max-count <n>       Stop after <n> matching lines per file (0 = unlimited)
+
+TRAVERSAL OPTIONS:
+      --hidden              Include hidden files and directories
+      --follow              Follow symlinks (note: may loop)
+      --max-depth <n>       Limit recursion depth (0 = only the root)
+      --no-ignore-vcs       Do not skip .git/.hg/.svn directories
+
+PARALLELISM:
+  -j, --jobs <n>            Parallel tasks (0 = auto, 1 = single-threaded)
+      --no-parallel         Same as --jobs 1
+
+FILE HANDLING:
+      --text                Search files that look binary (contain NUL bytes)
+
+OUTPUT OPTIONS:
+  -l, --files-with-matches  Print only file paths with a match
+      --heading             Print a file header before matches
+  -n, --line-number         Show line numbers (default: on)
+      --column              Show the 1-based match column (byte offset)
+      --stats               Print a search summary to stderr
+  -q, --quiet               Exit immediately on the first match
+
+COLOR:
+      --color <mode>        auto | always | never (default: auto)
+      --no-color            Same as --color never
+
+ENVIRONMENT:
+  NO_COLOR                  Disable color in --color auto mode
+
+META:
+      --files               List files that would be searched (no content search)
+  -h, --help                Show this help text
+  -V, --version             Print version and exit
+
+EXAMPLES:
+  slg \"TODO\" .
+  slg -i \"error\" src
+  slg -F \"needle\" --hidden .
+  slg --files .
+";
+}
+
+/**
+ * Print the CLI help to stdout.
+ */
+export fn print_help () -> void {
+  let _ = write_str(1, usage_text());
+}
+
+fn print_error_2 (a: string, b: string) -> void {
+  let _ = write_str(2, a);
+  let _ = write_str(2, b);
+  let _ = write_str(2, "\n");
+}
+
+fn print_error_3 (a: string, b: string, c: string) -> void {
+  let _ = write_str(2, a);
+  let _ = write_str(2, b);
+  let _ = write_str(2, c);
+  let _ = write_str(2, "\n");
+}
+
+fn is_flag (s: string) -> bool {
+  let n: i64 = std::runtime::mem::string_len(s);
+  if n < 2 {
+    return false;
+  }
+  let p: u64 = std::runtime::mem::string_ptr(s);
+  return std::runtime::mem::load_u8(p, 0) == 45; // '-'
+}
+
+fn split_eq_value (s: string, prefix: string) -> string? {
+  let s_len: i64 = std::runtime::mem::string_len(s);
+  let p_len: i64 = std::runtime::mem::string_len(prefix);
+  if s_len <= p_len + 1 {
+    return None;
+  }
+  let s_ptr: u64 = std::runtime::mem::string_ptr(s);
+  let p_ptr: u64 = std::runtime::mem::string_ptr(prefix);
+
+  // Check prefix bytes.
+  var i: i64 = 0;
+  while i < p_len {
+    if std::runtime::mem::load_u8(s_ptr, i) != std::runtime::mem::load_u8(p_ptr, i) {
+      return None;
+    }
+    i = i + 1;
+  }
+
+  // Require '='.
+  if std::runtime::mem::load_u8(s_ptr, p_len) != 61 {
+    return None;
+  }
+
+  let v_ptr: u64 = s_ptr + (p_len + 1) as u64;
+  let v_len: i64 = s_len - (p_len + 1);
+  if v_len <= 0 {
+    return Some("");
+  }
+  return Some(std::runtime::mem::string_from_ptr_len(v_ptr, v_len as int));
+}
+
+fn parse_int (s: string) -> int? {
+  let n: i64 = std::runtime::mem::string_len(s);
+  if n <= 0 {
+    return None;
+  }
+  let ptr: u64 = std::runtime::mem::string_ptr(s);
+
+  var i: i64 = 0;
+  var sign: int = 1;
+  let b0: u8 = std::runtime::mem::load_u8(ptr, 0);
+  if b0 == 45 { // '-'
+    sign = -1;
+    i = 1;
+  } else if b0 == 43 { // '+'
+    i = 1;
+  }
+  if i >= n {
+    return None;
+  }
+
+  var v: i64 = 0;
+  while i < n {
+    let b: u8 = std::runtime::mem::load_u8(ptr, i);
+    if b < 48 || b > 57 {
+      return None;
+    }
+    v = (v * 10) + ((b - 48) as i64);
+    i = i + 1;
+  }
+
+  return Some((v as int) * sign);
+}
+
+/**
+ * Parse argv into a `Config`.
+ *
+ * On error, prints a message to stderr and returns `None`.
+ */
+export fn parse_cli (args: Args) -> Config? {
+  // Defaults.
+  var mode: Mode = Mode::Search;
+  var fixed_string: bool = false;
+  var ignore_case: bool = false;
+  var hidden: bool = false;
+  var follow: bool = false;
+  var max_depth: int = -1;
+  var ignore_vcs: bool = true;
+  var jobs: int = 0;
+  var text: bool = false;
+  var files_with_matches: bool = false;
+  var heading: bool = false;
+  var line_number: bool = true;
+  var column: bool = false;
+  var stats: bool = false;
+  var quiet: bool = false;
+  var max_count: int = 0;
+  var color_mode: ColorMode = ColorMode::Auto;
+  var help: bool = false;
+  var version: bool = false;
+
+  let argc: int = args.count();
+  var i: int = 1;
+  var end_flags: bool = false;
+  var pattern: string? = None;
+  var paths_start: int = 0;
+  var paths_count: int = 0;
+
+  while i < argc {
+    let a: string = args.get(i);
+
+    if !end_flags && is_flag(a) && a != "-" {
+      if a == "--" {
+        end_flags = true;
+        i = i + 1;
+        continue;
+      }
+
+      // Meta.
+      if a == "-h" || a == "--help" {
+        help = true;
+        i = i + 1;
+        continue;
+      }
+      if a == "-V" || a == "--version" {
+        version = true;
+        i = i + 1;
+        continue;
+      }
+      if a == "--files" {
+        mode = Mode::Files;
+        i = i + 1;
+        continue;
+      }
+
+      // Matching.
+      if a == "-F" || a == "--fixed-string" {
+        fixed_string = true;
+        i = i + 1;
+        continue;
+      }
+      if a == "-i" || a == "--ignore-case" {
+        ignore_case = true;
+        i = i + 1;
+        continue;
+      }
+      if a == "-m" || a == "--max-count" {
+        if i + 1 >= argc {
+          print_error_2("slg: missing value for ", a);
+          return None;
+        }
+        let v_s: string = args.get(i + 1);
+        let v_opt: int? = parse_int(v_s);
+        if v_opt == None {
+          print_error_3("slg: invalid value for ", a, ": expected integer");
+          return None;
+        }
+        let v: int = match (v_opt) {
+          Some(x) => x,
+          None => 0,
+        };
+        if v < 0 {
+          print_error_3("slg: invalid value for ", a, ": must be >= 0");
+          return None;
+        }
+        max_count = v;
+        i = i + 2;
+        continue;
+      }
+
+      let max_count_eq: string? = split_eq_value(a, "--max-count");
+      if max_count_eq != None {
+        let v_s: string = match (max_count_eq) {
+          Some(s) => s,
+          None => "",
+        };
+        let v_opt: int? = parse_int(v_s);
+        if v_opt == None {
+          print_error_3("slg: invalid value for ", "--max-count", ": expected integer");
+          return None;
+        }
+        let v: int = match (v_opt) {
+          Some(x) => x,
+          None => 0,
+        };
+        if v < 0 {
+          print_error_3("slg: invalid value for ", "--max-count", ": must be >= 0");
+          return None;
+        }
+        max_count = v;
+        i = i + 1;
+        continue;
+      }
+
+      // Traversal.
+      if a == "--hidden" {
+        hidden = true;
+        i = i + 1;
+        continue;
+      }
+      if a == "--follow" {
+        follow = true;
+        i = i + 1;
+        continue;
+      }
+      if a == "--no-ignore-vcs" {
+        ignore_vcs = false;
+        i = i + 1;
+        continue;
+      }
+      if a == "--max-depth" {
+        if i + 1 >= argc {
+          print_error_2("slg: missing value for ", a);
+          return None;
+        }
+        let v_s: string = args.get(i + 1);
+        let v_opt: int? = parse_int(v_s);
+        if v_opt == None {
+          print_error_3("slg: invalid value for ", a, ": expected integer");
+          return None;
+        }
+        max_depth = match (v_opt) {
+          Some(x) => x,
+          None => -1,
+        };
+        i = i + 2;
+        continue;
+      }
+
+      let max_depth_eq: string? = split_eq_value(a, "--max-depth");
+      if max_depth_eq != None {
+        let v_s: string = match (max_depth_eq) {
+          Some(s) => s,
+          None => "",
+        };
+        let v_opt: int? = parse_int(v_s);
+        if v_opt == None {
+          print_error_3("slg: invalid value for ", "--max-depth", ": expected integer");
+          return None;
+        }
+        max_depth = match (v_opt) {
+          Some(x) => x,
+          None => -1,
+        };
+        i = i + 1;
+        continue;
+      }
+
+      // Parallelism.
+      if a == "--no-parallel" {
+        jobs = 1;
+        i = i + 1;
+        continue;
+      }
+      if a == "-j" || a == "--jobs" {
+        if i + 1 >= argc {
+          print_error_2("slg: missing value for ", a);
+          return None;
+        }
+        let v_s: string = args.get(i + 1);
+        let v_opt: int? = parse_int(v_s);
+        if v_opt == None {
+          print_error_3("slg: invalid value for ", a, ": expected integer");
+          return None;
+        }
+        let v: int = match (v_opt) { Some(x) => x, None => 0 };
+        if v < 0 {
+          print_error_3("slg: invalid value for ", a, ": must be >= 0");
+          return None;
+        }
+        jobs = v;
+        i = i + 2;
+        continue;
+      }
+      let jobs_eq: string? = split_eq_value(a, "--jobs");
+      if jobs_eq != None {
+        let v_s: string = match (jobs_eq) { Some(s) => s, None => "" };
+        let v_opt: int? = parse_int(v_s);
+        if v_opt == None {
+          print_error_3("slg: invalid value for ", "--jobs", ": expected integer");
+          return None;
+        }
+        let v: int = match (v_opt) { Some(x) => x, None => 0 };
+        if v < 0 {
+          print_error_3("slg: invalid value for ", "--jobs", ": must be >= 0");
+          return None;
+        }
+        jobs = v;
+        i = i + 1;
+        continue;
+      }
+
+      // File handling.
+      if a == "--text" {
+        text = true;
+        i = i + 1;
+        continue;
+      }
+
+      // Output.
+      if a == "-l" || a == "--files-with-matches" {
+        files_with_matches = true;
+        i = i + 1;
+        continue;
+      }
+      if a == "--heading" {
+        heading = true;
+        i = i + 1;
+        continue;
+      }
+      if a == "-n" || a == "--line-number" {
+        line_number = true;
+        i = i + 1;
+        continue;
+      }
+      if a == "--column" {
+        column = true;
+        i = i + 1;
+        continue;
+      }
+      if a == "--stats" {
+        stats = true;
+        i = i + 1;
+        continue;
+      }
+      if a == "-q" || a == "--quiet" {
+        quiet = true;
+        i = i + 1;
+        continue;
+      }
+
+      // Color.
+      if a == "--no-color" {
+        color_mode = ColorMode::Never;
+        i = i + 1;
+        continue;
+      }
+      if a == "--color" {
+        if i + 1 >= argc {
+          print_error_2("slg: missing value for ", a);
+          return None;
+        }
+        let v_s: string = args.get(i + 1);
+        let m_opt: ColorMode? = parse_mode(v_s);
+        if m_opt == None {
+          print_error_3("slg: invalid value for ", a, ": expected auto|always|never");
+          return None;
+        }
+        color_mode = match (m_opt) {
+          Some(m) => m,
+          None => ColorMode::Auto,
+        };
+        i = i + 2;
+        continue;
+      }
+      let color_eq: string? = split_eq_value(a, "--color");
+      if color_eq != None {
+        let v_s: string = match (color_eq) {
+          Some(s) => s,
+          None => "",
+        };
+        let m_opt: ColorMode? = parse_mode(v_s);
+        if m_opt == None {
+          print_error_3("slg: invalid value for ", "--color", ": expected auto|always|never");
+          return None;
+        }
+        color_mode = match (m_opt) {
+          Some(m) => m,
+          None => ColorMode::Auto,
+        };
+        i = i + 1;
+        continue;
+      }
+
+      // Unknown flag.
+      print_error_2("slg: unknown flag: ", a);
+      return None;
+    }
+
+    // Positional arguments.
+    if mode == Mode::Files {
+      paths_start = i;
+      paths_count = argc - i;
+      break;
+    }
+
+    // Search mode: first positional is pattern, remaining are paths.
+    if pattern == None {
+      pattern = Some(a);
+      paths_start = i + 1;
+      paths_count = argc - (i + 1);
+      break;
+    }
+
+    i = i + 1;
+  }
+
+  if mode == Mode::Search && pattern == None && !help && !version {
+    print_error_2("slg: missing <pattern>. Try: ", "slg --help");
+    return None;
+  }
+
+  return Some(Config{
+    args: args,
+    mode: mode,
+    pattern: pattern,
+    paths_start: paths_start,
+    paths_count: paths_count,
+    fixed_string: fixed_string,
+    ignore_case: ignore_case,
+    hidden: hidden,
+    follow: follow,
+    max_depth: max_depth,
+    ignore_vcs: ignore_vcs,
+    jobs: jobs,
+    text: text,
+    files_with_matches: files_with_matches,
+    heading: heading,
+    line_number: line_number,
+    column: column,
+    stats: stats,
+    quiet: quiet,
+    max_count: max_count,
+    color_mode: color_mode_code(color_mode),
+    help: help,
+    version: version,
+  });
+}
+
+/**
+ * Print `slg` version to stdout.
+ *
+ * This is used by the entrypoint when `--version` is requested.
+ */
+export fn print_version () -> void {
+  let _ = write_str(1, NAME());
+  let _ = write_str(1, " ");
+  let _ = write_str(1, VERSION());
+  let _ = write_str(1, "\n");
+}
