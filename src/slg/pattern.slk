@@ -6,7 +6,7 @@ import std::regex;
 import std::result;
 import std::runtime::mem;
 
-import { memmem } from "./os.slk";
+import { memchr, memmem } from "./os.slk";
 
 /**
  * Concrete `Result` specialization for runtime regex compilation.
@@ -144,6 +144,44 @@ fn eq_ascii_case_insensitive (a_ptr: u64, b_ptr: u64, n: i64) -> bool {
   return true;
 }
 
+fn is_regex_meta (b: u8) -> bool {
+  // Common regex metacharacters:
+  //   . ^ $ * + ? ( ) [ ] { } | \
+  return
+    b == 46  || // '.'
+    b == 94  || // '^'
+    b == 36  || // '$'
+    b == 42  || // '*'
+    b == 43  || // '+'
+    b == 63  || // '?'
+    b == 40  || // '('
+    b == 41  || // ')'
+    b == 91  || // '['
+    b == 93  || // ']'
+    b == 123 || // '{'
+    b == 125 || // '}'
+    b == 124 || // '|'
+    b == 92;    // '\\'
+}
+
+fn is_literal_regex (text: string) -> bool {
+  let n: i64 = std::runtime::mem::string_len(text);
+  if n <= 0 {
+    return false;
+  }
+
+  let ptr: u64 = std::runtime::mem::string_ptr(text);
+  var i: i64 = 0;
+  while i < n {
+    let b: u8 = std::runtime::mem::load_u8(ptr, i);
+    if is_regex_meta(b) {
+      return false;
+    }
+    i = i + 1;
+  }
+  return true;
+}
+
 fn next_fixed_case_sensitive (hay_ptr: u64, hay_len: i64, needle_ptr: u64, needle_len: i64, start: i64) -> Match? {
   if needle_len <= 0 {
     return None;
@@ -151,8 +189,22 @@ fn next_fixed_case_sensitive (hay_ptr: u64, hay_len: i64, needle_ptr: u64, needl
   if start < 0 || start > hay_len {
     return None;
   }
+  if hay_len < needle_len {
+    return None;
+  }
   let tail_ptr: u64 = hay_ptr + (start as u64);
   let tail_len: i64 = hay_len - start;
+
+  if needle_len == 1 {
+    let b: u8 = std::runtime::mem::load_u8(needle_ptr, 0);
+    let p: u64 = memchr(tail_ptr, b as int, tail_len);
+    if p == 0 {
+      return None;
+    }
+    let off: i64 = (p - hay_ptr) as i64;
+    return Some(Match{ start: off, end: off + 1 });
+  }
+
   let p: u64 = memmem(tail_ptr, tail_len, needle_ptr, needle_len);
   if p == 0 {
     return None;
@@ -171,15 +223,70 @@ fn next_fixed_ascii_case_insensitive (hay_ptr: u64, hay_len: i64, needle_ptr: u6
   if hay_len < needle_len {
     return None;
   }
+  if needle_len == 1 {
+    let n0: u8 = std::runtime::mem::load_u8(needle_ptr, 0);
+    let lower: u8 = ascii_lower(n0);
+    let upper: u8 = if lower >= 97 && lower <= 122 { lower - 32 } else { lower };
+
+    let tail_ptr: u64 = hay_ptr + (start as u64);
+    let tail_len: i64 = hay_len - start;
+
+    let p1: u64 = memchr(tail_ptr, lower as int, tail_len);
+    let p2: u64 = if upper == lower { 0 } else { memchr(tail_ptr, upper as int, tail_len) };
+
+    if p1 == 0 && p2 == 0 {
+      return None;
+    }
+
+    let p: u64 =
+      if p1 == 0 { p2 }
+      else if p2 == 0 { p1 }
+      else if p1 < p2 { p1 }
+      else { p2 };
+
+    let off: i64 = (p - hay_ptr) as i64;
+    return Some(Match{ start: off, end: off + 1 });
+  }
 
   let last: i64 = hay_len - needle_len;
+  if start > last {
+    return None;
+  }
+
+  let n0: u8 = std::runtime::mem::load_u8(needle_ptr, 0);
+  let lower0: u8 = ascii_lower(n0);
+  let upper0: u8 = if lower0 >= 97 && lower0 <= 122 { lower0 - 32 } else { lower0 };
+
+  // Scan for the first byte via libc `memchr`, then verify candidates.
   var i: i64 = start;
   while i <= last {
-    let a_ptr: u64 = hay_ptr + (i as u64);
-    if eq_ascii_case_insensitive(a_ptr, needle_ptr, needle_len) {
-      return Some(Match{ start: i, end: i + needle_len });
+    let tail_ptr: u64 = hay_ptr + (i as u64);
+    let tail_len: i64 = hay_len - i;
+
+    let p1: u64 = memchr(tail_ptr, lower0 as int, tail_len);
+    let p2: u64 = if upper0 == lower0 { 0 } else { memchr(tail_ptr, upper0 as int, tail_len) };
+
+    if p1 == 0 && p2 == 0 {
+      return None;
     }
-    i = i + 1;
+
+    let p: u64 =
+      if p1 == 0 { p2 }
+      else if p2 == 0 { p1 }
+      else if p1 < p2 { p1 }
+      else { p2 };
+
+    let cand: i64 = (p - hay_ptr) as i64;
+    if cand > last {
+      return None;
+    }
+
+    let a_ptr: u64 = hay_ptr + (cand as u64);
+    if eq_ascii_case_insensitive(a_ptr, needle_ptr, needle_len) {
+      return Some(Match{ start: cand, end: cand + needle_len });
+    }
+
+    i = cand + 1;
   }
   return None;
 }
@@ -198,7 +305,13 @@ export fn compile (text: string, fixed: bool, ignore_case: bool) -> PatternResul
     return Err(failed(PatternErrorKind::EmptyPattern, 0));
   }
 
-  if fixed {
+  // Fast path: when the pattern contains no regex metacharacters, regex
+  // semantics are identical to a fixed substring search. In that case we can
+  // skip regex compilation and use the fixed matcher (case-sensitive only).
+  let effective_fixed: bool =
+    fixed || (!ignore_case && is_literal_regex(text));
+
+  if effective_fixed {
     return Ok(Pattern{
       kind: PatternKind::Fixed,
       needle: text,
@@ -207,10 +320,7 @@ export fn compile (text: string, fixed: bool, ignore_case: bool) -> PatternResul
     });
   }
 
-  var flags: string = "";
-  if ignore_case {
-    flags = "i";
-  }
+  let flags: string = if ignore_case { "i" } else { "" };
 
   // Note: prefer `std::result::Result.unwrap_or(...)` instead of destructuring
   // the regex compile result directly. This avoids a known class of "by-value

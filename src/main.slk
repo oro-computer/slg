@@ -10,7 +10,6 @@ import { Config, parse_cli, print_help, print_version } from "./slg/cli.slk";
 import { run_auto } from "./slg/engine.slk";
 import { BufferU8 } from "./slg/buf.slk";
 import { dup, memcpy, memmem } from "./slg/os.slk";
-import { smoke as formal_smoke } from "./slg/formal.slk";
 
 async fn run_cfg (cfg: Config) -> int {
   if cfg.help {
@@ -21,7 +20,8 @@ async fn run_cfg (cfg: Config) -> int {
     print_version();
     return 0;
   }
-  return await run_auto(cfg);
+  let code: int = await run_auto(cfg);
+  return code;
 }
 
 /**
@@ -36,10 +36,11 @@ async fn run_cfg (cfg: Config) -> int {
 export async fn main (argc: int, argv: u64) -> int {
   let args: Args = Args.init(argc, argv);
   let cfg_opt: Config? = parse_cli(args);
-  return match (cfg_opt) {
+  let code: int = match (cfg_opt) {
     Some(cfg) => await run_cfg(cfg),
     None => 2,
   };
+  return code;
 }
 
 /**
@@ -103,161 +104,86 @@ fn argv_free_partial (argv: u64, count: int) -> void {
 }
 
 /**
- * Allocate an owned argv list with 3 entries.
+ * Return the `index`th vararg `string`, or `None` when out of range.
+ *
+ * Note: Silk varargs are currently represented as `len` plus a fixed set of
+ * fields (`a0..a31`), so indexing is manually unrolled here.
  */
-fn argv_alloc_3 (a0: string, a1: string, a2: string) -> ArgvOwned? {
-  let argc: int = 3;
-  let argv: u64 = std::runtime::mem::alloc((argc * 8) as i64);
-  if argv == 0 {
+fn argv_vararg_at (index: int, ...args: string) -> string? {
+  if index < 0 || index >= args.len {
     return None;
   }
-
-  let p0: u64 = cstr_alloc(a0);
-  if p0 == 0 {
-    std::runtime::mem::free(argv);
-    return None;
-  }
-  std::runtime::mem::store_u64(argv, 0, p0);
-
-  let p1: u64 = cstr_alloc(a1);
-  if p1 == 0 {
-    argv_free_partial(argv, 1);
-    std::runtime::mem::free(argv);
-    return None;
-  }
-  std::runtime::mem::store_u64(argv, 8, p1);
-
-  let p2: u64 = cstr_alloc(a2);
-  if p2 == 0 {
-    argv_free_partial(argv, 2);
-    std::runtime::mem::free(argv);
-    return None;
-  }
-  std::runtime::mem::store_u64(argv, 16, p2);
-
-  return Some(ArgvOwned{ argc: argc, argv: argv });
+  if index == 0 { return Some(args.a0); }
+  if index == 1 { return Some(args.a1); }
+  if index == 2 { return Some(args.a2); }
+  if index == 3 { return Some(args.a3); }
+  if index == 4 { return Some(args.a4); }
+  if index == 5 { return Some(args.a5); }
+  if index == 6 { return Some(args.a6); }
+  if index == 7 { return Some(args.a7); }
+  if index == 8 { return Some(args.a8); }
+  if index == 9 { return Some(args.a9); }
+  if index == 10 { return Some(args.a10); }
+  if index == 11 { return Some(args.a11); }
+  if index == 12 { return Some(args.a12); }
+  if index == 13 { return Some(args.a13); }
+  if index == 14 { return Some(args.a14); }
+  if index == 15 { return Some(args.a15); }
+  if index == 16 { return Some(args.a16); }
+  if index == 17 { return Some(args.a17); }
+  if index == 18 { return Some(args.a18); }
+  if index == 19 { return Some(args.a19); }
+  if index == 20 { return Some(args.a20); }
+  if index == 21 { return Some(args.a21); }
+  if index == 22 { return Some(args.a22); }
+  if index == 23 { return Some(args.a23); }
+  if index == 24 { return Some(args.a24); }
+  if index == 25 { return Some(args.a25); }
+  if index == 26 { return Some(args.a26); }
+  if index == 27 { return Some(args.a27); }
+  if index == 28 { return Some(args.a28); }
+  if index == 29 { return Some(args.a29); }
+  if index == 30 { return Some(args.a30); }
+  if index == 31 { return Some(args.a31); }
+  return None;
 }
 
 /**
- * Allocate an owned argv list with 4 entries.
+ * Allocate an owned argv list for end-to-end CLI tests.
+ *
+ * This allocates:
+ * - one `char**` pointer list (`argv`),
+ * - one NUL-terminated allocation per argument (`argv[i]`).
  */
-fn argv_alloc_4 (a0: string, a1: string, a2: string, a3: string) -> ArgvOwned? {
-  let argc: int = 4;
-  let argv: u64 = std::runtime::mem::alloc((argc * 8) as i64);
+fn argv_alloc (...args: string) -> ArgvOwned? {
+  if args.len <= 0 {
+    return None;
+  }
+  if args.len > 32 {
+    return None;
+  }
+  let argc: int = args.len;
+  // Allocate a `char**` pointer list with a conventional trailing NULL slot.
+  let argv: u64 = std::runtime::mem::alloc(((argc + 1) * 8) as i64);
   if argv == 0 {
     return None;
   }
+  std::runtime::mem::store_u64(argv, (argc * 8) as i64, 0);
 
-  let p0: u64 = cstr_alloc(a0);
-  if p0 == 0 {
-    std::runtime::mem::free(argv);
-    return None;
+  var i: int = 0;
+  while i < argc {
+    let s_opt: string? = argv_vararg_at(i, args);
+    let s: string = s_opt ?? "";
+
+    let p: u64 = cstr_alloc(s);
+    if p == 0 {
+      argv_free_partial(argv, i);
+      std::runtime::mem::free(argv);
+      return None;
+    }
+    std::runtime::mem::store_u64(argv, (i * 8) as i64, p);
+    i = i + 1;
   }
-  std::runtime::mem::store_u64(argv, 0, p0);
-
-  let p1: u64 = cstr_alloc(a1);
-  if p1 == 0 {
-    argv_free_partial(argv, 1);
-    std::runtime::mem::free(argv);
-    return None;
-  }
-  std::runtime::mem::store_u64(argv, 8, p1);
-
-  let p2: u64 = cstr_alloc(a2);
-  if p2 == 0 {
-    argv_free_partial(argv, 2);
-    std::runtime::mem::free(argv);
-    return None;
-  }
-  std::runtime::mem::store_u64(argv, 16, p2);
-
-  let p3: u64 = cstr_alloc(a3);
-  if p3 == 0 {
-    argv_free_partial(argv, 3);
-    std::runtime::mem::free(argv);
-    return None;
-  }
-  std::runtime::mem::store_u64(argv, 24, p3);
-
-  return Some(ArgvOwned{ argc: argc, argv: argv });
-}
-
-/**
- * Allocate an owned argv list with 5 entries.
- */
-fn argv_alloc_5 (a0: string, a1: string, a2: string, a3: string, a4: string) -> ArgvOwned? {
-  let argc: int = 5;
-  let argv: u64 = std::runtime::mem::alloc((argc * 8) as i64);
-  if argv == 0 {
-    return None;
-  }
-
-  let p0: u64 = cstr_alloc(a0);
-  if p0 == 0 {
-    std::runtime::mem::free(argv);
-    return None;
-  }
-  std::runtime::mem::store_u64(argv, 0, p0);
-
-  let p1: u64 = cstr_alloc(a1);
-  if p1 == 0 {
-    argv_free_partial(argv, 1);
-    std::runtime::mem::free(argv);
-    return None;
-  }
-  std::runtime::mem::store_u64(argv, 8, p1);
-
-  let p2: u64 = cstr_alloc(a2);
-  if p2 == 0 {
-    argv_free_partial(argv, 2);
-    std::runtime::mem::free(argv);
-    return None;
-  }
-  std::runtime::mem::store_u64(argv, 16, p2);
-
-  let p3: u64 = cstr_alloc(a3);
-  if p3 == 0 {
-    argv_free_partial(argv, 3);
-    std::runtime::mem::free(argv);
-    return None;
-  }
-  std::runtime::mem::store_u64(argv, 24, p3);
-
-  let p4: u64 = cstr_alloc(a4);
-  if p4 == 0 {
-    argv_free_partial(argv, 4);
-    std::runtime::mem::free(argv);
-    return None;
-  }
-  std::runtime::mem::store_u64(argv, 32, p4);
-
-  return Some(ArgvOwned{ argc: argc, argv: argv });
-}
-
-/**
- * Allocate an owned argv list with 2 entries.
- */
-fn argv_alloc_2 (a0: string, a1: string) -> ArgvOwned? {
-  let argc: int = 2;
-  let argv: u64 = std::runtime::mem::alloc((argc * 8) as i64);
-  if argv == 0 {
-    return None;
-  }
-
-  let p0: u64 = cstr_alloc(a0);
-  if p0 == 0 {
-    std::runtime::mem::free(argv);
-    return None;
-  }
-  std::runtime::mem::store_u64(argv, 0, p0);
-
-  let p1: u64 = cstr_alloc(a1);
-  if p1 == 0 {
-    argv_free_partial(argv, 1);
-    std::runtime::mem::free(argv);
-    return None;
-  }
-  std::runtime::mem::store_u64(argv, 8, p1);
 
   return Some(ArgvOwned{ argc: argc, argv: argv });
 }
@@ -402,8 +328,49 @@ async fn capture_stdout_run_cfg (cfg: Config) -> Capture? {
   return Some(Capture{ code: code, out: out });
 }
 
+/**
+ * Run `slg` with stdout redirected to a non-writable fd.
+ *
+ * This is used by end-to-end tests to ensure output failures are treated as
+ * errors (exit code 2) and trigger early-stop cancellation in parallel mode.
+ */
+async fn broken_stdout_run_cfg (cfg: Config) -> int? {
+  // Create a pipe, then (intentionally) dup the read end onto stdout.
+  let fds_ptr: u64 = std::runtime::mem::alloc(8);
+  if fds_ptr == 0 {
+    return None;
+  }
+  let prc: int = std::runtime::posix::io::pipe(fds_ptr) as int;
+  if prc != 0 {
+    std::runtime::mem::free(fds_ptr);
+    return None;
+  }
+  let rfd: int = load_i32_le(fds_ptr, 0);
+  let wfd: int = load_i32_le(fds_ptr, 4);
+  std::runtime::mem::free(fds_ptr);
+
+  // Save stdout, then redirect fd=1 to the read end (writes will fail).
+  let saved: int = dup(1);
+  if saved < 0 {
+    let _ = std::runtime::posix::fs::close(rfd);
+    let _ = std::runtime::posix::fs::close(wfd);
+    return None;
+  }
+  let _ = std::runtime::posix::io::dup2(rfd, 1);
+  let _ = std::runtime::posix::fs::close(rfd);
+  let _ = std::runtime::posix::fs::close(wfd);
+
+  // Run.
+  let code: int = await run_cfg(cfg);
+
+  // Restore stdout.
+  let _ = std::runtime::posix::io::dup2(saved, 1);
+  let _ = std::runtime::posix::fs::close(saved);
+  return Some(code);
+}
+
 test "slg e2e - help is descriptive" {
-  let av_opt: ArgvOwned? = argv_alloc_2("slg", "--help");
+  let av_opt: ArgvOwned? = argv_alloc("slg", "--help");
   assert(av_opt != None, "argv alloc failed");
   let mut av: ArgvOwned = av_opt ?? ArgvOwned{ argc: 0, argv: 0 };
 
@@ -432,7 +399,7 @@ test "slg e2e - help is descriptive" {
 }
 
 test "slg e2e - --files can run in parallel" {
-  let av_opt: ArgvOwned? = argv_alloc_5("slg", "--files", "--parallel-files", "--jobs=4", "testdata/basic");
+  let av_opt: ArgvOwned? = argv_alloc("slg", "--files", "--parallel-files", "--jobs=4", "testdata/basic");
   assert(av_opt != None, "argv alloc failed");
   let mut av: ArgvOwned = av_opt ?? ArgvOwned{ argc: 0, argv: 0 };
 
@@ -457,8 +424,28 @@ test "slg e2e - --files can run in parallel" {
   av.drop();
 }
 
+test "slg e2e - output failure is an error" {
+  let av_opt: ArgvOwned? = argv_alloc("slg", "--files", "--parallel-files", "--jobs=4", "testdata/basic");
+  assert(av_opt != None, "argv alloc failed");
+  let mut av: ArgvOwned = av_opt ?? ArgvOwned{ argc: 0, argv: 0 };
+
+  let args: Args = Args.init(av.argc, av.argv);
+  let cfg_opt: Config? = parse_cli(args);
+  assert(cfg_opt != None, "parse_cli should succeed");
+
+  let code_opt: int? = match (cfg_opt) {
+    Some(cfg) => await broken_stdout_run_cfg(cfg),
+    None => None,
+  };
+  assert(code_opt != None, "run should return a code");
+  let code: int = code_opt ?? 0;
+  assert(code == 2, "expected exit code 2 when stdout is not writable");
+
+  av.drop();
+}
+
 test "slg e2e - fixed search finds a match" {
-  let av_opt: ArgvOwned? = argv_alloc_4("slg", "-F", "TODO", "testdata/basic");
+  let av_opt: ArgvOwned? = argv_alloc("slg", "-F", "TODO", "testdata/basic");
   assert(av_opt != None, "argv alloc failed");
   let mut av: ArgvOwned = av_opt ?? ArgvOwned{ argc: 0, argv: 0 };
 
@@ -483,7 +470,7 @@ test "slg e2e - fixed search finds a match" {
 }
 
 test "slg e2e - --jobs 1 forces single-threaded" {
-  let av_opt: ArgvOwned? = argv_alloc_5("slg", "--jobs=1", "-F", "TODO", "testdata/basic");
+  let av_opt: ArgvOwned? = argv_alloc("slg", "--jobs=1", "-F", "TODO", "testdata/basic");
   assert(av_opt != None, "argv alloc failed");
   let mut av: ArgvOwned = av_opt ?? ArgvOwned{ argc: 0, argv: 0 };
 
@@ -507,9 +494,32 @@ test "slg e2e - --jobs 1 forces single-threaded" {
   av.drop();
 }
 
+test "slg e2e - concurrency values are clamped" {
+  let av_opt: ArgvOwned? =
+    argv_alloc("slg", "--jobs=999", "--max-workers=999", "-F", "TODO", "testdata/basic");
+  assert(av_opt != None, "argv alloc failed");
+  let mut av: ArgvOwned = av_opt ?? ArgvOwned{ argc: 0, argv: 0 };
+
+  let args: Args = Args.init(av.argc, av.argv);
+  let cfg_opt: Config? = parse_cli(args);
+  assert(cfg_opt != None, "parse_cli should succeed");
+
+  let Some(cfg) = cfg_opt else {
+    assert(false, "config should exist");
+    av.drop();
+    return;
+  };
+
+  // Current implementation limit: 1 orchestrator + 8 worker slots.
+  assert(cfg.jobs == 9, "expected --jobs to clamp to 9");
+  assert(cfg.max_workers == 8, "expected --max-workers to clamp to 8");
+
+  av.drop();
+}
+
 test "slg e2e - hidden files require --hidden" {
   // Without --hidden: no matches.
-  let av1_opt: ArgvOwned? = argv_alloc_4("slg", "-F", "needle_hidden", "testdata/basic");
+  let av1_opt: ArgvOwned? = argv_alloc("slg", "-F", "needle_hidden", "testdata/basic");
   assert(av1_opt != None, "argv alloc failed");
   let mut av1: ArgvOwned = av1_opt ?? ArgvOwned{ argc: 0, argv: 0 };
 
@@ -532,7 +542,7 @@ test "slg e2e - hidden files require --hidden" {
   av1.drop();
 
   // With --hidden: match appears.
-  let av2_opt: ArgvOwned? = argv_alloc_5("slg", "-F", "--hidden", "needle_hidden", "testdata/basic");
+  let av2_opt: ArgvOwned? = argv_alloc("slg", "-F", "--hidden", "needle_hidden", "testdata/basic");
   assert(av2_opt != None, "argv alloc failed");
   let mut av2: ArgvOwned = av2_opt ?? ArgvOwned{ argc: 0, argv: 0 };
 
@@ -556,7 +566,7 @@ test "slg e2e - hidden files require --hidden" {
 }
 
 test "slg e2e - --files lists searchable files" {
-  let av_opt: ArgvOwned? = argv_alloc_3("slg", "--files", "testdata/basic");
+  let av_opt: ArgvOwned? = argv_alloc("slg", "--files", "testdata/basic");
   assert(av_opt != None, "argv alloc failed");
   let mut av: ArgvOwned = av_opt ?? ArgvOwned{ argc: 0, argv: 0 };
 
@@ -579,4 +589,66 @@ test "slg e2e - --files lists searchable files" {
 
   cap.drop();
   av.drop();
+}
+
+test "slg e2e - ignore files are respected" {
+  // With ignore files enabled (default): ignored paths should be skipped.
+  let av1_opt: ArgvOwned? = argv_alloc("slg", "--files", "testdata/ignore");
+  assert(av1_opt != None, "argv alloc failed");
+  let mut av1: ArgvOwned = av1_opt ?? ArgvOwned{ argc: 0, argv: 0 };
+
+  let args1: Args = Args.init(av1.argc, av1.argv);
+  let cfg1_opt: Config? = parse_cli(args1);
+  assert(cfg1_opt != None, "parse_cli should succeed");
+
+  let cap1_opt: Capture? = match (cfg1_opt) {
+    Some(cfg) => await capture_stdout_run_cfg(cfg),
+    None => None,
+  };
+  assert(cap1_opt != None, "capture failed");
+  let mut cap1: Capture = cap1_opt ?? Capture{ code: 2, out: BufferU8.empty() };
+
+  assert(cap1.code == 0, "expected exit code 0");
+  let out1: string = buffer_as_string(cap1.out);
+  assert(contains(out1, "testdata/ignore/a.txt"), "expected unignored file in list");
+  assert(contains(out1, "testdata/ignore/keep.log"), "expected negated file in list");
+  assert(contains(out1, "testdata/ignore/sub/anchored.txt"), "expected anchored rule to not apply in subdir");
+
+  assert(!contains(out1, "testdata/ignore/ignored.txt"), "expected ignored file to be skipped");
+  assert(!contains(out1, "testdata/ignore/a.log"), "expected glob-ignored file to be skipped");
+  assert(!contains(out1, "testdata/ignore/anchored.txt"), "expected anchored ignored file to be skipped");
+  assert(!contains(out1, "testdata/ignore/deep.txt"), "expected globstar-ignored file to be skipped");
+  assert(!contains(out1, "testdata/ignore/sub/deep.txt"), "expected globstar-ignored file to be skipped");
+  assert(!contains(out1, "testdata/ignore/ignored_dir/x.txt"), "expected ignored directory to be skipped");
+
+  cap1.drop();
+  av1.drop();
+
+  // With ignore files disabled: previously ignored paths should re-appear.
+  let av2_opt: ArgvOwned? = argv_alloc("slg", "--files", "--no-ignore-files", "testdata/ignore");
+  assert(av2_opt != None, "argv alloc failed");
+  let mut av2: ArgvOwned = av2_opt ?? ArgvOwned{ argc: 0, argv: 0 };
+
+  let args2: Args = Args.init(av2.argc, av2.argv);
+  let cfg2_opt: Config? = parse_cli(args2);
+  assert(cfg2_opt != None, "parse_cli should succeed");
+
+  let cap2_opt: Capture? = match (cfg2_opt) {
+    Some(cfg) => await capture_stdout_run_cfg(cfg),
+    None => None,
+  };
+  assert(cap2_opt != None, "capture failed");
+  let mut cap2: Capture = cap2_opt ?? Capture{ code: 2, out: BufferU8.empty() };
+
+  assert(cap2.code == 0, "expected exit code 0");
+  let out2: string = buffer_as_string(cap2.out);
+  assert(contains(out2, "testdata/ignore/ignored.txt"), "expected ignored file to re-appear with --no-ignore-files");
+  assert(contains(out2, "testdata/ignore/a.log"), "expected glob-ignored file to re-appear with --no-ignore-files");
+  assert(contains(out2, "testdata/ignore/anchored.txt"), "expected anchored ignored file to re-appear with --no-ignore-files");
+  assert(contains(out2, "testdata/ignore/deep.txt"), "expected globstar-ignored file to re-appear with --no-ignore-files");
+  assert(contains(out2, "testdata/ignore/sub/deep.txt"), "expected globstar-ignored file to re-appear with --no-ignore-files");
+  assert(contains(out2, "testdata/ignore/ignored_dir/x.txt"), "expected ignored directory contents to re-appear with --no-ignore-files");
+
+  cap2.drop();
+  av2.drop();
 }

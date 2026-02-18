@@ -1,0 +1,1 @@
+this file should NOT be ignored by an anchored root rule

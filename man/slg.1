@@ -43,6 +43,12 @@ Follow symlinks (may loop).
 Limit recursion depth.
 Use \fB0\fR for only the root(s).
 .TP
+.B --no-ignore-common
+Do not skip common heavy directories (by default: \fBnode_modules\fR, \fBbuild\fR, \fBdist\fR, \fBtarget\fR, \fBtmp\fR, \fB.cache\fR).
+.TP
+.B --no-ignore-files
+Do not read per-directory ignore files (\fB.gitignore\fR, \fB.ignore\fR, \fB.agignore\fR).
+.TP
 .B --no-ignore-vcs
 Do not skip \fB.git\fR/\fB.hg\fR/\fB.svn\fR directories.
 Note: these names are also hidden; use \fB--hidden\fR to traverse them.
@@ -50,13 +56,16 @@ Note: these names are also hidden; use \fB--hidden\fR to traverse them.
 .TP
 .BR -j ", " --jobs " " \fIn\fR
 Parallel tasks.
-\fB0\fR means auto (use available CPUs).
+\fB0\fR means auto (use available CPUs, clamped to the current implementation limit).
 \fB1\fR forces single-threaded mode.
+Values above \fB9\fR are clamped to \fB9\fR in this snapshot.
 .TP
 .BR --max-workers " " \fIn\fR
 Cap worker tasks for parallel traversal.
-\fB0\fR means no cap (within current implementation limits).
-Default: \fB8\fR.
+\fB0\fR means no cap (still clamped to the current implementation limit).
+Values above \fB8\fR are clamped to \fB8\fR in this snapshot.
+Current implementation limit: \fB8\fR.
+Default: \fB0\fR.
 .TP
 .B --parallel-files
 Parallelize \fB--files\fR traversal when \fB--jobs\fR > 1.

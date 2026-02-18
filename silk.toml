@@ -34,7 +34,8 @@ profile = "release"
 command = "silk test --package ."
 e2e = true
 testdata = [
-  "testdata/basic"
+  "testdata/basic",
+  "testdata/ignore"
 ]
 
 [docs]

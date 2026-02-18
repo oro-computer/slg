@@ -1,0 +1,768 @@
+module slg::ignore;
+
+import std::path;
+import std::runtime::mem;
+import std::runtime::posix::fs;
+import { OutOfMemory } from "std/memory";
+
+import { BufferU8 } from "./buf.slk";
+import {
+  MAP_FAILED,
+  MAP_PRIVATE,
+  PROT_READ,
+  errno,
+  memchr,
+  memcmp,
+  mmap,
+  munmap,
+} from "./os.slk";
+
+// ---------------------------------------------------------------------------
+// Gitignore-style ignore files.
+//
+// Goals:
+// - Reduce work (file count) to be closer to `ag` defaults.
+// - Keep semantics pragmatic and robust.
+// - Stay allocation-light in hot loops (rules are parsed once per directory).
+//
+// Supported features:
+// - `.gitignore`, `.ignore`, `.agignore` (per-directory)
+// - `#` comments + blank lines
+// - `!` negation
+// - trailing `/` (directory-only)
+// - leading `/` anchoring (name-only patterns only)
+// - globs: `*` and `?`
+// - `**` as a full path segment matches zero or more segments
+//
+// Notes:
+// - This intentionally does not (yet) implement backslash escaping, character
+//   classes (`[a-z]`), or git’s "re-include requires parent directories to be
+//   unignored" nuance. It’s good enough for common ignore files used in the
+//   workspace and materially improves performance by skipping build outputs.
+
+type PathBuf = std::path::PathBuf;
+
+// Linux hosted baseline errno values used for ignore-file opens.
+let ENOENT: int = 2;
+
+let RULE_REC_SIZE: i64 = 24;
+let DIR_REC_SIZE: i64 = 40;
+let MAX_SEGMENTS: i64 = 64;
+
+let FLAG_NEGATED: u64 = 1;
+let FLAG_DIR_ONLY: u64 = 2;
+let FLAG_ANCHORED: u64 = 4;
+let FLAG_HAS_SLASH: u64 = 8;
+let FLAG_HAS_GLOB: u64 = 16;
+
+let DIR_OFF_BASE_LEN: i64 = 0;
+let DIR_OFF_CONTENT_PTR: i64 = 8;
+let DIR_OFF_CONTENT_LEN: i64 = 16;
+let DIR_OFF_RULES_PTR: i64 = 24;
+let DIR_OFF_RULES_LEN: i64 = 32;
+
+struct RuleRec {
+  pat_off: i64,
+  pat_len: i64,
+  flags: u64,
+}
+
+struct DirRec {
+  base_len: i64,
+  content_ptr: u64,
+  content_len: i64,
+  rules_ptr: u64,
+  rules_len: i64,
+}
+
+/**
+ * A stack of ignore contexts (one per directory with ignore rules).
+ *
+ * Design:
+ * - The hosted subset rejects self-referential borrows in structs (`parent:
+ *   &Self`), so we represent the "parent chain" as an explicit stack.
+ * - Each pushed directory owns two buffers:
+ *   - `content`: concatenated bytes of ignore files read in that directory
+ *   - `rules`: packed RuleRec records referencing offsets into `content`
+ * - When we pop, we free those owned buffers.
+ */
+export struct IgnoreStack {
+  // Packed DirRec records (each record owns `content_ptr` + `rules_ptr`).
+  dirs: BufferU8,
+}
+
+fn take_dirs (mut stack: &IgnoreStack) -> BufferU8 {
+  let dirs: BufferU8 = stack.dirs;
+  stack.dirs = BufferU8.empty();
+  return dirs;
+}
+
+fn put_dirs (mut stack: &IgnoreStack, mut dirs: BufferU8) -> void {
+  stack.dirs = dirs;
+  dirs.ptr = 0;
+  dirs.len = 0;
+  dirs.cap = 0;
+}
+
+fn rules_count_len (rules_len: i64) -> i64 {
+  if rules_len <= 0 {
+    return 0;
+  }
+  return rules_len / RULE_REC_SIZE;
+}
+
+fn dirs_count_len (dirs_len: i64) -> i64 {
+  if dirs_len <= 0 {
+    return 0;
+  }
+  return dirs_len / DIR_REC_SIZE;
+}
+
+fn rules_push (mut rules: &BufferU8, pat_off: i64, pat_len: i64, flags: u64) -> bool {
+  let err: OutOfMemory? = rules.reserve_additional(RULE_REC_SIZE);
+  if err != None {
+    return false;
+  }
+  let off: i64 = rules.len;
+  std::runtime::mem::store_u64(rules.ptr, off + 0, pat_off as u64);
+  std::runtime::mem::store_u64(rules.ptr, off + 8, pat_len as u64);
+  std::runtime::mem::store_u64(rules.ptr, off + 16, flags);
+  rules.len = rules.len + RULE_REC_SIZE;
+  return true;
+}
+
+fn rules_get (rules_ptr: u64, index: i64) -> RuleRec {
+  let off: i64 = index * RULE_REC_SIZE;
+  let pat_off: i64 = std::runtime::mem::load_u64(rules_ptr, off + 0) as i64;
+  let pat_len: i64 = std::runtime::mem::load_u64(rules_ptr, off + 8) as i64;
+  let flags: u64 = std::runtime::mem::load_u64(rules_ptr, off + 16);
+  return RuleRec{ pat_off: pat_off, pat_len: pat_len, flags: flags };
+}
+
+fn dirs_get (dirs_ptr: u64, index: i64) -> DirRec {
+  let off: i64 = index * DIR_REC_SIZE;
+  let base_len: i64 = std::runtime::mem::load_u64(dirs_ptr, off + DIR_OFF_BASE_LEN) as i64;
+  let content_ptr: u64 = std::runtime::mem::load_u64(dirs_ptr, off + DIR_OFF_CONTENT_PTR);
+  let content_len: i64 = std::runtime::mem::load_u64(dirs_ptr, off + DIR_OFF_CONTENT_LEN) as i64;
+  let rules_ptr: u64 = std::runtime::mem::load_u64(dirs_ptr, off + DIR_OFF_RULES_PTR);
+  let rules_len: i64 = std::runtime::mem::load_u64(dirs_ptr, off + DIR_OFF_RULES_LEN) as i64;
+  return DirRec{
+    base_len: base_len,
+    content_ptr: content_ptr,
+    content_len: content_len,
+    rules_ptr: rules_ptr,
+    rules_len: rules_len,
+  };
+}
+
+fn dirs_push (mut dirs: &BufferU8, base_len: i64, content_ptr: u64, content_len: i64, rules_ptr: u64, rules_len: i64) -> bool {
+  let err: OutOfMemory? = dirs.reserve_additional(DIR_REC_SIZE);
+  if err != None {
+    return false;
+  }
+  let off: i64 = dirs.len;
+  std::runtime::mem::store_u64(dirs.ptr, off + DIR_OFF_BASE_LEN, base_len as u64);
+  std::runtime::mem::store_u64(dirs.ptr, off + DIR_OFF_CONTENT_PTR, content_ptr);
+  std::runtime::mem::store_u64(dirs.ptr, off + DIR_OFF_CONTENT_LEN, content_len as u64);
+  std::runtime::mem::store_u64(dirs.ptr, off + DIR_OFF_RULES_PTR, rules_ptr);
+  std::runtime::mem::store_u64(dirs.ptr, off + DIR_OFF_RULES_LEN, rules_len as u64);
+  dirs.len = dirs.len + DIR_REC_SIZE;
+  return true;
+}
+
+fn trim_line_end (ptr: u64, start: i64, end: i64) -> i64 {
+  var e: i64 = end;
+  if e <= start {
+    return e;
+  }
+  // Drop CR.
+  if std::runtime::mem::load_u8(ptr, e - 1) == 13 {
+    e = e - 1;
+  }
+  // Drop trailing spaces/tabs (common in hand-edited ignore files).
+  while e > start {
+    let b: u8 = std::runtime::mem::load_u8(ptr, e - 1);
+    if b != 32 && b != 9 {
+      break;
+    }
+    e = e - 1;
+  }
+  return e;
+}
+
+fn line_has_slash (ptr: u64, start: i64, end: i64) -> bool {
+  if end <= start {
+    return false;
+  }
+  return memchr(ptr + (start as u64), 47, end - start) != 0;
+}
+
+fn line_has_glob (ptr: u64, start: i64, end: i64) -> bool {
+  if end <= start {
+    return false;
+  }
+  let n: i64 = end - start;
+  let p: u64 = ptr + (start as u64);
+  return memchr(p, 42, n) != 0 || memchr(p, 63, n) != 0;
+}
+
+fn parse_rules_range (content_ptr: u64, start_off: i64, len: i64, mut rules: &BufferU8) -> bool {
+  if content_ptr == 0 || len <= 0 {
+    return true;
+  }
+
+  let end_off: i64 = start_off + len;
+  var off: i64 = start_off;
+  var line_start: i64 = start_off;
+
+  while off <= end_off {
+    let at_end: bool = off == end_off;
+    let b: u8 = if at_end { 10 } else { std::runtime::mem::load_u8(content_ptr, off) };
+    if b != 10 {
+      off = off + 1;
+      continue;
+    }
+
+    var start: i64 = line_start;
+    var end: i64 = trim_line_end(content_ptr, line_start, off);
+    line_start = off + 1;
+    off = off + 1;
+
+    if end <= start {
+      continue;
+    }
+
+    // Comment line (`#...`).
+    if std::runtime::mem::load_u8(content_ptr, start) == 35 {
+      continue;
+    }
+
+    var flags: u64 = 0;
+
+    // Negation (`!...`).
+    if std::runtime::mem::load_u8(content_ptr, start) == 33 {
+      flags = flags | FLAG_NEGATED;
+      start = start + 1;
+      if end <= start {
+        continue;
+      }
+    }
+
+    // Leading '/' anchor.
+    if std::runtime::mem::load_u8(content_ptr, start) == 47 {
+      flags = flags | FLAG_ANCHORED;
+      start = start + 1;
+      if end <= start {
+        continue;
+      }
+    }
+
+    // Trailing '/' means "directory-only".
+    if end > start && std::runtime::mem::load_u8(content_ptr, end - 1) == 47 {
+      flags = flags | FLAG_DIR_ONLY;
+      end = end - 1;
+      if end <= start {
+        continue;
+      }
+    }
+
+    if line_has_slash(content_ptr, start, end) {
+      flags = flags | FLAG_HAS_SLASH;
+    }
+    if line_has_glob(content_ptr, start, end) {
+      flags = flags | FLAG_HAS_GLOB;
+    }
+
+    if !rules_push(mut rules, start, end - start, flags) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+fn mmap_append_file (mut content: &BufferU8, mut rules: &BufferU8, path: string) -> bool {
+  let fd: int = std::runtime::posix::fs::open(path, std::runtime::posix::fs::O_RDONLY, 0) as int;
+  if fd < 0 {
+    let e: int = errno();
+    if e == ENOENT {
+      return true;
+    }
+    // Ignore-file failures should not make the whole run fail; just treat it
+    // as absent (best-effort).
+    return true;
+  }
+
+  let size: i64 = std::runtime::posix::fs::lseek(fd, 0, std::runtime::posix::fs::SEEK_END);
+  if size <= 0 {
+    let _ = std::runtime::posix::fs::close(fd);
+    return true;
+  }
+
+  let map_len: u64 = size as u64;
+  let ptr: u64 = mmap(0, map_len, PROT_READ, MAP_PRIVATE, fd, 0);
+  if ptr == MAP_FAILED {
+    let _ = std::runtime::posix::fs::close(fd);
+    return true;
+  }
+
+  let start_off: i64 = content.len;
+  let err: OutOfMemory? = content.push_ptr_len(ptr, size);
+  let _ = munmap(ptr, map_len);
+  let _ = std::runtime::posix::fs::close(fd);
+
+  if err != None {
+    return false;
+  }
+
+  return parse_rules_range(content.ptr, start_off, size, mut rules);
+}
+
+fn path_truncate (mut path: &PathBuf, new_len: i64) -> void {
+  if new_len < 0 {
+    path.len = 0;
+    if path.ptr != 0 {
+      std::runtime::mem::store_u8(path.ptr, 0, 0);
+    }
+    return;
+  }
+  if new_len >= path.len {
+    return;
+  }
+  path.len = new_len;
+  if path.ptr != 0 {
+    std::runtime::mem::store_u8(path.ptr, new_len, 0);
+  }
+}
+
+fn load_one_ignore_file (
+  mut content: &BufferU8,
+  mut rules: &BufferU8,
+  mut path: &PathBuf,
+  base_len: i64,
+  name: string
+) -> bool {
+  let perr = path.push(name);
+  if perr != None {
+    path_truncate(mut path, base_len);
+    return true;
+  }
+  let file_path: string = path.as_string();
+  let ok: bool = mmap_append_file(mut content, mut rules, file_path);
+  path_truncate(mut path, base_len);
+  return ok;
+}
+
+fn is_globstar_segment (ptr: u64, off: i64, len: i64) -> bool {
+  if len != 2 {
+    return false;
+  }
+  return std::runtime::mem::load_u8(ptr, off) == 42 && std::runtime::mem::load_u8(ptr, off + 1) == 42;
+}
+
+fn match_component (pat_ptr: u64, pat_len: i64, text_ptr: u64, text_len: i64) -> bool {
+  var pi: i64 = 0;
+  var ti: i64 = 0;
+
+  var star_pi: i64 = -1;
+  var star_ti: i64 = -1;
+
+  while ti < text_len {
+    if pi < pat_len && std::runtime::mem::load_u8(pat_ptr, pi) == 42 {
+      // Collapse consecutive `*`.
+      while pi < pat_len && std::runtime::mem::load_u8(pat_ptr, pi) == 42 {
+        pi = pi + 1;
+      }
+      star_pi = pi;
+      star_ti = ti;
+      continue;
+    }
+
+    if pi < pat_len {
+      let pc: u8 = std::runtime::mem::load_u8(pat_ptr, pi);
+      let tc: u8 = std::runtime::mem::load_u8(text_ptr, ti);
+      if pc == 63 || pc == tc {
+        pi = pi + 1;
+        ti = ti + 1;
+        continue;
+      }
+    }
+
+    if star_pi >= 0 {
+      star_ti = star_ti + 1;
+      ti = star_ti;
+      pi = star_pi;
+      continue;
+    }
+
+    return false;
+  }
+
+  while pi < pat_len && std::runtime::mem::load_u8(pat_ptr, pi) == 42 {
+    pi = pi + 1;
+  }
+  return pi == pat_len;
+}
+
+fn bytes_eq (a_ptr: u64, a_len: i64, b_ptr: u64, b_len: i64) -> bool {
+  if a_len != b_len {
+    return false;
+  }
+  if a_len <= 0 {
+    return true;
+  }
+  if a_ptr == b_ptr {
+    return true;
+  }
+  return memcmp(a_ptr, b_ptr, a_len as u64) == 0;
+}
+
+fn match_path (pat_ptr: u64, pat_len: i64, text_ptr: u64, text_len: i64) -> bool {
+  let mut pat_offs: i64[64] = [
+  0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0
+  ];
+  let mut pat_lens: i64[64] = [
+  0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0
+  ];
+  let mut text_offs: i64[64] = [
+  0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0
+  ];
+  let mut text_lens: i64[64] = [
+  0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0
+  ];
+
+  var p_count: i64 = 0;
+  if pat_ptr != 0 && pat_len > 0 {
+    var i: i64 = 0;
+    while i < pat_len {
+      if p_count >= MAX_SEGMENTS {
+        return false;
+      }
+      var j: i64 = i;
+      while j < pat_len && std::runtime::mem::load_u8(pat_ptr, j) != 47 {
+        j = j + 1;
+      }
+      pat_offs[p_count] = i;
+      pat_lens[p_count] = j - i;
+      p_count = p_count + 1;
+      i = j + 1;
+    }
+  }
+
+  var t_count: i64 = 0;
+  if text_ptr != 0 && text_len > 0 {
+    var i: i64 = 0;
+    while i < text_len {
+      if t_count >= MAX_SEGMENTS {
+        return false;
+      }
+      var j: i64 = i;
+      while j < text_len && std::runtime::mem::load_u8(text_ptr, j) != 47 {
+        j = j + 1;
+      }
+      text_offs[t_count] = i;
+      text_lens[t_count] = j - i;
+      t_count = t_count + 1;
+      i = j + 1;
+    }
+  }
+
+  // Stack of active `**` segments for backtracking.
+  let mut gs_pi: i64[64] = [
+  0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0
+  ];
+  let mut gs_ti: i64[64] = [
+  0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0
+  ];
+  var gs_sp: i64 = 0;
+
+  var pi: i64 = 0;
+  var ti: i64 = 0;
+
+  while true {
+    if pi == p_count {
+      if ti == t_count {
+        return true;
+      }
+      // Mismatch: pattern ended but text remains.
+    } else {
+      let seg_off: i64 = pat_offs[pi];
+      let seg_len: i64 = pat_lens[pi];
+      if is_globstar_segment(pat_ptr, seg_off, seg_len) {
+        // `**` matches zero or more path segments.
+        if gs_sp < MAX_SEGMENTS {
+          gs_pi[gs_sp] = pi + 1;
+          gs_ti[gs_sp] = ti;
+          gs_sp = gs_sp + 1;
+        }
+        pi = pi + 1;
+        continue;
+      }
+
+      if ti < t_count {
+        let pat_seg_ptr: u64 = pat_ptr + (seg_off as u64);
+        let pat_seg_len: i64 = seg_len;
+        let text_seg_ptr: u64 = text_ptr + (text_offs[ti] as u64);
+        let text_seg_len: i64 = text_lens[ti];
+        if match_component(pat_seg_ptr, pat_seg_len, text_seg_ptr, text_seg_len) {
+          pi = pi + 1;
+          ti = ti + 1;
+          continue;
+        }
+      }
+    }
+
+    // Backtrack to the most recent `**`.
+    var backtracked: bool = false;
+    while gs_sp > 0 {
+      let idx: i64 = gs_sp - 1;
+      let bt_pi: i64 = gs_pi[idx];
+      let bt_ti: i64 = gs_ti[idx];
+      if bt_ti < t_count {
+        gs_ti[idx] = bt_ti + 1;
+        pi = bt_pi;
+        ti = gs_ti[idx];
+        backtracked = true;
+        break;
+      }
+      gs_sp = gs_sp - 1;
+    }
+
+    if !backtracked {
+      return false;
+    }
+  }
+  return false;
+}
+
+fn rel_slice (full_ptr: u64, full_len: i64, base_len: i64) -> slg::buf::ByteSlice {
+  if base_len <= 0 {
+    return slg::buf::ByteSlice{ ptr: full_ptr, len: full_len };
+  }
+
+  if full_len <= base_len {
+    return slg::buf::ByteSlice{ ptr: full_ptr + (full_len as u64), len: 0 };
+  }
+
+  var off: i64 = base_len;
+  if base_len > 0 && std::runtime::mem::load_u8(full_ptr, base_len - 1) != 47 {
+    off = off + 1;
+  }
+  if off >= full_len {
+    return slg::buf::ByteSlice{ ptr: full_ptr + (full_len as u64), len: 0 };
+  }
+
+  return slg::buf::ByteSlice{ ptr: full_ptr + (off as u64), len: full_len - off };
+}
+
+fn rule_matches (
+  dir_content_ptr: u64,
+  r: RuleRec,
+  rel: slg::buf::ByteSlice,
+  rel_has_slash: bool,
+  name_ptr: u64,
+  name_len: i64,
+  is_dir: bool
+) -> bool {
+  if (r.flags & FLAG_DIR_ONLY) != 0 && !is_dir {
+    return false;
+  }
+
+  let pat_ptr: u64 = dir_content_ptr + (r.pat_off as u64);
+
+  if (r.flags & FLAG_HAS_SLASH) != 0 {
+    if (r.flags & FLAG_HAS_GLOB) == 0 {
+      return bytes_eq(pat_ptr, r.pat_len, rel.ptr, rel.len);
+    }
+    return match_path(pat_ptr, r.pat_len, rel.ptr, rel.len);
+  }
+
+  if (r.flags & FLAG_ANCHORED) != 0 {
+    if rel_has_slash {
+      return false;
+    }
+  }
+
+  if (r.flags & FLAG_HAS_GLOB) == 0 {
+    return bytes_eq(pat_ptr, r.pat_len, name_ptr, name_len);
+  }
+  return match_component(pat_ptr, r.pat_len, name_ptr, name_len);
+}
+
+export fn is_ignored (stack: &IgnoreStack, full_path: string, name: string, is_dir: bool) -> bool {
+  if stack.dirs.ptr == 0 || stack.dirs.len <= 0 {
+    return false;
+  }
+
+  let full_ptr: u64 = std::runtime::mem::string_ptr(full_path);
+  let full_len: i64 = std::runtime::mem::string_len(full_path);
+  let name_ptr: u64 = std::runtime::mem::string_ptr(name);
+  let name_len: i64 = std::runtime::mem::string_len(name);
+
+  let dcount: i64 = dirs_count_len(stack.dirs.len);
+  var di: i64 = dcount - 1;
+  while di >= 0 {
+    let d: DirRec = dirs_get(stack.dirs.ptr, di);
+    let rel: slg::buf::ByteSlice = rel_slice(full_ptr, full_len, d.base_len);
+    let rel_slash: bool = rel.ptr != 0 && rel.len > 0 && memchr(rel.ptr, 47, rel.len) != 0;
+    let n: i64 = rules_count_len(d.rules_len);
+    var i: i64 = n - 1;
+    while i >= 0 {
+      let r: RuleRec = rules_get(d.rules_ptr, i);
+      if rule_matches(d.content_ptr, r, rel, rel_slash, name_ptr, name_len, is_dir) {
+        return (r.flags & FLAG_NEGATED) == 0;
+      }
+      i = i - 1;
+    }
+    di = di - 1;
+  }
+
+  return false;
+}
+
+export fn init () -> IgnoreStack {
+  return IgnoreStack{ dirs: BufferU8.empty() };
+}
+
+export fn mark (stack: &IgnoreStack) -> i64 {
+  return stack.dirs.len;
+}
+
+fn pop_dirs_to (mut dirs: &BufferU8, mark: i64) -> void {
+  var m: i64 = mark;
+  if m < 0 { m = 0; }
+  if m >= dirs.len {
+    return;
+  }
+  if dirs.ptr == 0 {
+    dirs.len = 0;
+    return;
+  }
+
+  var off: i64 = dirs.len - DIR_REC_SIZE;
+  while off >= m {
+    let content_ptr: u64 = std::runtime::mem::load_u64(dirs.ptr, off + DIR_OFF_CONTENT_PTR);
+    let rules_ptr: u64 = std::runtime::mem::load_u64(dirs.ptr, off + DIR_OFF_RULES_PTR);
+    std::runtime::mem::free(content_ptr);
+    std::runtime::mem::free(rules_ptr);
+    off = off - DIR_REC_SIZE;
+  }
+
+  dirs.len = m;
+}
+
+export fn pop_to (mut stack: &IgnoreStack, mark: i64) -> void {
+  let mut dirs: BufferU8 = take_dirs(mut stack);
+  pop_dirs_to(mut dirs, mark);
+  put_dirs(mut stack, dirs);
+}
+
+export fn drop_stack (mut stack: &IgnoreStack) -> void {
+  let mut dirs: BufferU8 = take_dirs(mut stack);
+  pop_dirs_to(mut dirs, 0);
+  dirs.drop();
+}
+
+export fn push_dir (enabled: bool, mut stack: &IgnoreStack, mut path: &PathBuf) -> void {
+  if !enabled {
+    return;
+  }
+
+  let base_len: i64 = path.len;
+  let mut content: BufferU8 = BufferU8.empty();
+  let mut rules: BufferU8 = BufferU8.empty();
+
+  let saved_len: i64 = path.len;
+
+  // Read ignore files for this directory in a stable order.
+  if !load_one_ignore_file(mut content, mut rules, mut path, saved_len, ".gitignore") {
+    content.drop();
+    rules.drop();
+    return;
+  }
+
+  if !load_one_ignore_file(mut content, mut rules, mut path, saved_len, ".ignore") {
+    content.drop();
+    rules.drop();
+    return;
+  }
+
+  if !load_one_ignore_file(mut content, mut rules, mut path, saved_len, ".agignore") {
+    content.drop();
+    rules.drop();
+    return;
+  }
+
+  if rules_count_len(rules.len) <= 0 {
+    content.drop();
+    rules.drop();
+    return;
+  }
+
+  // Detach the owned buffers into raw values so we can store them in a packed
+  // stack record without relying on self-referential borrows.
+  let content_ptr: u64 = content.ptr;
+  let content_len: i64 = content.len;
+  content.ptr = 0;
+  content.len = 0;
+  content.cap = 0;
+
+  let rules_ptr: u64 = rules.ptr;
+  let rules_len: i64 = rules.len;
+  rules.ptr = 0;
+  rules.len = 0;
+  rules.cap = 0;
+
+  let mut dirs: BufferU8 = take_dirs(mut stack);
+  let ok: bool = dirs_push(mut dirs, base_len, content_ptr, content_len, rules_ptr, rules_len);
+  put_dirs(mut stack, dirs);
+  if !ok {
+    std::runtime::mem::free(content_ptr);
+    std::runtime::mem::free(rules_ptr);
+    return;
+  }
+}
+
+// NOTE: popping/dropping is handled by `pop_to` / `drop_stack`.

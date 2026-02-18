@@ -40,7 +40,7 @@ export ext closedir = fn (u64) -> int;
  * @param fd: int File descriptor.
  * @returns int 1 for yes, 0 for no, -1 for error.
  */
-export ext isatty = fn (int) -> int;
+export ext isatty = fn (int) -> i32;
 
 /**
  * `dup(2)` — duplicate a file descriptor.
@@ -87,14 +87,24 @@ export ext memmem = fn (u64, i64, u64, i64) -> u64;
 export ext memcpy = fn (u64, u64, i64) -> u64;
 
 /**
+ * `memcmp(3)` — compare two byte sequences (glibc).
+ *
+ * @param a: u64 Pointer to bytes.
+ * @param b: u64 Pointer to bytes.
+ * @param len: u64 Byte length.
+ * @returns int 0 if equal, otherwise non-zero.
+ */
+export ext memcmp = fn (u64, u64, u64) -> int;
+
+/**
  * `mmap(2)` — map a file into memory (POSIX hosted baseline).
  */
-export ext mmap = fn (u64, i64, int, int, int, i64) -> u64;
+export ext mmap = fn (u64, u64, int, int, int, i64) -> u64;
 
 /**
  * `munmap(2)` — unmap a memory mapping.
  */
-export ext munmap = fn (u64, i64) -> int;
+export ext munmap = fn (u64, u64) -> int;
 
 // `mmap` constants (linux hosted baseline).
 export const PROT_READ: int = 1;

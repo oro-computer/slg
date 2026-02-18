@@ -22,7 +22,7 @@ import {
   enabled as color_enabled,
 } from "./color.slk";
 
-import { Config, Mode } from "./cli.slk";
+import { Config, Mode, MAX_WORKER_SLOTS } from "./cli.slk";
 import {
   DT_DIR,
   DT_LNK,
@@ -35,6 +35,7 @@ import {
   closedir,
   errno,
   memchr,
+  memmem,
   mmap,
   munmap,
   opendir,
@@ -42,6 +43,15 @@ import {
 } from "./os.slk";
 import { Writer } from "./out.slk";
 import { BufferU8 } from "./buf.slk";
+import {
+  IgnoreStack,
+  drop_stack as ignore_drop_stack,
+  init as ignore_init,
+  is_ignored as ignore_is_ignored,
+  mark as ignore_mark,
+  pop_to as ignore_pop_to,
+  push_dir as ignore_push_dir,
+} from "./ignore.slk";
 import {
   Match,
   Pattern,
@@ -92,6 +102,27 @@ fn path_truncate (mut p: &PathBuf, new_len: i64) -> void {
   }
 }
 
+fn path_parent_len (p: &PathBuf) -> i64 {
+  if p.ptr == 0 || p.len <= 0 {
+    return 0;
+  }
+
+  var i: i64 = p.len - 1;
+  while i >= 0 {
+    if std::runtime::mem::load_u8(p.ptr, i) == 47 { // '/'
+      if i == 0 {
+        // Root directory ("/").
+        return 1;
+      }
+      return i;
+    }
+    i = i - 1;
+  }
+
+  // No separator: parent is the implicit root (empty base, i.e. ".").
+  return 0;
+}
+
 /**
  * Running counters for a search invocation.
  */
@@ -126,7 +157,7 @@ fn stats_add (mut a: &Stats, b: &Stats) -> void {
  *
  * This is threaded through hot paths so `slg` can:
  * - serialize stdout/stderr output when running multiple tasks,
- * - short-circuit work when quiet-mode cancellation is requested.
+ * - short-circuit work when cancellation is requested (`--quiet`, output failure).
  */
 struct IO {
   out_lock: std::sync::MutexBorrow?,
@@ -161,6 +192,30 @@ fn flush_locked (mut w: &Writer, lock: std::sync::MutexBorrow?) -> bool {
   return ok;
 }
 
+fn flush_locked_or_cancel (mut w: &Writer, io: &IO, lock: std::sync::MutexBorrow?) -> bool {
+  let ok: bool = flush_locked(mut w, lock);
+  if !ok {
+    cancel_set(io);
+  }
+  return ok;
+}
+
+fn flush_out_if_needed (mut out: &Writer, io: &IO) -> bool {
+  // Flush in reasonably sized chunks to reduce syscall + mutex overhead when
+  // emitting lots of output (e.g., `slg .`).
+  if out.buf.len < 65536 {
+    return true;
+  }
+  return flush_locked_or_cancel(mut out, io, io.out_lock);
+}
+
+fn flush_out_if_nonempty (mut out: &Writer, io: &IO) -> bool {
+  if out.buf.len <= 0 {
+    return true;
+  }
+  return flush_locked_or_cancel(mut out, io, io.out_lock);
+}
+
 fn cancel_is_set (io: &IO) -> bool {
   if io.cancel == None {
     return false;
@@ -180,7 +235,7 @@ fn cancel_set (io: &IO) -> void {
 }
 
 /**
- * Outcome for an operation that may short-circuit (quiet mode).
+ * Outcome for an operation that may short-circuit (`--quiet`, cancellation, output failure).
  */
 struct Outcome {
   found: bool,
@@ -210,6 +265,18 @@ fn is_hidden_name (name: string) -> bool {
 
 fn is_vcs_dir_name (name: string) -> bool {
   return name == ".git" || name == ".hg" || name == ".svn";
+}
+
+fn is_common_dir_name (name: string) -> bool {
+  // A small, pragmatic set of "heavy" directories commonly ignored in
+  // project trees. This is intentionally exact-name matching (no globbing).
+  return
+    name == "node_modules" ||
+    name == "build" ||
+    name == "dist" ||
+    name == "target" ||
+    name == "tmp" ||
+    name == ".cache";
 }
 
 fn cstr_len (cstr: u64, max: i64) -> i64 {
@@ -254,14 +321,13 @@ fn write_error (mut err: &Writer, io: &IO, path: string, msg: string) -> void {
   let _ = err.push_str(path);
   if err.color { let _ = err.push_str(reset); }
   let _ = err.push_u8(10);
-  let _ = flush_locked(mut err, io.err_lock);
+  let _ = flush_locked_or_cancel(mut err, io, io.err_lock);
 }
 
-fn print_heading (mut out: &Writer, io: &IO, path: string) -> void {
+fn print_heading (mut out: &Writer, io: &IO, path: string) -> bool {
   let bold: string = BOLD();
   let underline: string = UNDERLINE();
   let reset: string = RESET();
-  out.clear();
   if out.color {
     let _ = out.push_str(bold);
     let _ = out.push_str(underline);
@@ -269,7 +335,13 @@ fn print_heading (mut out: &Writer, io: &IO, path: string) -> void {
   let _ = out.push_str(path);
   if out.color { let _ = out.push_str(reset); }
   let _ = out.push_u8(10);
-  let _ = flush_locked(mut out, io.out_lock);
+  return flush_out_if_needed(mut out, io);
+}
+
+fn append_path_line (mut out: &Writer, io: &IO, path: string) -> bool {
+  let _ = out.push_str(path);
+  let _ = out.push_u8(10);
+  return flush_out_if_needed(mut out, io);
 }
 
 fn append_match_line (
@@ -287,7 +359,6 @@ fn append_match_line (
   let fg_green: string = FG_GREEN();
   let match_hi: string = MATCH_HI();
   let reset: string = RESET();
-  out.clear();
 
   // Prefix.
   if !cfg.heading {
@@ -312,46 +383,119 @@ fn append_match_line (
     let _ = out.push_u8(58); // ':'
   }
 
-  // Highlight all matches.
-  let line: string = std::runtime::mem::string_from_ptr_len(line_ptr, line_len as int);
-  var off: i64 = 0;
-  while true {
-    let m_opt: Match? = next_match(p, line, off);
-    if m_opt == None {
-      break;
-    }
-    let m: Match = m_opt ?? Match{ start: 0, end: 0 };
-    if m.start < off {
-      break;
+  // Highlight all matches when color is enabled.
+  //
+  // Note: when color is disabled, skip the per-match scan and write the raw
+  // line bytes directly (this is a big win for patterns that match frequently,
+  // like `.`).
+  if !out.color {
+    let _ = out.push_ptr_len(line_ptr, line_len);
+  } else {
+    // Special-case the common benchmark pattern `.`:
+    // it matches every byte in the line, so highlighting is just "highlight the whole line".
+    // This avoids calling into the regex engine once per byte.
+    if p.kind == PatternKind::Regex && p.needle == "." {
+      let _ = out.push_str(match_hi);
+      let _ = out.push_ptr_len(line_ptr, line_len);
+      let _ = out.push_str(reset);
+      let _ = out.push_u8(10);
+      return flush_out_if_needed(mut out, io);
     }
 
-    let seg_len: i64 = m.start - off;
-    if seg_len > 0 {
-      let _ = out.push_ptr_len(line_ptr + (off as u64), seg_len);
-    }
+    let line: string = std::runtime::mem::string_from_ptr_len(line_ptr, line_len as int);
+    // Use the already-computed first match and then scan forward for
+    // additional matches. This avoids an extra `next_match(p, line, 0)` call.
+    //
+    // Merge adjacent/overlapping match ranges so we emit fewer color toggles.
+    // This is particularly important for patterns that match very frequently.
+    var hi_start: i64 = first_match.start;
+    var hi_end: i64 = first_match.end;
 
-    if out.color { let _ = out.push_str(match_hi); }
-    let match_len: i64 = m.end - m.start;
-    if match_len > 0 {
-      let _ = out.push_ptr_len(line_ptr + (m.start as u64), match_len);
-    }
-    if out.color { let _ = out.push_str(reset); }
+    // Avoid emitting highlight/reset sequences for empty matches.
+    if hi_end <= hi_start {
+      let _ = out.push_ptr_len(line_ptr, line_len);
+    } else {
+      if hi_start < 0 { hi_start = 0; }
+      if hi_end > line_len { hi_end = line_len; }
+      if hi_start >= line_len || hi_end <= hi_start {
+        let _ = out.push_ptr_len(line_ptr, line_len);
+      } else {
+        var out_off: i64 = 0;
+        var search_off: i64 = hi_end;
 
-    off = m.end;
-    if m.end == m.start {
-      off = off + 1;
-    }
-    if off >= line_len {
-      break;
-    }
-  }
+        while true {
+          if search_off >= line_len {
+            break;
+          }
+          let m_opt: Match? = next_match(p, line, search_off);
+          if m_opt == None {
+            break;
+          }
+          let m: Match = m_opt ?? Match{ start: 0, end: 0 };
+          if m.start < search_off {
+            break;
+          }
 
-  if off < line_len {
-    let _ = out.push_ptr_len(line_ptr + (off as u64), line_len - off);
+          if m.end <= m.start {
+            // Empty match: advance by one byte to guarantee progress.
+            search_off = m.end + 1;
+            continue;
+          }
+
+          if m.start <= hi_end {
+            if m.end > hi_end {
+              hi_end = m.end;
+              if hi_end > line_len {
+                hi_end = line_len;
+              }
+            }
+          } else {
+            let before_len: i64 = hi_start - out_off;
+            if before_len > 0 {
+              let _ = out.push_ptr_len(line_ptr + (out_off as u64), before_len);
+            }
+
+            let _ = out.push_str(match_hi);
+            let match_len: i64 = hi_end - hi_start;
+            if match_len > 0 {
+              let _ = out.push_ptr_len(line_ptr + (hi_start as u64), match_len);
+            }
+            let _ = out.push_str(reset);
+
+            out_off = hi_end;
+            hi_start = m.start;
+            hi_end = m.end;
+            if hi_end > line_len {
+              hi_end = line_len;
+            }
+          }
+
+          search_off = hi_end;
+        }
+
+        // Emit the final merged highlight range and the tail.
+        let before_len: i64 = hi_start - out_off;
+        if before_len > 0 {
+          let _ = out.push_ptr_len(line_ptr + (out_off as u64), before_len);
+        }
+
+        let _ = out.push_str(match_hi);
+        let match_len: i64 = hi_end - hi_start;
+        if match_len > 0 {
+          let _ = out.push_ptr_len(line_ptr + (hi_start as u64), match_len);
+        }
+        let _ = out.push_str(reset);
+
+        out_off = hi_end;
+        if out_off < line_len {
+          let _ = out.push_ptr_len(line_ptr + (out_off as u64), line_len - out_off);
+        }
+      }
+    }
   }
 
   let _ = out.push_u8(10);
-  return flush_locked(mut out, io.out_lock);
+  return flush_out_if_needed(mut out, io);
 }
 
 fn print_stats (mut err: &Writer, io: &IO, cfg: &Config, stats: &Stats, elapsed_ns: i64) -> void {
@@ -376,7 +520,7 @@ fn print_stats (mut err: &Writer, io: &IO, cfg: &Config, stats: &Stats, elapsed_
   let _ = err.push_i64(ms);
   if err.color { let _ = err.push_str(reset); }
   let _ = err.push_u8(10);
-  let _ = flush_locked(mut err, io.err_lock);
+  let _ = flush_locked_or_cancel(mut err, io, io.err_lock);
 }
 
 fn pattern_compile_error (mut err: &Writer, io: &IO, mut stats: &Stats, e: PatternFailed) -> Pattern? {
@@ -392,7 +536,7 @@ fn pattern_compile_error (mut err: &Writer, io: &IO, mut stats: &Stats, e: Patte
   }
   if err.color { let _ = err.push_str(reset); }
   let _ = err.push_u8(10);
-  let _ = flush_locked(mut err, io.err_lock);
+  let _ = flush_locked_or_cancel(mut err, io, io.err_lock);
 
   return None;
 }
@@ -420,7 +564,8 @@ fn search_file (cfg: &Config, p: &Pattern, path: string, io: &IO, mut out: &Writ
   }
 
   // Map read-only.
-  let ptr: u64 = mmap(0, size, PROT_READ, MAP_PRIVATE, fd, 0);
+  let map_len: u64 = size as u64;
+  let ptr: u64 = mmap(0, map_len, PROT_READ, MAP_PRIVATE, fd, 0);
   if ptr == MAP_FAILED {
     stats.errors = stats.errors + 1;
     write_error(mut err, io, path, "failed to mmap");
@@ -429,9 +574,202 @@ fn search_file (cfg: &Config, p: &Pattern, path: string, io: &IO, mut out: &Writ
   }
 
   if !cfg.text && detect_binary(ptr, size) {
-    let _ = munmap(ptr, size);
+    let _ = munmap(ptr, map_len);
     let _ = std::runtime::posix::fs::close(fd);
     return outcome_none();
+  }
+
+  // Fast path: `-l`/`--files-with-matches` with a fixed, case-sensitive needle
+  // does not need line splitting or match location.
+  if cfg.files_with_matches && p.kind == PatternKind::Fixed && !p.ignore_case {
+    if io.cancel != None && cancel_is_set(io) {
+      let _ = munmap(ptr, map_len);
+      let _ = std::runtime::posix::fs::close(fd);
+      return Outcome{ found: true, stop: true };
+    }
+
+    let needle_ptr: u64 = std::runtime::mem::string_ptr(p.needle);
+    let needle_len: i64 = std::runtime::mem::string_len(p.needle);
+    // Preserve line-based semantics: the fixed-string needle must not include
+    // `\n`, otherwise a whole-file `memmem` could match across line boundaries.
+    let needle_has_nl: bool = needle_len > 0 && memchr(needle_ptr, 10, needle_len) != 0;
+    if needle_len > 0 && !needle_has_nl && memmem(ptr, size, needle_ptr, needle_len) != 0 {
+      stats.match_lines = stats.match_lines + 1;
+      stats.files_matched = stats.files_matched + 1;
+
+      let ok: bool = append_path_line(mut out, io, path);
+      if !ok {
+        stats.errors = stats.errors + 1;
+        let _ = munmap(ptr, map_len);
+        let _ = std::runtime::posix::fs::close(fd);
+        return Outcome{ found: true, stop: true };
+      }
+
+      let _ = munmap(ptr, map_len);
+      let _ = std::runtime::posix::fs::close(fd);
+      if cfg.quiet {
+        let ok_flush: bool = flush_out_if_nonempty(mut out, io);
+        if !ok_flush {
+          stats.errors = stats.errors + 1;
+          return Outcome{ found: true, stop: true };
+        }
+        return outcome_found(true);
+      }
+      return Outcome{ found: true, stop: false };
+    }
+
+    let _ = munmap(ptr, map_len);
+    let _ = std::runtime::posix::fs::close(fd);
+    return outcome_none();
+  }
+
+  // Fast path: fixed, case-sensitive needle without `\n` can use a whole-file
+  // `memmem` scan to skip line splitting in the (common) no-match case.
+  if p.kind == PatternKind::Fixed && !p.ignore_case {
+    let needle_ptr: u64 = std::runtime::mem::string_ptr(p.needle);
+    let needle_len: i64 = std::runtime::mem::string_len(p.needle);
+    let needle_has_nl: bool = needle_len > 0 && memchr(needle_ptr, 10, needle_len) != 0;
+
+    if needle_len > 0 && !needle_has_nl {
+      let first_ptr: u64 = memmem(ptr, size, needle_ptr, needle_len);
+      if first_ptr == 0 {
+        let _ = munmap(ptr, map_len);
+        let _ = std::runtime::posix::fs::close(fd);
+        return outcome_none();
+      }
+
+      var matched_in_file: bool = false;
+      var match_lines_in_file: i64 = 0;
+
+      var line_no: i64 = 1;
+      var counted_off: i64 = 0;
+      var search_off: i64 = 0;
+
+      var match_ptr: u64 = first_ptr;
+      while match_ptr != 0 {
+        if io.cancel != None && cancel_is_set(io) {
+          let ok_flush: bool = flush_out_if_nonempty(mut out, io);
+          if !ok_flush {
+            stats.errors = stats.errors + 1;
+          }
+          let _ = munmap(ptr, map_len);
+          let _ = std::runtime::posix::fs::close(fd);
+          return Outcome{ found: true, stop: true };
+        }
+
+        let match_off: i64 = (match_ptr - ptr) as i64;
+
+        // Find the start of the containing line by scanning backward for '\n'.
+        var line_start: i64 = match_off;
+        while line_start > 0 {
+          if std::runtime::mem::load_u8(ptr, line_start - 1) == 10 {
+            break;
+          }
+          line_start = line_start - 1;
+        }
+
+        // Find the end of the containing line by scanning forward for '\n'.
+        let tail_ptr: u64 = ptr + (match_off as u64);
+        let tail_len: i64 = size - match_off;
+        let nl_ptr: u64 = if tail_len > 0 { memchr(tail_ptr, 10, tail_len) } else { 0 };
+
+        var line_end: i64 = size;
+        var next_line_off: i64 = size;
+        if nl_ptr != 0 {
+          line_end = (nl_ptr - ptr) as i64;
+          next_line_off = line_end + 1;
+        }
+
+        if line_end < line_start {
+          break;
+        }
+
+        // Advance line counter up to `line_start`.
+        while counted_off < line_start {
+          let seg_ptr: u64 = ptr + (counted_off as u64);
+          let seg_len: i64 = line_start - counted_off;
+          let seg_nl: u64 = if seg_len > 0 { memchr(seg_ptr, 10, seg_len) } else { 0 };
+          if seg_nl == 0 {
+            counted_off = line_start;
+            break;
+          }
+          counted_off = ((seg_nl - ptr) as i64) + 1;
+          line_no = line_no + 1;
+        }
+
+        let line_ptr: u64 = ptr + (line_start as u64);
+        let line_len: i64 = line_end - line_start;
+        let first: Match = Match{ start: match_off - line_start, end: (match_off - line_start) + needle_len };
+
+        matched_in_file = true;
+        stats.match_lines = stats.match_lines + 1;
+        match_lines_in_file = match_lines_in_file + 1;
+
+        if cfg.heading && match_lines_in_file == 1 {
+          let ok: bool = print_heading(mut out, io, path);
+          if !ok {
+            stats.errors = stats.errors + 1;
+            let _ = munmap(ptr, map_len);
+            let _ = std::runtime::posix::fs::close(fd);
+            return Outcome{ found: true, stop: true };
+          }
+        }
+
+        let ok: bool = append_match_line(mut out, io, cfg, p, path, line_no, line_ptr, line_len, first);
+        if !ok {
+          stats.errors = stats.errors + 1;
+          let _ = munmap(ptr, map_len);
+          let _ = std::runtime::posix::fs::close(fd);
+          return Outcome{ found: true, stop: true };
+        }
+
+        if cfg.max_count > 0 && (match_lines_in_file as int) >= cfg.max_count {
+          break;
+        }
+
+        if cfg.quiet {
+          let ok_flush: bool = flush_out_if_nonempty(mut out, io);
+          if !ok_flush {
+            stats.errors = stats.errors + 1;
+            let _ = munmap(ptr, map_len);
+            let _ = std::runtime::posix::fs::close(fd);
+            return Outcome{ found: true, stop: true };
+          }
+          let _ = munmap(ptr, map_len);
+          let _ = std::runtime::posix::fs::close(fd);
+          return outcome_found(true);
+        }
+
+        if next_line_off <= 0 || next_line_off >= size {
+          break;
+        }
+
+        // Skip to the next line so each matching line prints once.
+        search_off = next_line_off;
+        counted_off = next_line_off;
+        line_no = line_no + 1;
+
+        let next_ptr: u64 = ptr + (search_off as u64);
+        let next_len: i64 = size - search_off;
+        match_ptr = if next_len > 0 { memmem(next_ptr, next_len, needle_ptr, needle_len) } else { 0 };
+      }
+
+      if matched_in_file {
+        stats.files_matched = stats.files_matched + 1;
+      }
+
+      let ok_flush: bool = flush_out_if_nonempty(mut out, io);
+      if !ok_flush {
+        stats.errors = stats.errors + 1;
+        let _ = munmap(ptr, map_len);
+        let _ = std::runtime::posix::fs::close(fd);
+        return Outcome{ found: true, stop: true };
+      }
+
+      let _ = munmap(ptr, map_len);
+      let _ = std::runtime::posix::fs::close(fd);
+      return Outcome{ found: matched_in_file, stop: false };
+    }
   }
 
   var matched_in_file: bool = false;
@@ -440,10 +778,14 @@ fn search_file (cfg: &Config, p: &Pattern, path: string, io: &IO, mut out: &Writ
 
   var tick: i64 = 0;
   var off: i64 = 0;
-  while off <= size {
+  while off < size {
     if io.cancel != None && (tick & 127) == 0 {
       if cancel_is_set(io) {
-        let _ = munmap(ptr, size);
+        let ok_flush: bool = flush_out_if_nonempty(mut out, io);
+        if !ok_flush {
+          stats.errors = stats.errors + 1;
+        }
+        let _ = munmap(ptr, map_len);
         let _ = std::runtime::posix::fs::close(fd);
         return Outcome{ found: true, stop: true };
       }
@@ -477,30 +819,58 @@ fn search_file (cfg: &Config, p: &Pattern, path: string, io: &IO, mut out: &Writ
       match_lines_in_file = match_lines_in_file + 1;
 
       if cfg.files_with_matches {
-        out.clear();
-        let _ = out.push_str(path);
-        let _ = out.push_u8(10);
-        let _ = flush_locked(mut out, io.out_lock);
-        let _ = munmap(ptr, size);
+        let ok: bool = append_path_line(mut out, io, path);
+        if !ok {
+          stats.errors = stats.errors + 1;
+          let _ = munmap(ptr, map_len);
+          let _ = std::runtime::posix::fs::close(fd);
+          return Outcome{ found: true, stop: true };
+        }
+        stats.files_matched = stats.files_matched + 1;
+        let _ = munmap(ptr, map_len);
         let _ = std::runtime::posix::fs::close(fd);
         if cfg.quiet {
+          let ok_flush: bool = flush_out_if_nonempty(mut out, io);
+          if !ok_flush {
+            stats.errors = stats.errors + 1;
+            return Outcome{ found: true, stop: true };
+          }
           return outcome_found(true);
         }
-        break;
+        return Outcome{ found: true, stop: false };
       }
 
       if cfg.heading && match_lines_in_file == 1 {
-        print_heading(mut out, io, path);
+        let ok: bool = print_heading(mut out, io, path);
+        if !ok {
+          stats.errors = stats.errors + 1;
+          let _ = munmap(ptr, map_len);
+          let _ = std::runtime::posix::fs::close(fd);
+          return Outcome{ found: true, stop: true };
+        }
       }
 
-      let _ = append_match_line(mut out, io, cfg, p, path, line_no, line_ptr, line_len, first);
+      let ok: bool = append_match_line(mut out, io, cfg, p, path, line_no, line_ptr, line_len, first);
+      if !ok {
+        stats.errors = stats.errors + 1;
+        let _ = munmap(ptr, map_len);
+        let _ = std::runtime::posix::fs::close(fd);
+        return Outcome{ found: true, stop: true };
+      }
 
       if cfg.max_count > 0 && (match_lines_in_file as int) >= cfg.max_count {
         break;
       }
 
       if cfg.quiet {
-        let _ = munmap(ptr, size);
+        let ok_flush: bool = flush_out_if_nonempty(mut out, io);
+        if !ok_flush {
+          stats.errors = stats.errors + 1;
+          let _ = munmap(ptr, map_len);
+          let _ = std::runtime::posix::fs::close(fd);
+          return Outcome{ found: true, stop: true };
+        }
+        let _ = munmap(ptr, map_len);
         let _ = std::runtime::posix::fs::close(fd);
         return outcome_found(true);
       }
@@ -518,21 +888,26 @@ fn search_file (cfg: &Config, p: &Pattern, path: string, io: &IO, mut out: &Writ
     stats.files_matched = stats.files_matched + 1;
   }
 
-  let _ = munmap(ptr, size);
+  let ok_flush: bool = flush_out_if_nonempty(mut out, io);
+  if !ok_flush {
+    stats.errors = stats.errors + 1;
+    let _ = munmap(ptr, map_len);
+    let _ = std::runtime::posix::fs::close(fd);
+    return Outcome{ found: true, stop: true };
+  }
+
+  let _ = munmap(ptr, map_len);
   let _ = std::runtime::posix::fs::close(fd);
   return Outcome{ found: matched_in_file, stop: false };
 }
 
-fn list_file (path: string, io: &IO, mut out: &Writer) -> void {
-  out.clear();
-  let _ = out.push_str(path);
-  let _ = out.push_u8(10);
-  let _ = flush_locked(mut out, io.out_lock);
+fn list_file (path: string, io: &IO, mut out: &Writer) -> bool {
+  return append_path_line(mut out, io, path);
 }
 
-fn walk_dir_files (cfg: &Config, open_path: string, io: &IO, mut path: &PathBuf, depth: int, mut out: &Writer, mut err: &Writer, mut stats: &Stats) -> void {
+fn walk_dir_files (cfg: &Config, mut ignore: &IgnoreStack, open_path: string, io: &IO, mut path: &PathBuf, depth: int, mut out: &Writer, mut err: &Writer, mut stats: &Stats) -> Outcome {
   if cfg.max_depth >= 0 && depth > cfg.max_depth {
-    return;
+    return outcome_none();
   }
 
   let dir: u64 = opendir(open_path);
@@ -540,19 +915,33 @@ fn walk_dir_files (cfg: &Config, open_path: string, io: &IO, mut path: &PathBuf,
     let e: int = errno();
     if e == ENOTDIR {
       stats.files_total = stats.files_total + 1;
-      list_file(open_path, io, mut out);
-      return;
+      let ok: bool = list_file(open_path, io, mut out);
+      if !ok {
+        stats.errors = stats.errors + 1;
+        return Outcome{ found: true, stop: true };
+      }
+      return outcome_none();
     }
     stats.errors = stats.errors + 1;
     write_error(mut err, io, open_path, "failed to open directory");
-    return;
+    return outcome_none();
+  }
+
+  var ignore_checkpoint: i64 = 0;
+  if cfg.ignore_files {
+    ignore_checkpoint = ignore_mark(ignore);
+    ignore_push_dir(true, mut ignore, mut path);
   }
 
   var tick: i64 = 0;
   while true {
     if io.cancel != None && (tick & 255) == 0 {
       if cancel_is_set(io) {
-        break;
+        let _ = closedir(dir);
+        if cfg.ignore_files {
+          ignore_pop_to(mut ignore, ignore_checkpoint);
+        }
+        return Outcome{ found: true, stop: true };
       }
     }
     tick = tick + 1;
@@ -577,6 +966,9 @@ fn walk_dir_files (cfg: &Config, open_path: string, io: &IO, mut path: &PathBuf,
       continue;
     }
     if cfg.ignore_vcs && is_vcs_dir_name(name) {
+      continue;
+    }
+    if cfg.ignore_common && dtype == DT_DIR && is_common_dir_name(name) {
       continue;
     }
 
@@ -630,25 +1022,59 @@ fn walk_dir_files (cfg: &Config, open_path: string, io: &IO, mut path: &PathBuf,
       }
     }
 
+    if is_dir && cfg.ignore_common && is_common_dir_name(name) {
+      path_truncate(mut path, saved_len);
+      continue;
+    }
+
     if is_dir {
+      if cfg.ignore_files && ignore_is_ignored(ignore, child_path, name, true) {
+        path_truncate(mut path, saved_len);
+        continue;
+      }
       let next_depth: int = depth + 1;
       if cfg.max_depth >= 0 && next_depth > cfg.max_depth {
         // Don't recurse.
       } else {
-        walk_dir_files(cfg, child_path, io, mut path, next_depth, mut out, mut err, mut stats);
+        let o: Outcome = walk_dir_files(cfg, mut ignore, child_path, io, mut path, next_depth, mut out, mut err, mut stats);
+        if o.stop {
+          let _ = closedir(dir);
+          path_truncate(mut path, saved_len);
+          if cfg.ignore_files {
+            ignore_pop_to(mut ignore, ignore_checkpoint);
+          }
+          return Outcome{ found: true, stop: true };
+        }
       }
     } else if is_file {
+      if cfg.ignore_files && ignore_is_ignored(ignore, child_path, name, false) {
+        path_truncate(mut path, saved_len);
+        continue;
+      }
       stats.files_total = stats.files_total + 1;
-      list_file(child_path, io, mut out);
+      let ok: bool = list_file(child_path, io, mut out);
+      if !ok {
+        stats.errors = stats.errors + 1;
+        let _ = closedir(dir);
+        path_truncate(mut path, saved_len);
+        if cfg.ignore_files {
+          ignore_pop_to(mut ignore, ignore_checkpoint);
+        }
+        return Outcome{ found: true, stop: true };
+      }
     }
 
     path_truncate(mut path, saved_len);
   }
 
   let _ = closedir(dir);
+  if cfg.ignore_files {
+    ignore_pop_to(mut ignore, ignore_checkpoint);
+  }
+  return outcome_none();
 }
 
-fn walk_dir_search (cfg: &Config, p: &Pattern, open_path: string, io: &IO, mut path: &PathBuf, depth: int, mut out: &Writer, mut err: &Writer, mut stats: &Stats) -> Outcome {
+fn walk_dir_search (cfg: &Config, mut ignore: &IgnoreStack, p: &Pattern, open_path: string, io: &IO, mut path: &PathBuf, depth: int, mut out: &Writer, mut err: &Writer, mut stats: &Stats) -> Outcome {
   if cfg.max_depth >= 0 && depth > cfg.max_depth {
     return outcome_none();
   }
@@ -665,6 +1091,12 @@ fn walk_dir_search (cfg: &Config, p: &Pattern, open_path: string, io: &IO, mut p
     return outcome_none();
   }
 
+  var ignore_checkpoint: i64 = 0;
+  if cfg.ignore_files {
+    ignore_checkpoint = ignore_mark(ignore);
+    ignore_push_dir(true, mut ignore, mut path);
+  }
+
   var found_any: bool = false;
 
   var tick: i64 = 0;
@@ -672,6 +1104,9 @@ fn walk_dir_search (cfg: &Config, p: &Pattern, open_path: string, io: &IO, mut p
     if io.cancel != None && (tick & 255) == 0 {
       if cancel_is_set(io) {
         let _ = closedir(dir);
+        if cfg.ignore_files {
+          ignore_pop_to(mut ignore, ignore_checkpoint);
+        }
         return Outcome{ found: true, stop: true };
       }
     }
@@ -697,6 +1132,9 @@ fn walk_dir_search (cfg: &Config, p: &Pattern, open_path: string, io: &IO, mut p
       continue;
     }
     if cfg.ignore_vcs && is_vcs_dir_name(name) {
+      continue;
+    }
+    if cfg.ignore_common && dtype == DT_DIR && is_common_dir_name(name) {
       continue;
     }
 
@@ -750,22 +1188,38 @@ fn walk_dir_search (cfg: &Config, p: &Pattern, open_path: string, io: &IO, mut p
       }
     }
 
+    if is_dir && cfg.ignore_common && is_common_dir_name(name) {
+      path_truncate(mut path, saved_len);
+      continue;
+    }
+
     if is_dir {
+      if cfg.ignore_files && ignore_is_ignored(ignore, child_path, name, true) {
+        path_truncate(mut path, saved_len);
+        continue;
+      }
       let next_depth: int = depth + 1;
       if cfg.max_depth >= 0 && next_depth > cfg.max_depth {
         // Don't recurse.
       } else {
-        let o: Outcome = walk_dir_search(cfg, p, child_path, io, mut path, next_depth, mut out, mut err, mut stats);
+        let o: Outcome = walk_dir_search(cfg, mut ignore, p, child_path, io, mut path, next_depth, mut out, mut err, mut stats);
         if o.found {
           found_any = true;
         }
         if o.stop {
           let _ = closedir(dir);
           path_truncate(mut path, saved_len);
+          if cfg.ignore_files {
+            ignore_pop_to(mut ignore, ignore_checkpoint);
+          }
           return Outcome{ found: true, stop: true };
         }
       }
     } else if is_file {
+      if cfg.ignore_files && ignore_is_ignored(ignore, child_path, name, false) {
+        path_truncate(mut path, saved_len);
+        continue;
+      }
       stats.files_total = stats.files_total + 1;
       let o: Outcome = search_file(cfg, p, child_path, io, mut out, mut err, mut stats);
       if o.found {
@@ -774,6 +1228,9 @@ fn walk_dir_search (cfg: &Config, p: &Pattern, open_path: string, io: &IO, mut p
       if o.stop {
         let _ = closedir(dir);
         path_truncate(mut path, saved_len);
+        if cfg.ignore_files {
+          ignore_pop_to(mut ignore, ignore_checkpoint);
+        }
         return Outcome{ found: true, stop: true };
       }
     }
@@ -782,10 +1239,13 @@ fn walk_dir_search (cfg: &Config, p: &Pattern, open_path: string, io: &IO, mut p
   }
 
   let _ = closedir(dir);
+  if cfg.ignore_files {
+    ignore_pop_to(mut ignore, ignore_checkpoint);
+  }
   return Outcome{ found: found_any, stop: false };
 }
 
-fn handle_root_files (cfg: &Config, root: string, io: &IO, mut out: &Writer, mut err: &Writer, mut stats: &Stats) -> void {
+fn handle_root_files (cfg: &Config, root: string, io: &IO, mut out: &Writer, mut err: &Writer, mut stats: &Stats) -> Outcome {
   var open_root: string = root;
   if open_root == "" {
     open_root = ".";
@@ -795,32 +1255,36 @@ fn handle_root_files (cfg: &Config, root: string, io: &IO, mut out: &Writer, mut
     let e: int = errno();
     if e == ENOTDIR {
       stats.files_total = stats.files_total + 1;
-      list_file(open_root, io, mut out);
-      return;
+      let ok: bool = list_file(open_root, io, mut out);
+      if !ok {
+        stats.errors = stats.errors + 1;
+        return Outcome{ found: true, stop: true };
+      }
+      return outcome_none();
     }
     stats.errors = stats.errors + 1;
     write_error(mut err, io, open_root, "failed to open directory");
-    return;
+    return outcome_none();
   }
   let _ = closedir(dir);
 
-  var base: string = open_root;
-  if root == "." {
-    base = "";
-  }
+  let base: string = if root == "." { "" } else { open_root };
   let pb_r: PathBufResult = std::path::PathBuf.from_string(base);
   if pb_r.is_err() {
     stats.errors = stats.errors + 1;
     write_error(mut err, io, open_root, "out of memory");
-    return;
+    return outcome_none();
   }
   let mut path: PathBuf = match (pb_r) {
     PathBufResult::Ok(v) => v,
     PathBufResult::Err(_) => PathBuf{ ptr: 0, cap: 0, len: 0 },
   };
 
-  walk_dir_files(cfg, open_root, io, mut path, 0, mut out, mut err, mut stats);
+  let mut ignore: IgnoreStack = ignore_init();
+  let o: Outcome = walk_dir_files(cfg, mut ignore, open_root, io, mut path, 0, mut out, mut err, mut stats);
+  ignore_drop_stack(mut ignore);
   path.drop();
+  return o;
 }
 
 fn handle_root_search (cfg: &Config, p: &Pattern, root: string, io: &IO, mut out: &Writer, mut err: &Writer, mut stats: &Stats) -> Outcome {
@@ -841,10 +1305,7 @@ fn handle_root_search (cfg: &Config, p: &Pattern, root: string, io: &IO, mut out
   }
   let _ = closedir(dir);
 
-  var base: string = open_root;
-  if root == "." {
-    base = "";
-  }
+  let base: string = if root == "." { "" } else { open_root };
   let pb_r: PathBufResult = std::path::PathBuf.from_string(base);
   if pb_r.is_err() {
     stats.errors = stats.errors + 1;
@@ -856,7 +1317,9 @@ fn handle_root_search (cfg: &Config, p: &Pattern, root: string, io: &IO, mut out
     PathBufResult::Err(_) => PathBuf{ ptr: 0, cap: 0, len: 0 },
   };
 
-  let o: Outcome = walk_dir_search(cfg, p, open_root, io, mut path, 0, mut out, mut err, mut stats);
+  let mut ignore: IgnoreStack = ignore_init();
+  let o: Outcome = walk_dir_search(cfg, mut ignore, p, open_root, io, mut path, 0, mut out, mut err, mut stats);
+  ignore_drop_stack(mut ignore);
   path.drop();
   return o;
 }
@@ -891,7 +1354,10 @@ task fn worker_search_subtree (cfg: Config, pat_s: string, start_depth: int, mut
     stats.errors = stats.errors + 1;
     return WorkerResult{ stats: stats, found_any: false, stop: true };
   }
-  let mut out: Writer = match (out_opt) { Some(v) => v, None => Writer{ fd: -1, color: false, buf: BufferU8.empty() } };
+  let mut out: Writer = match (out_opt) {
+    Some(v) => move v,
+    None => Writer{ fd: -1, color: false, buf: BufferU8.empty() },
+  };
 
   let err_opt: Writer? = Writer.stderr(stderr_color, 8192);
   if err_opt == None {
@@ -899,7 +1365,10 @@ task fn worker_search_subtree (cfg: Config, pat_s: string, start_depth: int, mut
     out.drop();
     return WorkerResult{ stats: stats, found_any: false, stop: true };
   }
-  let mut err: Writer = match (err_opt) { Some(v) => v, None => Writer{ fd: -1, color: false, buf: BufferU8.empty() } };
+  let mut err: Writer = match (err_opt) {
+    Some(v) => move v,
+    None => Writer{ fd: -1, color: false, buf: BufferU8.empty() },
+  };
 
   let pr: PatternResult = compile_pattern(pat_s, cfg.fixed_string, cfg.ignore_case);
   let pat_opt: Pattern? = match pr {
@@ -916,6 +1385,30 @@ task fn worker_search_subtree (cfg: Config, pat_s: string, start_depth: int, mut
     Some(v) => move v,
     None => Pattern{ kind: PatternKind::Fixed, needle: "", ignore_case: false, regex: std::regex::RegExp.empty() },
   };
+
+  // Reconstruct ignore rules from the parent of this subtree root so worker
+  // tasks still respect root-level ignore files when the orchestrator splits
+  // work at depth=1.
+  let mut ignore: IgnoreStack = ignore_init();
+
+  if cfg.ignore_files {
+    let parent_len: i64 = path_parent_len(&path);
+    let parent_s: string =
+      if parent_len <= 0 || path.ptr == 0 {
+        ""
+      } else {
+        std::runtime::mem::string_from_ptr_len(path.ptr, parent_len as int)
+      };
+    let pb_r: PathBufResult = std::path::PathBuf.from_string(parent_s);
+    if !pb_r.is_err() {
+      let mut parent_path: PathBuf = match (pb_r) {
+        PathBufResult::Ok(v) => v,
+        PathBufResult::Err(_) => PathBuf{ ptr: 0, cap: 0, len: 0 },
+      };
+      ignore_push_dir(true, mut ignore, mut parent_path);
+      parent_path.drop();
+    }
+  }
 
   let open_path: string = path.as_string();
   let dir: u64 = opendir(open_path);
@@ -936,15 +1429,23 @@ task fn worker_search_subtree (cfg: Config, pat_s: string, start_depth: int, mut
     }
   } else {
     let _ = closedir(dir);
-    let o: Outcome = walk_dir_search(cfg, &pat, open_path, &io, mut path, start_depth, mut out, mut err, mut stats);
+    let o: Outcome = walk_dir_search(cfg, mut ignore, &pat, open_path, &io, mut path, start_depth, mut out, mut err, mut stats);
     if o.found { found_any = true; }
     if o.stop { found_any = true; stop = true; }
+  }
+
+  let ok_flush: bool = flush_out_if_nonempty(mut out, &io);
+  if !ok_flush {
+    stats.errors = stats.errors + 1;
+    found_any = true;
+    stop = true;
   }
 
   if stop {
     cancel_set(&io);
   }
 
+  ignore_drop_stack(mut ignore);
   pat.drop();
   out.drop();
   err.drop();
@@ -963,10 +1464,11 @@ task fn worker_list_subtree (cfg: Config, start_depth: int, mut path: PathBuf, i
   let out_opt: Writer? = Writer.stdout(stdout_color, 16384);
   if out_opt == None {
     stats.errors = stats.errors + 1;
-    return WorkerResult{ stats: stats, found_any: false, stop: false };
+    cancel_set(&io);
+    return WorkerResult{ stats: stats, found_any: false, stop: true };
   }
   let mut out: Writer = match (out_opt) {
-    Some(v) => v,
+    Some(v) => move v,
     None => Writer{ fd: -1, color: false, buf: BufferU8.empty() },
   };
 
@@ -974,30 +1476,72 @@ task fn worker_list_subtree (cfg: Config, start_depth: int, mut path: PathBuf, i
   if err_opt == None {
     stats.errors = stats.errors + 1;
     out.drop();
-    return WorkerResult{ stats: stats, found_any: false, stop: false };
+    cancel_set(&io);
+    return WorkerResult{ stats: stats, found_any: false, stop: true };
   }
   let mut err: Writer = match (err_opt) {
-    Some(v) => v,
+    Some(v) => move v,
     None => Writer{ fd: -1, color: false, buf: BufferU8.empty() },
   };
 
-  let open_path: string = path.as_string();
-  walk_dir_files(cfg, open_path, &io, mut path, start_depth, mut out, mut err, mut stats);
+  let mut ignore: IgnoreStack = ignore_init();
 
+  if cfg.ignore_files {
+    let parent_len: i64 = path_parent_len(&path);
+    let parent_s: string =
+      if parent_len <= 0 || path.ptr == 0 {
+        ""
+      } else {
+        std::runtime::mem::string_from_ptr_len(path.ptr, parent_len as int)
+      };
+    let pb_r: PathBufResult = std::path::PathBuf.from_string(parent_s);
+    if !pb_r.is_err() {
+      let mut parent_path: PathBuf = match (pb_r) {
+        PathBufResult::Ok(v) => v,
+        PathBufResult::Err(_) => PathBuf{ ptr: 0, cap: 0, len: 0 },
+      };
+      ignore_push_dir(true, mut ignore, mut parent_path);
+      parent_path.drop();
+    }
+  }
+
+  let open_path: string = path.as_string();
+  let o: Outcome = walk_dir_files(cfg, mut ignore, open_path, &io, mut path, start_depth, mut out, mut err, mut stats);
+  var stop: bool = false;
+  if o.stop {
+    stop = true;
+    cancel_set(&io);
+  }
+
+  let ok_flush: bool = flush_out_if_nonempty(mut out, &io);
+  if !ok_flush {
+    stats.errors = stats.errors + 1;
+    stop = true;
+    cancel_set(&io);
+  }
+
+  ignore_drop_stack(mut ignore);
   out.drop();
   err.drop();
   path.drop();
 
-  return WorkerResult{ stats: stats, found_any: false, stop: false };
+  return WorkerResult{ stats: stats, found_any: false, stop: stop };
 }
 
 fn resolve_jobs (cfg: &Config) -> int {
+  let max_jobs: int = MAX_WORKER_SLOTS + 1;
   if cfg.jobs > 0 {
+    if cfg.jobs > max_jobs {
+      return max_jobs;
+    }
     return cfg.jobs;
   }
   // Auto mode.
   let n: int = std::task::available_parallelism();
   if n <= 0 { return 1; }
+  if n > max_jobs {
+    return max_jobs;
+  }
   return n;
 }
 
@@ -1009,7 +1553,10 @@ fn clamp_workers (cfg: &Config, jobs: int) -> int {
   //   global work-stealing pool yet).
   // - `cfg.max_workers == 0` means “no cap” (within current implementation
   //   limits).
-  let max_worker_slots: int = 32;
+  //
+  // Note: the fixed slot cap is intentional. A larger unrolled slot count
+  // triggered a Silk backend crash (segfault) in this workspace snapshot.
+  let max_worker_slots: int = MAX_WORKER_SLOTS;
   var max_workers: int = cfg.max_workers;
   if max_workers <= 0 {
     max_workers = max_worker_slots;
@@ -1022,6 +1569,19 @@ fn clamp_workers (cfg: &Config, jobs: int) -> int {
   if w <= 0 { return 0; }
   if w > max_workers { return max_workers; }
   return w;
+}
+
+fn disarm_parallel_sync_drops (mut out_mutex: &std::sync::Mutex, mut cancel_tok: &std::sync::CancellationToken) -> void {
+  // Workaround (Silk (ABI) 0.2.0):
+  //
+  // In this snapshot, dropping `std::sync` handle types at the end of an
+  // `async fn` that uses `yield` can crash (SIGSEGV / double-free) due to
+  // coroutine lowering copying handle values.
+  //
+  // We intentionally leak these handles by clearing their `handle` fields so
+  // the stdlib `Drop` impl becomes a no-op.
+  out_mutex.handle = 0;
+  cancel_tok.handle = 0;
 }
 
 /**
@@ -1049,27 +1609,27 @@ export async fn run_parallel (cfg: Config) -> int {
 
   // Shared output lock for stdout/stderr.
   let m_r: std::sync::MutexResult = std::sync::Mutex.init();
-  let mut out_mutex: std::sync::Mutex = match (m_r) {
-    Ok(v) => v,
-    Err(_) => std::sync::Mutex.invalid(),
-  };
-  if !out_mutex.is_valid() {
+  if m_r.is_err() {
     return run(cfg);
   }
+  let mut out_mutex: std::sync::Mutex = match (m_r) {
+    Ok(v) => move v,
+    Err(_) => std::sync::Mutex.invalid(),
+  };
   let lock: std::sync::MutexBorrow = out_mutex.borrow();
 
-  // Quiet-mode cancellation (search mode only).
-  let mut cancel_tok: std::sync::CancellationToken = std::sync::CancellationToken.invalid();
+  // Shared cancellation token for early-stop coordination:
+  // - `--quiet` (search mode) cancels after the first match.
+  // - Output write/flush failures cancel other tasks to avoid wasted work.
+  let t_r: std::sync::CancellationTokenResult = std::sync::CancellationToken.init();
+  let cancel_ok: bool = !t_r.is_err();
+  let mut cancel_tok: std::sync::CancellationToken = match (t_r) {
+    Ok(v) => move v,
+    Err(_) => std::sync::CancellationToken.invalid(),
+  };
   var cancel_borrow: std::sync::CancellationTokenBorrow? = None;
-  if cfg.quiet && mode != Mode::Files {
-    let t_r: std::sync::CancellationTokenResult = std::sync::CancellationToken.init();
-    cancel_tok = match (t_r) {
-      Ok(v) => v,
-      Err(_) => std::sync::CancellationToken.invalid(),
-    };
-    if cancel_tok.is_valid() {
-      cancel_borrow = Some(cancel_tok.borrow());
-    }
+  if cancel_ok {
+    cancel_borrow = Some(cancel_tok.borrow());
   }
 
   let io: IO = IO{ out_lock: Some(lock), err_lock: Some(lock), cancel: cancel_borrow };
@@ -1080,20 +1640,24 @@ export async fn run_parallel (cfg: Config) -> int {
 
   let out_opt: Writer? = Writer.stdout(stdout_color, 16384);
   if out_opt == None {
-    out_mutex.drop();
-    cancel_tok.drop();
+    disarm_parallel_sync_drops(mut out_mutex, mut cancel_tok);
     return 2;
   }
-  let mut out: Writer = match (out_opt) { Some(v) => v, None => Writer{ fd: -1, color: false, buf: BufferU8.empty() } };
+  let mut out: Writer = match (out_opt) {
+    Some(v) => move v,
+    None => Writer{ fd: -1, color: false, buf: BufferU8.empty() },
+  };
 
   let err_opt: Writer? = Writer.stderr(stderr_color, 8192);
   if err_opt == None {
     out.drop();
-    out_mutex.drop();
-    cancel_tok.drop();
+    disarm_parallel_sync_drops(mut out_mutex, mut cancel_tok);
     return 2;
   }
-  let mut err: Writer = match (err_opt) { Some(v) => v, None => Writer{ fd: -1, color: false, buf: BufferU8.empty() } };
+  let mut err: Writer = match (err_opt) {
+    Some(v) => move v,
+    None => Writer{ fd: -1, color: false, buf: BufferU8.empty() },
+  };
 
   // Stats + task handles.
   let start_ns_opt: i64? = std::runtime::posix::time::monotonic_now_ns();
@@ -1114,8 +1678,7 @@ export async fn run_parallel (cfg: Config) -> int {
     if pat_opt == None {
       out.drop();
       err.drop();
-      out_mutex.drop();
-      cancel_tok.drop();
+      disarm_parallel_sync_drops(mut out_mutex, mut cancel_tok);
       return 2;
     }
   }
@@ -1133,30 +1696,6 @@ export async fn run_parallel (cfg: Config) -> int {
   var t5: Task(WorkerResult)? = None;
   var t6: Task(WorkerResult)? = None;
   var t7: Task(WorkerResult)? = None;
-  var t8: Task(WorkerResult)? = None;
-  var t9: Task(WorkerResult)? = None;
-  var t10: Task(WorkerResult)? = None;
-  var t11: Task(WorkerResult)? = None;
-  var t12: Task(WorkerResult)? = None;
-  var t13: Task(WorkerResult)? = None;
-  var t14: Task(WorkerResult)? = None;
-  var t15: Task(WorkerResult)? = None;
-  var t16: Task(WorkerResult)? = None;
-  var t17: Task(WorkerResult)? = None;
-  var t18: Task(WorkerResult)? = None;
-  var t19: Task(WorkerResult)? = None;
-  var t20: Task(WorkerResult)? = None;
-  var t21: Task(WorkerResult)? = None;
-  var t22: Task(WorkerResult)? = None;
-  var t23: Task(WorkerResult)? = None;
-  var t24: Task(WorkerResult)? = None;
-  var t25: Task(WorkerResult)? = None;
-  var t26: Task(WorkerResult)? = None;
-  var t27: Task(WorkerResult)? = None;
-  var t28: Task(WorkerResult)? = None;
-  var t29: Task(WorkerResult)? = None;
-  var t30: Task(WorkerResult)? = None;
-  var t31: Task(WorkerResult)? = None;
 
   // Walk roots, spawning workers for top-level subdirectories.
   let n: int = cfg.path_count();
@@ -1187,7 +1726,13 @@ export async fn run_parallel (cfg: Config) -> int {
         // Root is a file.
         stats.files_total = stats.files_total + 1;
         if mode == Mode::Files {
-          list_file(open_root, &io, mut out);
+          let ok: bool = list_file(open_root, &io, mut out);
+          if !ok {
+            stats.errors = stats.errors + 1;
+            found_any = true;
+            cancel_set(&io);
+            break;
+          }
         } else {
           let o: Outcome = search_file(cfg, &pat, open_root, &io, mut out, mut err, mut stats);
           if o.found { found_any = true; }
@@ -1204,8 +1749,7 @@ export async fn run_parallel (cfg: Config) -> int {
     }
 
     // Root is a directory: iterate its entries and split at depth=1.
-    var base: string = open_root;
-    if root == "." { base = ""; }
+    let base: string = if root == "." { "" } else { open_root };
     let pb_r: PathBufResult = std::path::PathBuf.from_string(base);
     if pb_r.is_err() {
       stats.errors = stats.errors + 1;
@@ -1214,7 +1758,13 @@ export async fn run_parallel (cfg: Config) -> int {
       root_i = root_i + 1;
       continue;
     }
-    let mut path: PathBuf = match (pb_r) { PathBufResult::Ok(v) => v, PathBufResult::Err(_) => PathBuf{ ptr: 0, cap: 0, len: 0 } };
+    let mut path: PathBuf = match (pb_r) {
+      PathBufResult::Ok(v) => v,
+      PathBufResult::Err(_) => PathBuf{ ptr: 0, cap: 0, len: 0 },
+    };
+
+    let mut ignore: IgnoreStack = ignore_init();
+    ignore_push_dir(cfg.ignore_files, mut ignore, mut path);
 
     while true {
       if cancel_is_set(&io) {
@@ -1238,6 +1788,7 @@ export async fn run_parallel (cfg: Config) -> int {
       if is_dot_or_dotdot(name) { continue; }
       if !cfg.hidden && is_hidden_name(name) { continue; }
       if cfg.ignore_vcs && is_vcs_dir_name(name) { continue; }
+      if cfg.ignore_common && dtype == DT_DIR && is_common_dir_name(name) { continue; }
 
       let saved_len: i64 = path.len;
       let perr = path.push(name);
@@ -1289,20 +1840,23 @@ export async fn run_parallel (cfg: Config) -> int {
         }
       }
 
+      if is_dir && cfg.ignore_common && is_common_dir_name(name) {
+        path_truncate(mut path, saved_len);
+        continue;
+      }
+
       if is_dir {
+        if cfg.ignore_files && ignore_is_ignored(&ignore, child_path, name, true) {
+          path_truncate(mut path, saved_len);
+          continue;
+        }
         let next_depth: int = 1;
         if cfg.max_depth >= 0 && next_depth > cfg.max_depth {
           // Don't recurse.
         } else {
           let has_slot: bool =
             t0 == None || t1 == None || t2 == None || t3 == None ||
-            t4 == None || t5 == None || t6 == None || t7 == None ||
-            t8 == None || t9 == None || t10 == None || t11 == None ||
-            t12 == None || t13 == None || t14 == None || t15 == None ||
-            t16 == None || t17 == None || t18 == None || t19 == None ||
-            t20 == None || t21 == None || t22 == None || t23 == None ||
-            t24 == None || t25 == None || t26 == None || t27 == None ||
-            t28 == None || t29 == None || t30 == None || t31 == None;
+            t4 == None || t5 == None || t6 == None || t7 == None;
           if budget > 0 && has_slot {
             let child_r: PathBufResult = std::path::PathBuf.from_string(child_path);
             if child_r.is_err() {
@@ -1327,39 +1881,21 @@ export async fn run_parallel (cfg: Config) -> int {
               else if t5 == None { t5 = Some(move task_h); stored = true; }
               else if t6 == None { t6 = Some(move task_h); stored = true; }
               else if t7 == None { t7 = Some(move task_h); stored = true; }
-              else if t8 == None { t8 = Some(move task_h); stored = true; }
-              else if t9 == None { t9 = Some(move task_h); stored = true; }
-              else if t10 == None { t10 = Some(move task_h); stored = true; }
-              else if t11 == None { t11 = Some(move task_h); stored = true; }
-              else if t12 == None { t12 = Some(move task_h); stored = true; }
-              else if t13 == None { t13 = Some(move task_h); stored = true; }
-              else if t14 == None { t14 = Some(move task_h); stored = true; }
-              else if t15 == None { t15 = Some(move task_h); stored = true; }
-              else if t16 == None { t16 = Some(move task_h); stored = true; }
-              else if t17 == None { t17 = Some(move task_h); stored = true; }
-              else if t18 == None { t18 = Some(move task_h); stored = true; }
-              else if t19 == None { t19 = Some(move task_h); stored = true; }
-              else if t20 == None { t20 = Some(move task_h); stored = true; }
-              else if t21 == None { t21 = Some(move task_h); stored = true; }
-              else if t22 == None { t22 = Some(move task_h); stored = true; }
-              else if t23 == None { t23 = Some(move task_h); stored = true; }
-              else if t24 == None { t24 = Some(move task_h); stored = true; }
-              else if t25 == None { t25 = Some(move task_h); stored = true; }
-              else if t26 == None { t26 = Some(move task_h); stored = true; }
-              else if t27 == None { t27 = Some(move task_h); stored = true; }
-              else if t28 == None { t28 = Some(move task_h); stored = true; }
-              else if t29 == None { t29 = Some(move task_h); stored = true; }
-              else if t30 == None { t30 = Some(move task_h); stored = true; }
-              else if t31 == None { t31 = Some(move task_h); stored = true; }
 
               if stored {
                 budget = budget - 1;
               } else {
                 // No slot available; fall back to synchronous recursion.
                 if mode == Mode::Files {
-                  walk_dir_files(cfg, child_path, &io, mut path, next_depth, mut out, mut err, mut stats);
+                  let o: Outcome = walk_dir_files(cfg, mut ignore, child_path, &io, mut path, next_depth, mut out, mut err, mut stats);
+                  if o.stop {
+                    found_any = true;
+                    cancel_set(&io);
+                    path_truncate(mut path, saved_len);
+                    break;
+                  }
                 } else {
-                  let o: Outcome = walk_dir_search(cfg, &pat, child_path, &io, mut path, next_depth, mut out, mut err, mut stats);
+                  let o: Outcome = walk_dir_search(cfg, mut ignore, &pat, child_path, &io, mut path, next_depth, mut out, mut err, mut stats);
                   if o.found { found_any = true; }
                   if o.stop { found_any = true; cancel_set(&io); path_truncate(mut path, saved_len); break; }
                 }
@@ -1367,18 +1903,35 @@ export async fn run_parallel (cfg: Config) -> int {
             }
           } else {
             if mode == Mode::Files {
-              walk_dir_files(cfg, child_path, &io, mut path, next_depth, mut out, mut err, mut stats);
+              let o: Outcome = walk_dir_files(cfg, mut ignore, child_path, &io, mut path, next_depth, mut out, mut err, mut stats);
+              if o.stop {
+                found_any = true;
+                cancel_set(&io);
+                path_truncate(mut path, saved_len);
+                break;
+              }
             } else {
-              let o: Outcome = walk_dir_search(cfg, &pat, child_path, &io, mut path, next_depth, mut out, mut err, mut stats);
+              let o: Outcome = walk_dir_search(cfg, mut ignore, &pat, child_path, &io, mut path, next_depth, mut out, mut err, mut stats);
               if o.found { found_any = true; }
               if o.stop { found_any = true; cancel_set(&io); path_truncate(mut path, saved_len); break; }
             }
           }
         }
       } else if is_file {
+        if cfg.ignore_files && ignore_is_ignored(&ignore, child_path, name, false) {
+          path_truncate(mut path, saved_len);
+          continue;
+        }
         stats.files_total = stats.files_total + 1;
         if mode == Mode::Files {
-          list_file(child_path, &io, mut out);
+          let ok: bool = list_file(child_path, &io, mut out);
+          if !ok {
+            stats.errors = stats.errors + 1;
+            found_any = true;
+            cancel_set(&io);
+            path_truncate(mut path, saved_len);
+            break;
+          }
         } else {
           let o: Outcome = search_file(cfg, &pat, child_path, &io, mut out, mut err, mut stats);
           if o.found { found_any = true; }
@@ -1389,6 +1942,7 @@ export async fn run_parallel (cfg: Config) -> int {
       path_truncate(mut path, saved_len);
     }
 
+    ignore_drop_stack(mut ignore);
     let _ = closedir(dir);
     path.drop();
 
@@ -1466,198 +2020,6 @@ export async fn run_parallel (cfg: Config) -> int {
       if r.stop { found_any = true; }
       t7 = None;
     }
-    if t8 != None {
-      let h: Task(WorkerResult) = match (t8) { Some(v) => move v, None => worker_noop() };
-      let r: WorkerResult = yield h;
-      stats_add(mut stats, &r.stats);
-      if r.found_any { found_any = true; }
-      if r.stop { found_any = true; }
-      t8 = None;
-    }
-    if t9 != None {
-      let h: Task(WorkerResult) = match (t9) { Some(v) => move v, None => worker_noop() };
-      let r: WorkerResult = yield h;
-      stats_add(mut stats, &r.stats);
-      if r.found_any { found_any = true; }
-      if r.stop { found_any = true; }
-      t9 = None;
-    }
-    if t10 != None {
-      let h: Task(WorkerResult) = match (t10) { Some(v) => move v, None => worker_noop() };
-      let r: WorkerResult = yield h;
-      stats_add(mut stats, &r.stats);
-      if r.found_any { found_any = true; }
-      if r.stop { found_any = true; }
-      t10 = None;
-    }
-    if t11 != None {
-      let h: Task(WorkerResult) = match (t11) { Some(v) => move v, None => worker_noop() };
-      let r: WorkerResult = yield h;
-      stats_add(mut stats, &r.stats);
-      if r.found_any { found_any = true; }
-      if r.stop { found_any = true; }
-      t11 = None;
-    }
-    if t12 != None {
-      let h: Task(WorkerResult) = match (t12) { Some(v) => move v, None => worker_noop() };
-      let r: WorkerResult = yield h;
-      stats_add(mut stats, &r.stats);
-      if r.found_any { found_any = true; }
-      if r.stop { found_any = true; }
-      t12 = None;
-    }
-    if t13 != None {
-      let h: Task(WorkerResult) = match (t13) { Some(v) => move v, None => worker_noop() };
-      let r: WorkerResult = yield h;
-      stats_add(mut stats, &r.stats);
-      if r.found_any { found_any = true; }
-      if r.stop { found_any = true; }
-      t13 = None;
-    }
-    if t14 != None {
-      let h: Task(WorkerResult) = match (t14) { Some(v) => move v, None => worker_noop() };
-      let r: WorkerResult = yield h;
-      stats_add(mut stats, &r.stats);
-      if r.found_any { found_any = true; }
-      if r.stop { found_any = true; }
-      t14 = None;
-    }
-    if t15 != None {
-      let h: Task(WorkerResult) = match (t15) { Some(v) => move v, None => worker_noop() };
-      let r: WorkerResult = yield h;
-      stats_add(mut stats, &r.stats);
-      if r.found_any { found_any = true; }
-      if r.stop { found_any = true; }
-      t15 = None;
-    }
-    if t16 != None {
-      let h: Task(WorkerResult) = match (t16) { Some(v) => move v, None => worker_noop() };
-      let r: WorkerResult = yield h;
-      stats_add(mut stats, &r.stats);
-      if r.found_any { found_any = true; }
-      if r.stop { found_any = true; }
-      t16 = None;
-    }
-    if t17 != None {
-      let h: Task(WorkerResult) = match (t17) { Some(v) => move v, None => worker_noop() };
-      let r: WorkerResult = yield h;
-      stats_add(mut stats, &r.stats);
-      if r.found_any { found_any = true; }
-      if r.stop { found_any = true; }
-      t17 = None;
-    }
-    if t18 != None {
-      let h: Task(WorkerResult) = match (t18) { Some(v) => move v, None => worker_noop() };
-      let r: WorkerResult = yield h;
-      stats_add(mut stats, &r.stats);
-      if r.found_any { found_any = true; }
-      if r.stop { found_any = true; }
-      t18 = None;
-    }
-    if t19 != None {
-      let h: Task(WorkerResult) = match (t19) { Some(v) => move v, None => worker_noop() };
-      let r: WorkerResult = yield h;
-      stats_add(mut stats, &r.stats);
-      if r.found_any { found_any = true; }
-      if r.stop { found_any = true; }
-      t19 = None;
-    }
-    if t20 != None {
-      let h: Task(WorkerResult) = match (t20) { Some(v) => move v, None => worker_noop() };
-      let r: WorkerResult = yield h;
-      stats_add(mut stats, &r.stats);
-      if r.found_any { found_any = true; }
-      if r.stop { found_any = true; }
-      t20 = None;
-    }
-    if t21 != None {
-      let h: Task(WorkerResult) = match (t21) { Some(v) => move v, None => worker_noop() };
-      let r: WorkerResult = yield h;
-      stats_add(mut stats, &r.stats);
-      if r.found_any { found_any = true; }
-      if r.stop { found_any = true; }
-      t21 = None;
-    }
-    if t22 != None {
-      let h: Task(WorkerResult) = match (t22) { Some(v) => move v, None => worker_noop() };
-      let r: WorkerResult = yield h;
-      stats_add(mut stats, &r.stats);
-      if r.found_any { found_any = true; }
-      if r.stop { found_any = true; }
-      t22 = None;
-    }
-    if t23 != None {
-      let h: Task(WorkerResult) = match (t23) { Some(v) => move v, None => worker_noop() };
-      let r: WorkerResult = yield h;
-      stats_add(mut stats, &r.stats);
-      if r.found_any { found_any = true; }
-      if r.stop { found_any = true; }
-      t23 = None;
-    }
-    if t24 != None {
-      let h: Task(WorkerResult) = match (t24) { Some(v) => move v, None => worker_noop() };
-      let r: WorkerResult = yield h;
-      stats_add(mut stats, &r.stats);
-      if r.found_any { found_any = true; }
-      if r.stop { found_any = true; }
-      t24 = None;
-    }
-    if t25 != None {
-      let h: Task(WorkerResult) = match (t25) { Some(v) => move v, None => worker_noop() };
-      let r: WorkerResult = yield h;
-      stats_add(mut stats, &r.stats);
-      if r.found_any { found_any = true; }
-      if r.stop { found_any = true; }
-      t25 = None;
-    }
-    if t26 != None {
-      let h: Task(WorkerResult) = match (t26) { Some(v) => move v, None => worker_noop() };
-      let r: WorkerResult = yield h;
-      stats_add(mut stats, &r.stats);
-      if r.found_any { found_any = true; }
-      if r.stop { found_any = true; }
-      t26 = None;
-    }
-    if t27 != None {
-      let h: Task(WorkerResult) = match (t27) { Some(v) => move v, None => worker_noop() };
-      let r: WorkerResult = yield h;
-      stats_add(mut stats, &r.stats);
-      if r.found_any { found_any = true; }
-      if r.stop { found_any = true; }
-      t27 = None;
-    }
-    if t28 != None {
-      let h: Task(WorkerResult) = match (t28) { Some(v) => move v, None => worker_noop() };
-      let r: WorkerResult = yield h;
-      stats_add(mut stats, &r.stats);
-      if r.found_any { found_any = true; }
-      if r.stop { found_any = true; }
-      t28 = None;
-    }
-    if t29 != None {
-      let h: Task(WorkerResult) = match (t29) { Some(v) => move v, None => worker_noop() };
-      let r: WorkerResult = yield h;
-      stats_add(mut stats, &r.stats);
-      if r.found_any { found_any = true; }
-      if r.stop { found_any = true; }
-      t29 = None;
-    }
-    if t30 != None {
-      let h: Task(WorkerResult) = match (t30) { Some(v) => move v, None => worker_noop() };
-      let r: WorkerResult = yield h;
-      stats_add(mut stats, &r.stats);
-      if r.found_any { found_any = true; }
-      if r.stop { found_any = true; }
-      t30 = None;
-    }
-    if t31 != None {
-      let h: Task(WorkerResult) = match (t31) { Some(v) => move v, None => worker_noop() };
-      let r: WorkerResult = yield h;
-      stats_add(mut stats, &r.stats);
-      if r.found_any { found_any = true; }
-      if r.stop { found_any = true; }
-      t31 = None;
-    }
   }
 
   let end_ns_opt: i64? = std::runtime::posix::time::monotonic_now_ns();
@@ -1665,11 +2027,16 @@ export async fn run_parallel (cfg: Config) -> int {
   let elapsed_ns: i64 = end_ns - start_ns;
   print_stats(mut err, &io, cfg, stats, elapsed_ns);
 
+  let ok_flush: bool = flush_out_if_nonempty(mut out, &io);
+  if !ok_flush {
+    stats.errors = stats.errors + 1;
+    found_any = true;
+  }
+
   pat.drop();
   out.drop();
   err.drop();
-  out_mutex.drop();
-  cancel_tok.drop();
+  disarm_parallel_sync_drops(mut out_mutex, mut cancel_tok);
 
   if stats.errors > 0 {
     return 2;
@@ -1711,18 +2078,19 @@ export fn run (cfg: Config) -> int {
   if out_opt == None {
     return 2;
   }
+  let mut out: Writer = match (out_opt) {
+    Some(v) => move v,
+    None => Writer{ fd: -1, color: false, buf: BufferU8.empty() },
+  };
+
   let err_opt: Writer? = Writer.stderr(stderr_color, 8192);
   if err_opt == None {
+    out.drop();
     return 2;
   }
-
-  let mut out: Writer = match (out_opt) {
-    Some(v) => v,
-    None => Writer{ fd: 1, color: false, buf: BufferU8.empty() },
-  };
   let mut err: Writer = match (err_opt) {
-    Some(v) => v,
-    None => Writer{ fd: 2, color: false, buf: BufferU8.empty() },
+    Some(v) => move v,
+    None => Writer{ fd: -1, color: false, buf: BufferU8.empty() },
   };
 
   let start_ns_opt: i64? = std::runtime::posix::time::monotonic_now_ns();
@@ -1733,13 +2101,20 @@ export fn run (cfg: Config) -> int {
   if mode == Mode::Files {
     let n: int = cfg.path_count();
     if n <= 0 {
-      handle_root_files(cfg, ".", &io, mut out, mut err, mut stats);
+      let o: Outcome = handle_root_files(cfg, ".", &io, mut out, mut err, mut stats);
+      if o.stop {
+        found_any = true;
+      }
     } else {
       var i: int = 0;
       while i < n {
         let root_opt: string? = cfg.path_at(i);
         let root: string = root_opt ?? ".";
-        handle_root_files(cfg, root, &io, mut out, mut err, mut stats);
+        let o: Outcome = handle_root_files(cfg, root, &io, mut out, mut err, mut stats);
+        if o.stop {
+          found_any = true;
+          break;
+        }
         i = i + 1;
       }
     }
@@ -1783,6 +2158,12 @@ export fn run (cfg: Config) -> int {
   let end_ns: i64 = end_ns_opt ?? start_ns;
   let elapsed_ns: i64 = end_ns - start_ns;
   print_stats(mut err, &io, cfg, stats, elapsed_ns);
+
+  let ok_flush: bool = flush_out_if_nonempty(mut out, &io);
+  if !ok_flush {
+    stats.errors = stats.errors + 1;
+    found_any = true;
+  }
 
   out.drop();
   err.drop();

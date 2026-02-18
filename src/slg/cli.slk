@@ -7,6 +7,9 @@ import { write_str } from "./out.slk";
 import { ColorMode, parse_mode } from "./color.slk";
 import { NAME, VERSION } from "./version.slk";
 
+// Implementation limits for the task-based parallel engine.
+export const MAX_WORKER_SLOTS: int = 8;
+
 /**
  * `slg` primary operation mode.
  */
@@ -47,12 +50,16 @@ export struct Config {
   hidden: bool,
   follow: bool,
   max_depth: int,
+  // Ignore a small set of common “heavy” directories (e.g., `node_modules`).
+  ignore_common: bool,
   ignore_vcs: bool,
+  // Read `.gitignore` / `.ignore` / `.agignore` files.
+  ignore_files: bool,
 
   // Parallelism.
   //
   // Semantics:
-  // - `jobs == 0` means “auto” (pick a default at runtime).
+  // - `jobs == 0` means “auto” (pick a default at runtime, clamped to `MAX_WORKER_SLOTS + 1`).
   // - `jobs == 1` means “single-threaded”.
   // - `jobs > 1` enables task-based parallel traversal/search.
   jobs: int,
@@ -152,11 +159,13 @@ TRAVERSAL OPTIONS:
       --hidden              Include hidden files and directories
       --follow              Follow symlinks (note: may loop)
       --max-depth <n>       Limit recursion depth (0 = only the root)
+      --no-ignore-common    Do not skip common heavy directories (node_modules, build, dist, target, tmp, .cache)
       --no-ignore-vcs       Do not skip .git/.hg/.svn directories
+      --no-ignore-files     Do not read .gitignore/.ignore/.agignore ignore files
 
 PARALLELISM:
-  -j, --jobs <n>            Parallel tasks (0 = auto, 1 = single-threaded)
-      --max-workers <n>     Cap worker tasks (0 = no cap, default: 8)
+  -j, --jobs <n>            Parallel tasks (0 = auto, 1 = single-threaded, max: 9)
+      --max-workers <n>     Cap worker tasks (0 = no cap, default: 0, max effective: 8)
       --parallel-files      Parallelize `--files` traversal when jobs > 1
       --no-parallel         Same as --jobs 1
 
@@ -297,9 +306,11 @@ export fn parse_cli (args: Args) -> Config? {
   var hidden: bool = false;
   var follow: bool = false;
   var max_depth: int = -1;
+  var ignore_common: bool = true;
   var ignore_vcs: bool = true;
+  var ignore_files: bool = true;
   var jobs: int = 0;
-  var max_workers: int = 8;
+  var max_workers: int = 0;
   var parallel_files: bool = false;
   var text: bool = false;
   var files_with_matches: bool = false;
@@ -365,11 +376,10 @@ export fn parse_cli (args: Args) -> Config? {
         }
         let v_s: string = args.get(i + 1);
         let v_opt: int? = parse_int(v_s);
-        if v_opt == None {
+        let Some(v) = v_opt else {
           print_error_3("slg: invalid value for ", a, ": expected integer");
           return None;
-        }
-        let v: int = v_opt ?? 0;
+        };
         if v < 0 {
           print_error_3("slg: invalid value for ", a, ": must be >= 0");
           return None;
@@ -381,16 +391,12 @@ export fn parse_cli (args: Args) -> Config? {
 
       let max_count_eq: string? = split_eq_value(a, "--max-count");
       if max_count_eq != None {
-        let v_s: string = match (max_count_eq) {
-          Some(s) => s,
-          None => "",
-        };
+        let v_s: string = max_count_eq ?? "";
         let v_opt: int? = parse_int(v_s);
-        if v_opt == None {
+        let Some(v) = v_opt else {
           print_error_3("slg: invalid value for ", "--max-count", ": expected integer");
           return None;
-        }
-        let v: int = v_opt ?? 0;
+        };
         if v < 0 {
           print_error_3("slg: invalid value for ", "--max-count", ": must be >= 0");
           return None;
@@ -416,6 +422,11 @@ export fn parse_cli (args: Args) -> Config? {
         i = i + 1;
         continue;
       }
+      if a == "--no-ignore-files" {
+        ignore_files = false;
+        i = i + 1;
+        continue;
+      }
       if a == "--max-depth" {
         if i + 1 >= argc {
           print_error_2("slg: missing value for ", a);
@@ -423,27 +434,30 @@ export fn parse_cli (args: Args) -> Config? {
         }
         let v_s: string = args.get(i + 1);
         let v_opt: int? = parse_int(v_s);
-        if v_opt == None {
+        let Some(v) = v_opt else {
           print_error_3("slg: invalid value for ", a, ": expected integer");
           return None;
-        }
-        max_depth = v_opt ?? -1;
+        };
+        max_depth = v;
         i = i + 2;
         continue;
       }
 
       let max_depth_eq: string? = split_eq_value(a, "--max-depth");
       if max_depth_eq != None {
-        let v_s: string = match (max_depth_eq) {
-          Some(s) => s,
-          None => "",
-        };
+        let v_s: string = max_depth_eq ?? "";
         let v_opt: int? = parse_int(v_s);
-        if v_opt == None {
+        let Some(v) = v_opt else {
           print_error_3("slg: invalid value for ", "--max-depth", ": expected integer");
           return None;
-        }
-        max_depth = v_opt ?? -1;
+        };
+        max_depth = v;
+        i = i + 1;
+        continue;
+      }
+
+      if a == "--no-ignore-common" {
+        ignore_common = false;
         i = i + 1;
         continue;
       }
@@ -461,11 +475,10 @@ export fn parse_cli (args: Args) -> Config? {
         }
         let v_s: string = args.get(i + 1);
         let v_opt: int? = parse_int(v_s);
-        if v_opt == None {
+        let Some(v) = v_opt else {
           print_error_3("slg: invalid value for ", a, ": expected integer");
           return None;
-        }
-        let v: int = v_opt ?? 0;
+        };
         if v < 0 {
           print_error_3("slg: invalid value for ", a, ": must be >= 0");
           return None;
@@ -478,11 +491,10 @@ export fn parse_cli (args: Args) -> Config? {
       if jobs_eq != None {
         let v_s: string = jobs_eq ?? "";
         let v_opt: int? = parse_int(v_s);
-        if v_opt == None {
+        let Some(v) = v_opt else {
           print_error_3("slg: invalid value for ", "--jobs", ": expected integer");
           return None;
-        }
-        let v: int = v_opt ?? 0;
+        };
         if v < 0 {
           print_error_3("slg: invalid value for ", "--jobs", ": must be >= 0");
           return None;
@@ -499,11 +511,10 @@ export fn parse_cli (args: Args) -> Config? {
         }
         let v_s: string = args.get(i + 1);
         let v_opt: int? = parse_int(v_s);
-        if v_opt == None {
+        let Some(v) = v_opt else {
           print_error_3("slg: invalid value for ", a, ": expected integer");
           return None;
-        }
-        let v: int = v_opt ?? 0;
+        };
         if v < 0 {
           print_error_3("slg: invalid value for ", a, ": must be >= 0");
           return None;
@@ -516,11 +527,10 @@ export fn parse_cli (args: Args) -> Config? {
       if max_workers_eq != None {
         let v_s: string = max_workers_eq ?? "";
         let v_opt: int? = parse_int(v_s);
-        if v_opt == None {
+        let Some(v) = v_opt else {
           print_error_3("slg: invalid value for ", "--max-workers", ": expected integer");
           return None;
-        }
-        let v: int = v_opt ?? 0;
+        };
         if v < 0 {
           print_error_3("slg: invalid value for ", "--max-workers", ": must be >= 0");
           return None;
@@ -592,28 +602,19 @@ export fn parse_cli (args: Args) -> Config? {
           print_error_3("slg: invalid value for ", a, ": expected auto|always|never");
           return None;
         }
-        color_mode = match (m_opt) {
-          Some(m) => m,
-          None => ColorMode::Auto,
-        };
+        color_mode = m_opt ?? ColorMode::Auto;
         i = i + 2;
         continue;
       }
       let color_eq: string? = split_eq_value(a, "--color");
       if color_eq != None {
-        let v_s: string = match (color_eq) {
-          Some(s) => s,
-          None => "",
-        };
+        let v_s: string = color_eq ?? "";
         let m_opt: ColorMode? = parse_mode(v_s);
         if m_opt == None {
           print_error_3("slg: invalid value for ", "--color", ": expected auto|always|never");
           return None;
         }
-        color_mode = match (m_opt) {
-          Some(m) => m,
-          None => ColorMode::Auto,
-        };
+        color_mode = m_opt ?? ColorMode::Auto;
         i = i + 1;
         continue;
       }
@@ -646,6 +647,17 @@ export fn parse_cli (args: Args) -> Config? {
     return None;
   }
 
+  // Clamp to current implementation limit (see `MAX_WORKER_SLOTS`).
+  let max_jobs: int = MAX_WORKER_SLOTS + 1;
+  if jobs > max_jobs {
+    jobs = max_jobs;
+  }
+
+  // Clamp to current implementation limit (see `MAX_WORKER_SLOTS`).
+  if max_workers > MAX_WORKER_SLOTS {
+    max_workers = MAX_WORKER_SLOTS;
+  }
+
   return Some(Config{
     args: args,
     mode: mode,
@@ -657,7 +669,9 @@ export fn parse_cli (args: Args) -> Config? {
     hidden: hidden,
     follow: follow,
     max_depth: max_depth,
+    ignore_common: ignore_common,
     ignore_vcs: ignore_vcs,
+    ignore_files: ignore_files,
     jobs: jobs,
     max_workers: max_workers,
     parallel_files: parallel_files,

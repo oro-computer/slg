@@ -1,0 +1,15 @@
+# Ignore a single file.
+ignored.txt
+
+# Directory-only ignore.
+ignored_dir/
+
+# Negation (re-include one file).
+*.log
+!keep.log
+
+# Anchored ignore (only in this directory).
+/anchored.txt
+
+# Globstar with slash patterns.
+**/deep.txt

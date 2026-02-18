@@ -1,6 +1,7 @@
 # `slg` — Silk Line Grep
 
-`slg` is a fast recursive file + pattern search tool written in Silk (think: a tiny, mmap-first `rg`/`ag`-style utility).
+`slg` is a fast recursive file + pattern search tool written in Silk
+(think: a tiny, mmap-first `rg`/`ag`-style utility).
 
 ## Build & run
 
@@ -71,7 +72,8 @@ slg --max-depth 2 "TODO" .
 
 # Parallelism control:
 #   --jobs 0 = auto (default), --jobs 1 = single-threaded, --no-parallel = --jobs 1
-#   --max-workers 8 = cap worker tasks (default), --max-workers 0 = no cap
+#   --max-workers 0 = no cap (default; currently clamped to 8), --max-workers 1..8 caps worker tasks (values > 8 clamp to 8)
+#   Note: in this snapshot, effective --jobs is clamped to 9 (1 orchestrator + 8 workers)
 #   --parallel-files enables parallel traversal for --files when jobs > 1
 slg --jobs 1 "TODO" .
 slg --jobs 0 --max-workers 0 "TODO" .
@@ -96,6 +98,18 @@ slg -q "TODO" .
 
 By default, `slg` skips files that look binary (contain a NUL byte in the first 1024 bytes).
 Use `--text` to force searching those files anyway.
+
+## Ignores
+
+By default, `slg` skips a small set of common “heavy” directories:
+`node_modules`, `build`, `dist`, `target`, `tmp`, `.cache`.
+
+Use `--no-ignore-common` to include them.
+
+By default, `slg` also reads per-directory ignore files:
+`.gitignore`, `.ignore`, `.agignore`.
+
+Use `--no-ignore-files` to disable ignore file reading.
 
 ## Color
 
