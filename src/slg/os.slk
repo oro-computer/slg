@@ -53,6 +53,20 @@ export ext isatty = fn (int) -> i32;
 export ext dup = fn (int) -> int;
 
 /**
+ * `fstat(2)` — get file metadata by file descriptor.
+ *
+ * Notes:
+ * - This is used in `slg` as a fast way to get file size for the small-file
+ *   scratch-buffer fast path without disturbing the file offset (unlike
+ *   `lseek(fd, 0, SEEK_END)`).
+ *
+ * @param fd: int Open file descriptor.
+ * @param out: u64 Pointer to a writable `struct stat` buffer.
+ * @returns i32 0 on success, otherwise -1.
+ */
+export ext fstat = fn (int, u64) -> i32;
+
+/**
  * `memchr(3)` — find the first byte in a memory region.
  *
  * @param hay: u64 Pointer to bytes.
@@ -112,6 +126,7 @@ export const MAP_PRIVATE: int = 2;
 export const MAP_FAILED: u64 = 18446744073709551615;
 
 // `errno` values (linux hosted baseline).
+export const EINTR: int = 4;
 export const ENOTDIR: int = 20;
 
 // `dirent.d_type` constants (linux hosted baseline).

@@ -1,7 +1,11 @@
 # `slg` — Silk Line Grep
 
 `slg` is a fast recursive file + pattern search tool written in Silk
-(think: a tiny, mmap-first `rg`/`ag`-style utility).
+(think: a tiny, hybrid read+`mmap` `rg`/`ag`-style utility).
+
+Implementation note:
+- Regular files are probed with a small read and, when <= 64KiB, read into a reusable scratch buffer.
+- Larger files fall back to `mmap`/`munmap`.
 
 ## Build & run
 
@@ -34,6 +38,7 @@ slg --files [options] [path ...]
 
 Important parsing rule (for speed + simplicity):
 - Options must appear before `<pattern>`. Any arguments after `<pattern>` are treated as paths.
+- Use `--` to end option parsing (useful for patterns starting with `-`).
 
 Exit status:
 - `0` match found (or `--files` completed successfully)
@@ -48,9 +53,13 @@ slg "T.DO" .
 
 # Fixed-string search (fast path)
 slg -F "TODO:" .
+slg -Q "TODO:" .
 
 # Case-insensitive (ASCII-only for -F)
 slg -i "error" src
+
+# Smart-case (like rg/ag): enables -i only when the pattern has no ASCII uppercase
+slg -S "todo" src
 
 # Show only files with matches
 slg -l "TODO" .
@@ -71,12 +80,21 @@ slg --follow "TODO" .
 slg --max-depth 2 "TODO" .
 
 # Parallelism control:
-#   --jobs 0 = auto (default), --jobs 1 = single-threaded, --no-parallel = --jobs 1
-#   --max-workers 0 = no cap (default; currently clamped to 8), --max-workers 1..8 caps worker tasks (values > 8 clamp to 8)
-#   Note: in this snapshot, effective --jobs is clamped to 9 (1 orchestrator + 8 workers)
+#   --jobs 0|auto = auto (default), --jobs 1 = single-threaded, --no-parallel = --jobs 1
+#   --threads is an alias for --jobs
+#   --max-workers 0 = no cap (default; capped by --jobs-1), --max-workers >= 1 caps worker tasks (clamped to 1023)
+#   --split-depth 0|auto = auto (default), --split-depth 1..8 bounds how deep the orchestrator splits directory subtrees into jobs
+#   --queue-cap 0|auto = auto (default), --queue-cap >= 1 sets the bounded job queue capacity
+#   --target-jobs 0|auto = auto (default), --target-jobs >= 1 stops splitting deeper once this many subtrees have been scheduled (enqueued + in-thread)
+#   --max-jobs-total 0|auto = auto (default), --max-jobs-total >= 1 caps the total number of enqueued jobs across the run
+#   --file-batch 0|auto = auto (default; currently 256), --file-batch >= 1 sets files per file-batch job (flat, file-heavy dirs)
+#   --no-file-jobs disables file-batch jobs, --file-jobs re-enables them (default: on)
+#   Note: in this snapshot, --jobs is clamped to 1024 (hard safety limit)
 #   --parallel-files enables parallel traversal for --files when jobs > 1
 slg --jobs 1 "TODO" .
 slg --jobs 0 --max-workers 0 "TODO" .
+slg --jobs 0 --split-depth 2 "TODO" .
+slg --jobs 0 --queue-cap 512 --max-jobs-total 8192 "TODO" .
 slg --files --parallel-files --jobs 0 .
 
 # Print stats to stderr
@@ -84,15 +102,22 @@ slg --stats "TODO" .
 
 # Quiet mode (exit immediately on first match)
 slg -q "TODO" .
+
+# Suppress line numbers (default output includes them)
+slg --no-line-number -F "TODO" .
+
+# Column output requires line numbers
+slg --column "TODO" .
 ```
 
 ## Pattern semantics
 
 - By default, `<pattern>` is a regular expression compiled by Silk’s runtime regex engine.
-- With `-F/--fixed-string`, `<pattern>` is treated as a literal byte substring (fast path).
+- With `-F/--fixed-string` (aliases: `-Q/--literal`, `--fixed-strings`), `<pattern>` is treated as a literal byte substring (fast path).
 - With `-i/--ignore-case`:
   - regex mode: delegated to the runtime regex engine
   - fixed-string mode: ASCII-only case folding
+- With `-S/--smart-case`: if `-i/--ignore-case` is not already set and `<pattern>` contains no ASCII uppercase, `slg` enables ignore-case matching.
 
 ## Binary / text detection
 
@@ -110,6 +135,14 @@ By default, `slg` also reads per-directory ignore files:
 `.gitignore`, `.ignore`, `.agignore`.
 
 Use `--no-ignore-files` to disable ignore file reading.
+
+Use `--no-ignore` to disable all ignore sources (common dirs, VCS dirs, ignore files).
+Use `--ignore` to re-enable ignore behavior (default).
+
+To re-enable individual ignore sources after `--no-ignore`:
+- `--ignore-common`
+- `--ignore-vcs`
+- `--ignore-files`
 
 ## Color
 

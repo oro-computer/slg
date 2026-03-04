@@ -6,9 +6,13 @@ import std::runtime::mem;
 import { write_str } from "./out.slk";
 import { ColorMode, parse_mode } from "./color.slk";
 import { NAME, VERSION } from "./version.slk";
+import { vararg_string_at } from "./varargs.slk";
 
-// Implementation limits for the task-based parallel engine.
-export const MAX_WORKER_SLOTS: int = 8;
+// Hard safety limits for the task-based parallel engine.
+//
+// Note: `task fn` calls currently spawn OS threads in the hosted subset, so we
+// clamp values to avoid accidental thread explosions (e.g. `--jobs=9999999`).
+export const MAX_JOBS_HARD: int = 1024;
 
 /**
  * `slg` primary operation mode.
@@ -59,7 +63,7 @@ export struct Config {
   // Parallelism.
   //
   // Semantics:
-  // - `jobs == 0` means “auto” (pick a default at runtime, clamped to `MAX_WORKER_SLOTS + 1`).
+  // - `jobs == 0` means “auto” (pick a default at runtime).
   // - `jobs == 1` means “single-threaded”.
   // - `jobs > 1` enables task-based parallel traversal/search.
   jobs: int,
@@ -70,6 +74,44 @@ export struct Config {
   // - `max_workers == 0` means “no cap” (within current implementation limits).
   // - `max_workers > 0` caps spawned worker tasks.
   max_workers: int,
+
+  // Parallel scheduler tuning (task-based engine only).
+  //
+  // Semantics:
+  // - `split_depth == 0` means “auto”.
+  // - `split_depth >= 1` bounds how deep the orchestrator will split
+  //   directories into subtree jobs for workers.
+  split_depth: int,
+
+  // Advanced parallel scheduler tuning (task-based engine only).
+  //
+  // Semantics:
+  // - `queue_cap == 0` means “auto” (pick a runtime default).
+  // - `queue_cap >= 1` sets the bounded job queue capacity.
+  queue_cap: int,
+
+  // Semantics:
+  // - `target_jobs == 0` means “auto”.
+  // - `target_jobs >= 1` stops splitting deeper once this many work units have
+  //   been scheduled (includes in-thread splitting and enqueued jobs).
+  target_jobs: int,
+
+  // Semantics:
+  // - `max_jobs_total == 0` means “auto”.
+  // - `max_jobs_total >= 1` caps the total number of enqueued jobs; once hit,
+  //   `slg` runs remaining subtrees in the current thread.
+  max_jobs_total: int,
+
+  // Parallelize within a single directory by enqueueing batches of files as
+  // jobs (useful for very flat, file-heavy directories).
+  file_jobs: bool,
+
+  // Maximum number of files per file-batch job.
+  //
+  // Semantics:
+  // - `file_batch == 0` means “auto”.
+  // - `file_batch >= 1` sets the per-job file batch size.
+  file_batch: int,
 
   // Whether to parallelize `--files` traversal when jobs > 1.
   parallel_files: bool,
@@ -144,28 +186,49 @@ USAGE:
 
 NOTES:
   Options must appear before <pattern> (flags after the pattern are treated as paths).
+  Use `--` to end option parsing (useful for patterns starting with '-').
   Exit status: 0 match found (or --files), 1 no match, 2 error.
 
 PATTERN:
   By default, <pattern> is a regular expression (Silk runtime regex).
-  Use -F/--fixed-string for a literal byte substring (fast path).
+  Use -F/--fixed-string (or -Q/--literal) for a literal byte substring (fast path).
+  When <pattern> has no regex metacharacters, slg automatically uses the fixed matcher
+  (including for -i when the pattern is ASCII).
 
 SEARCH OPTIONS:
   -F, --fixed-string        Treat <pattern> as a literal byte substring
+  -Q, --literal             Alias for -F/--fixed-string
+      --fixed-strings       Alias for -F/--fixed-string (compat)
   -i, --ignore-case         Case-insensitive matching (ASCII for -F)
+  -S, --smart-case          Smart case: if <pattern> has no ASCII uppercase, enable -i
+      --no-smart-case       Disable smart case (default)
   -m, --max-count <n>       Stop after <n> matching lines per file (0 = unlimited)
 
 TRAVERSAL OPTIONS:
       --hidden              Include hidden files and directories
       --follow              Follow symlinks (note: may loop)
       --max-depth <n>       Limit recursion depth (0 = only the root)
+      --no-ignore           Do not respect any ignore sources (common dirs, VCS dirs, ignore files)
+      --ignore              Re-enable ignore behavior (default)
+      --ignore-common       Re-enable skipping common heavy directories (default)
+      --ignore-vcs          Re-enable skipping .git/.hg/.svn directories (default)
+      --ignore-files        Re-enable reading .gitignore/.ignore/.agignore ignore files (default)
       --no-ignore-common    Do not skip common heavy directories (node_modules, build, dist, target, tmp, .cache)
       --no-ignore-vcs       Do not skip .git/.hg/.svn directories
       --no-ignore-files     Do not read .gitignore/.ignore/.agignore ignore files
 
 PARALLELISM:
-  -j, --jobs <n>            Parallel tasks (0 = auto, 1 = single-threaded, max: 9)
-      --max-workers <n>     Cap worker tasks (0 = no cap, default: 0, max effective: 8)
+  -j, --jobs <n>            Parallel tasks (0|auto = auto, 1 = single-threaded, max: 1024)
+                            Note: worker tasks spawn OS threads in this snapshot.
+      --threads <n>         Alias for --jobs
+      --max-workers <n>     Cap worker tasks (0 = no cap, default: 0, max effective: 1023)
+      --split-depth <n>     Max directory split depth for parallel jobs (0|auto = auto, default: 0, max effective: 8)
+      --queue-cap <n>       Job queue capacity (0|auto = auto, default: 0)
+      --target-jobs <n>     Stop splitting deeper after scheduling ~N subtrees (0|auto = auto, default: 0)
+      --max-jobs-total <n>  Cap total enqueued jobs across the run (0|auto = auto, default: 0)
+      --file-batch <n>      Files per file-batch job (0|auto = auto, default: 0)
+      --no-file-jobs        Disable file-batch jobs (default: on)
+      --file-jobs           Enable file-batch jobs (default)
       --parallel-files      Parallelize `--files` traversal when jobs > 1
       --no-parallel         Same as --jobs 1
 
@@ -175,8 +238,10 @@ FILE HANDLING:
 OUTPUT OPTIONS:
   -l, --files-with-matches  Print only file paths with a match
       --heading             Print a file header before matches
-  -n, --line-number         Show line numbers (default: on)
-      --column              Show the 1-based match column (byte offset)
+  -n, --line-number         Show line numbers (default)
+      --no-line-number      Do not show line numbers
+      --no-numbers          Alias for --no-line-number
+      --column              Show the 1-based match column (byte offset; requires line numbers)
       --stats               Print a search summary to stderr
   -q, --quiet               Exit immediately on the first match
 
@@ -207,16 +272,14 @@ export fn print_help () -> void {
   let _ = write_str(1, usage_text());
 }
 
-fn print_error_2 (a: string, b: string) -> void {
-  let _ = write_str(2, a);
-  let _ = write_str(2, b);
-  let _ = write_str(2, "\n");
-}
-
-fn print_error_3 (a: string, b: string, c: string) -> void {
-  let _ = write_str(2, a);
-  let _ = write_str(2, b);
-  let _ = write_str(2, c);
+fn print_error (...parts: string) -> void {
+  var i: int = 0;
+  while i < parts.len {
+    let s_opt: string? = vararg_string_at(i, parts);
+    let s: string = s_opt ?? "";
+    let _ = write_str(2, s);
+    i = i + 1;
+  }
   let _ = write_str(2, "\n");
 }
 
@@ -227,6 +290,23 @@ fn is_flag (s: string) -> bool {
   }
   let p: u64 = std::runtime::mem::string_ptr(s);
   return std::runtime::mem::load_u8(p, 0) == 45; // '-'
+}
+
+fn has_ascii_upper (s: string) -> bool {
+  let n: i64 = std::runtime::mem::string_len(s);
+  if n <= 0 {
+    return false;
+  }
+  let p: u64 = std::runtime::mem::string_ptr(s);
+  var i: i64 = 0;
+  while i < n {
+    let b: u8 = std::runtime::mem::load_u8(p, i);
+    if b >= 65 && b <= 90 {
+      return true;
+    }
+    i = i + 1;
+  }
+  return false;
 }
 
 fn split_eq_value (s: string, prefix: string) -> string? {
@@ -293,6 +373,42 @@ fn parse_int (s: string) -> int? {
   return Some((v as int) * sign);
 }
 
+fn is_ascii_auto (s: string) -> bool {
+  let n: i64 = std::runtime::mem::string_len(s);
+  if n != 4 {
+    return false;
+  }
+  let ptr: u64 = std::runtime::mem::string_ptr(s);
+  if ptr == 0 {
+    return false;
+  }
+
+  let b0: u8 = std::runtime::mem::load_u8(ptr, 0);
+  if b0 != 97 && b0 != 65 { // a/A
+    return false;
+  }
+  let b1: u8 = std::runtime::mem::load_u8(ptr, 1);
+  if b1 != 117 && b1 != 85 { // u/U
+    return false;
+  }
+  let b2: u8 = std::runtime::mem::load_u8(ptr, 2);
+  if b2 != 116 && b2 != 84 { // t/T
+    return false;
+  }
+  let b3: u8 = std::runtime::mem::load_u8(ptr, 3);
+  if b3 != 111 && b3 != 79 { // o/O
+    return false;
+  }
+  return true;
+}
+
+fn parse_int_or_auto (s: string) -> int? {
+  if is_ascii_auto(s) {
+    return Some(0);
+  }
+  return parse_int(s);
+}
+
 /**
  * Parse argv into a `Config`.
  *
@@ -303,6 +419,7 @@ export fn parse_cli (args: Args) -> Config? {
   var mode: Mode = Mode::Search;
   var fixed_string: bool = false;
   var ignore_case: bool = false;
+  var smart_case: bool = false;
   var hidden: bool = false;
   var follow: bool = false;
   var max_depth: int = -1;
@@ -311,6 +428,12 @@ export fn parse_cli (args: Args) -> Config? {
   var ignore_files: bool = true;
   var jobs: int = 0;
   var max_workers: int = 0;
+  var split_depth: int = 0;
+  var queue_cap: int = 0;
+  var target_jobs: int = 0;
+  var max_jobs_total: int = 0;
+  var file_jobs: bool = true;
+  var file_batch: int = 0;
   var parallel_files: bool = false;
   var text: bool = false;
   var files_with_matches: bool = false;
@@ -359,7 +482,11 @@ export fn parse_cli (args: Args) -> Config? {
       }
 
       // Matching.
-      if a == "-F" || a == "--fixed-string" {
+      if a == "-F" ||
+        a == "-Q" ||
+        a == "--fixed-string" ||
+        a == "--literal" ||
+        a == "--fixed-strings" {
         fixed_string = true;
         i = i + 1;
         continue;
@@ -369,19 +496,29 @@ export fn parse_cli (args: Args) -> Config? {
         i = i + 1;
         continue;
       }
+      if a == "-S" || a == "--smart-case" {
+        smart_case = true;
+        i = i + 1;
+        continue;
+      }
+      if a == "--no-smart-case" {
+        smart_case = false;
+        i = i + 1;
+        continue;
+      }
       if a == "-m" || a == "--max-count" {
         if i + 1 >= argc {
-          print_error_2("slg: missing value for ", a);
+          print_error("slg: missing value for ", a);
           return None;
         }
         let v_s: string = args.get(i + 1);
-        let v_opt: int? = parse_int(v_s);
+        let v_opt: int? = parse_int_or_auto(v_s);
         let Some(v) = v_opt else {
-          print_error_3("slg: invalid value for ", a, ": expected integer");
+          print_error("slg: invalid value for ", a, ": expected integer or auto");
           return None;
         };
         if v < 0 {
-          print_error_3("slg: invalid value for ", a, ": must be >= 0");
+          print_error("slg: invalid value for ", a, ": must be >= 0");
           return None;
         }
         max_count = v;
@@ -394,11 +531,11 @@ export fn parse_cli (args: Args) -> Config? {
         let v_s: string = max_count_eq ?? "";
         let v_opt: int? = parse_int(v_s);
         let Some(v) = v_opt else {
-          print_error_3("slg: invalid value for ", "--max-count", ": expected integer");
+          print_error("slg: invalid value for ", "--max-count", ": expected integer");
           return None;
         };
         if v < 0 {
-          print_error_3("slg: invalid value for ", "--max-count", ": must be >= 0");
+          print_error("slg: invalid value for ", "--max-count", ": must be >= 0");
           return None;
         }
         max_count = v;
@@ -417,6 +554,35 @@ export fn parse_cli (args: Args) -> Config? {
         i = i + 1;
         continue;
       }
+      if a == "--no-ignore" {
+        ignore_common = false;
+        ignore_vcs = false;
+        ignore_files = false;
+        i = i + 1;
+        continue;
+      }
+      if a == "--ignore" {
+        ignore_common = true;
+        ignore_vcs = true;
+        ignore_files = true;
+        i = i + 1;
+        continue;
+      }
+      if a == "--ignore-common" {
+        ignore_common = true;
+        i = i + 1;
+        continue;
+      }
+      if a == "--ignore-vcs" {
+        ignore_vcs = true;
+        i = i + 1;
+        continue;
+      }
+      if a == "--ignore-files" {
+        ignore_files = true;
+        i = i + 1;
+        continue;
+      }
       if a == "--no-ignore-vcs" {
         ignore_vcs = false;
         i = i + 1;
@@ -429,13 +595,13 @@ export fn parse_cli (args: Args) -> Config? {
       }
       if a == "--max-depth" {
         if i + 1 >= argc {
-          print_error_2("slg: missing value for ", a);
+          print_error("slg: missing value for ", a);
           return None;
         }
         let v_s: string = args.get(i + 1);
         let v_opt: int? = parse_int(v_s);
         let Some(v) = v_opt else {
-          print_error_3("slg: invalid value for ", a, ": expected integer");
+          print_error("slg: invalid value for ", a, ": expected integer");
           return None;
         };
         max_depth = v;
@@ -448,7 +614,7 @@ export fn parse_cli (args: Args) -> Config? {
         let v_s: string = max_depth_eq ?? "";
         let v_opt: int? = parse_int(v_s);
         let Some(v) = v_opt else {
-          print_error_3("slg: invalid value for ", "--max-depth", ": expected integer");
+          print_error("slg: invalid value for ", "--max-depth", ": expected integer");
           return None;
         };
         max_depth = v;
@@ -468,19 +634,19 @@ export fn parse_cli (args: Args) -> Config? {
         i = i + 1;
         continue;
       }
-      if a == "-j" || a == "--jobs" {
+      if a == "-j" || a == "--jobs" || a == "--threads" {
         if i + 1 >= argc {
-          print_error_2("slg: missing value for ", a);
+          print_error("slg: missing value for ", a);
           return None;
         }
         let v_s: string = args.get(i + 1);
-        let v_opt: int? = parse_int(v_s);
+        let v_opt: int? = parse_int_or_auto(v_s);
         let Some(v) = v_opt else {
-          print_error_3("slg: invalid value for ", a, ": expected integer");
+          print_error("slg: invalid value for ", a, ": expected integer or auto");
           return None;
         };
         if v < 0 {
-          print_error_3("slg: invalid value for ", a, ": must be >= 0");
+          print_error("slg: invalid value for ", a, ": must be >= 0");
           return None;
         }
         jobs = v;
@@ -490,13 +656,29 @@ export fn parse_cli (args: Args) -> Config? {
       let jobs_eq: string? = split_eq_value(a, "--jobs");
       if jobs_eq != None {
         let v_s: string = jobs_eq ?? "";
-        let v_opt: int? = parse_int(v_s);
+        let v_opt: int? = parse_int_or_auto(v_s);
         let Some(v) = v_opt else {
-          print_error_3("slg: invalid value for ", "--jobs", ": expected integer");
+          print_error("slg: invalid value for ", "--jobs", ": expected integer or auto");
           return None;
         };
         if v < 0 {
-          print_error_3("slg: invalid value for ", "--jobs", ": must be >= 0");
+          print_error("slg: invalid value for ", "--jobs", ": must be >= 0");
+          return None;
+        }
+        jobs = v;
+        i = i + 1;
+        continue;
+      }
+      let threads_eq: string? = split_eq_value(a, "--threads");
+      if threads_eq != None {
+        let v_s: string = threads_eq ?? "";
+        let v_opt: int? = parse_int_or_auto(v_s);
+        let Some(v) = v_opt else {
+          print_error("slg: invalid value for ", "--threads", ": expected integer or auto");
+          return None;
+        };
+        if v < 0 {
+          print_error("slg: invalid value for ", "--threads", ": must be >= 0");
           return None;
         }
         jobs = v;
@@ -506,17 +688,17 @@ export fn parse_cli (args: Args) -> Config? {
 
       if a == "--max-workers" {
         if i + 1 >= argc {
-          print_error_2("slg: missing value for ", a);
+          print_error("slg: missing value for ", a);
           return None;
         }
         let v_s: string = args.get(i + 1);
         let v_opt: int? = parse_int(v_s);
         let Some(v) = v_opt else {
-          print_error_3("slg: invalid value for ", a, ": expected integer");
+          print_error("slg: invalid value for ", a, ": expected integer");
           return None;
         };
         if v < 0 {
-          print_error_3("slg: invalid value for ", a, ": must be >= 0");
+          print_error("slg: invalid value for ", a, ": must be >= 0");
           return None;
         }
         max_workers = v;
@@ -528,14 +710,205 @@ export fn parse_cli (args: Args) -> Config? {
         let v_s: string = max_workers_eq ?? "";
         let v_opt: int? = parse_int(v_s);
         let Some(v) = v_opt else {
-          print_error_3("slg: invalid value for ", "--max-workers", ": expected integer");
+          print_error("slg: invalid value for ", "--max-workers", ": expected integer");
           return None;
         };
         if v < 0 {
-          print_error_3("slg: invalid value for ", "--max-workers", ": must be >= 0");
+          print_error("slg: invalid value for ", "--max-workers", ": must be >= 0");
           return None;
         }
         max_workers = v;
+        i = i + 1;
+        continue;
+      }
+
+      if a == "--split-depth" {
+        if i + 1 >= argc {
+          print_error("slg: missing value for ", a);
+          return None;
+        }
+        let v_s: string = args.get(i + 1);
+        let v_opt: int? = parse_int_or_auto(v_s);
+        let Some(v) = v_opt else {
+          print_error("slg: invalid value for ", a, ": expected integer or auto");
+          return None;
+        };
+        if v < 0 {
+          print_error("slg: invalid value for ", a, ": must be >= 0");
+          return None;
+        }
+        split_depth = v;
+        i = i + 2;
+        continue;
+      }
+      let split_depth_eq: string? = split_eq_value(a, "--split-depth");
+      if split_depth_eq != None {
+        let v_s: string = split_depth_eq ?? "";
+        let v_opt: int? = parse_int_or_auto(v_s);
+        let Some(v) = v_opt else {
+          print_error("slg: invalid value for ", "--split-depth", ": expected integer or auto");
+          return None;
+        };
+        if v < 0 {
+          print_error("slg: invalid value for ", "--split-depth", ": must be >= 0");
+          return None;
+        }
+        split_depth = v;
+        i = i + 1;
+        continue;
+      }
+
+      if a == "--queue-cap" {
+        if i + 1 >= argc {
+          print_error("slg: missing value for ", a);
+          return None;
+        }
+        let v_s: string = args.get(i + 1);
+        let v_opt: int? = parse_int_or_auto(v_s);
+        let Some(v) = v_opt else {
+          print_error("slg: invalid value for ", a, ": expected integer or auto");
+          return None;
+        };
+        if v < 0 {
+          print_error("slg: invalid value for ", a, ": must be >= 0");
+          return None;
+        }
+        queue_cap = v;
+        i = i + 2;
+        continue;
+      }
+      let queue_cap_eq: string? = split_eq_value(a, "--queue-cap");
+      if queue_cap_eq != None {
+        let v_s: string = queue_cap_eq ?? "";
+        let v_opt: int? = parse_int_or_auto(v_s);
+        let Some(v) = v_opt else {
+          print_error("slg: invalid value for ", "--queue-cap", ": expected integer or auto");
+          return None;
+        };
+        if v < 0 {
+          print_error("slg: invalid value for ", "--queue-cap", ": must be >= 0");
+          return None;
+        }
+        queue_cap = v;
+        i = i + 1;
+        continue;
+      }
+
+      if a == "--target-jobs" {
+        if i + 1 >= argc {
+          print_error("slg: missing value for ", a);
+          return None;
+        }
+        let v_s: string = args.get(i + 1);
+        let v_opt: int? = parse_int_or_auto(v_s);
+        let Some(v) = v_opt else {
+          print_error("slg: invalid value for ", a, ": expected integer or auto");
+          return None;
+        };
+        if v < 0 {
+          print_error("slg: invalid value for ", a, ": must be >= 0");
+          return None;
+        }
+        target_jobs = v;
+        i = i + 2;
+        continue;
+      }
+      let target_jobs_eq: string? = split_eq_value(a, "--target-jobs");
+      if target_jobs_eq != None {
+        let v_s: string = target_jobs_eq ?? "";
+        let v_opt: int? = parse_int_or_auto(v_s);
+        let Some(v) = v_opt else {
+          print_error("slg: invalid value for ", "--target-jobs", ": expected integer or auto");
+          return None;
+        };
+        if v < 0 {
+          print_error("slg: invalid value for ", "--target-jobs", ": must be >= 0");
+          return None;
+        }
+        target_jobs = v;
+        i = i + 1;
+        continue;
+      }
+
+      if a == "--max-jobs-total" {
+        if i + 1 >= argc {
+          print_error("slg: missing value for ", a);
+          return None;
+        }
+        let v_s: string = args.get(i + 1);
+        let v_opt: int? = parse_int_or_auto(v_s);
+        let Some(v) = v_opt else {
+          print_error("slg: invalid value for ", a, ": expected integer or auto");
+          return None;
+        };
+        if v < 0 {
+          print_error("slg: invalid value for ", a, ": must be >= 0");
+          return None;
+        }
+        max_jobs_total = v;
+        i = i + 2;
+        continue;
+      }
+      let max_jobs_total_eq: string? = split_eq_value(a, "--max-jobs-total");
+      if max_jobs_total_eq != None {
+        let v_s: string = max_jobs_total_eq ?? "";
+        let v_opt: int? = parse_int_or_auto(v_s);
+        let Some(v) = v_opt else {
+          print_error("slg: invalid value for ", "--max-jobs-total", ": expected integer or auto");
+          return None;
+        };
+        if v < 0 {
+          print_error("slg: invalid value for ", "--max-jobs-total", ": must be >= 0");
+          return None;
+        }
+        max_jobs_total = v;
+        i = i + 1;
+        continue;
+      }
+
+      if a == "--no-file-jobs" {
+        file_jobs = false;
+        i = i + 1;
+        continue;
+      }
+      if a == "--file-jobs" {
+        file_jobs = true;
+        i = i + 1;
+        continue;
+      }
+
+      if a == "--file-batch" {
+        if i + 1 >= argc {
+          print_error("slg: missing value for ", a);
+          return None;
+        }
+        let v_s: string = args.get(i + 1);
+        let v_opt: int? = parse_int_or_auto(v_s);
+        let Some(v) = v_opt else {
+          print_error("slg: invalid value for ", a, ": expected integer or auto");
+          return None;
+        };
+        if v < 0 {
+          print_error("slg: invalid value for ", a, ": must be >= 0");
+          return None;
+        }
+        file_batch = v;
+        i = i + 2;
+        continue;
+      }
+      let file_batch_eq: string? = split_eq_value(a, "--file-batch");
+      if file_batch_eq != None {
+        let v_s: string = file_batch_eq ?? "";
+        let v_opt: int? = parse_int_or_auto(v_s);
+        let Some(v) = v_opt else {
+          print_error("slg: invalid value for ", "--file-batch", ": expected integer or auto");
+          return None;
+        };
+        if v < 0 {
+          print_error("slg: invalid value for ", "--file-batch", ": must be >= 0");
+          return None;
+        }
+        file_batch = v;
         i = i + 1;
         continue;
       }
@@ -561,6 +934,11 @@ export fn parse_cli (args: Args) -> Config? {
       }
       if a == "--heading" {
         heading = true;
+        i = i + 1;
+        continue;
+      }
+      if a == "--no-line-number" || a == "--no-numbers" {
+        line_number = false;
         i = i + 1;
         continue;
       }
@@ -593,13 +971,13 @@ export fn parse_cli (args: Args) -> Config? {
       }
       if a == "--color" {
         if i + 1 >= argc {
-          print_error_2("slg: missing value for ", a);
+          print_error("slg: missing value for ", a);
           return None;
         }
         let v_s: string = args.get(i + 1);
         let m_opt: ColorMode? = parse_mode(v_s);
         if m_opt == None {
-          print_error_3("slg: invalid value for ", a, ": expected auto|always|never");
+          print_error("slg: invalid value for ", a, ": expected auto|always|never");
           return None;
         }
         color_mode = m_opt ?? ColorMode::Auto;
@@ -611,7 +989,7 @@ export fn parse_cli (args: Args) -> Config? {
         let v_s: string = color_eq ?? "";
         let m_opt: ColorMode? = parse_mode(v_s);
         if m_opt == None {
-          print_error_3("slg: invalid value for ", "--color", ": expected auto|always|never");
+          print_error("slg: invalid value for ", "--color", ": expected auto|always|never");
           return None;
         }
         color_mode = m_opt ?? ColorMode::Auto;
@@ -620,7 +998,7 @@ export fn parse_cli (args: Args) -> Config? {
       }
 
       // Unknown flag.
-      print_error_2("slg: unknown flag: ", a);
+      print_error("slg: unknown flag: ", a, ". Try: slg --help");
       return None;
     }
 
@@ -643,20 +1021,40 @@ export fn parse_cli (args: Args) -> Config? {
   }
 
   if mode == Mode::Search && pattern == None && !help && !version {
-    print_error_2("slg: missing <pattern>. Try: ", "slg --help");
+    print_error("slg: missing <pattern>. Try: ", "slg --help");
     return None;
   }
 
-  // Clamp to current implementation limit (see `MAX_WORKER_SLOTS`).
-  let max_jobs: int = MAX_WORKER_SLOTS + 1;
-  if jobs > max_jobs {
-    jobs = max_jobs;
+  if mode == Mode::Search && smart_case && !ignore_case && pattern != None {
+    let pat: string = pattern ?? "";
+    if !has_ascii_upper(pat) {
+      ignore_case = true;
+    }
   }
 
-  // Clamp to current implementation limit (see `MAX_WORKER_SLOTS`).
-  if max_workers > MAX_WORKER_SLOTS {
-    max_workers = MAX_WORKER_SLOTS;
+  if mode == Mode::Search && column && !line_number {
+    print_error("slg: ", "--column", " requires line numbers (remove ", "--no-line-number", ")");
+    return None;
   }
+
+  // Clamp to hard safety limits (avoid accidental thread explosions).
+  if jobs > MAX_JOBS_HARD {
+    jobs = MAX_JOBS_HARD;
+  }
+  if max_workers > (MAX_JOBS_HARD - 1) {
+    max_workers = MAX_JOBS_HARD - 1;
+  }
+
+  // Clamp to the current scheduler implementation limit.
+  if split_depth > 8 {
+    split_depth = 8;
+  }
+
+  // Clamp advanced scheduler tuning.
+  if queue_cap > 65536 { queue_cap = 65536; }
+  if target_jobs > 1048576 { target_jobs = 1048576; }
+  if max_jobs_total > 1048576 { max_jobs_total = 1048576; }
+  if file_batch > 4096 { file_batch = 4096; }
 
   return Some(Config{
     args: args,
@@ -674,6 +1072,12 @@ export fn parse_cli (args: Args) -> Config? {
     ignore_files: ignore_files,
     jobs: jobs,
     max_workers: max_workers,
+    split_depth: split_depth,
+    queue_cap: queue_cap,
+    target_jobs: target_jobs,
+    max_jobs_total: max_jobs_total,
+    file_jobs: file_jobs,
+    file_batch: file_batch,
     parallel_files: parallel_files,
     text: text,
     files_with_matches: files_with_matches,
@@ -695,8 +1099,8 @@ export fn parse_cli (args: Args) -> Config? {
  * This is used by the entrypoint when `--version` is requested.
  */
 export fn print_version () -> void {
-  let _ = write_str(1, NAME());
+  let _ = write_str(1, NAME);
   let _ = write_str(1, " ");
-  let _ = write_str(1, VERSION());
+  let _ = write_str(1, VERSION);
   let _ = write_str(1, "\n");
 }

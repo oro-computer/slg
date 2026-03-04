@@ -71,19 +71,6 @@ fn writer_init (fd: int, color: bool, cap: i64) -> Writer? {
   return Some(Writer{ fd: fd, color: color, buf: b });
 }
 
-fn take_buf (mut w: &Writer) -> BufferU8 {
-  let b: BufferU8 = w.buf;
-  w.buf = BufferU8.empty();
-  return b;
-}
-
-fn put_buf (mut w: &Writer, mut b: BufferU8) -> void {
-  w.buf = b;
-  b.ptr = 0;
-  b.len = 0;
-  b.cap = 0;
-}
-
 impl Writer {
   /**
    * Create a stdout writer.
@@ -103,53 +90,39 @@ impl Writer {
    * Clear the internal buffer (does not write).
    */
   public fn clear (mut self: &Writer) -> void {
-    let mut b: BufferU8 = take_buf(mut self);
-    b.clear();
-    put_buf(mut self, b);
+    self.buf.clear();
   }
 
   /**
    * Append one byte.
    */
   public fn push_u8 (mut self: &Writer, value: u8) -> OutOfMemory? {
-    let mut b: BufferU8 = take_buf(mut self);
-    let err: OutOfMemory? = b.push_u8(value);
-    put_buf(mut self, b);
-    return err;
+    return self.buf.push_u8(value);
   }
 
   /**
    * Append a `string`.
    */
   public fn push_str (mut self: &Writer, s: string) -> OutOfMemory? {
-    let mut b: BufferU8 = take_buf(mut self);
-    let err: OutOfMemory? = b.push_str(s);
-    put_buf(mut self, b);
-    return err;
+    return self.buf.push_str(s);
   }
 
   /**
    * Append `len` bytes from `ptr`.
    */
   public fn push_ptr_len (mut self: &Writer, ptr: u64, len: i64) -> OutOfMemory? {
-    let mut b: BufferU8 = take_buf(mut self);
-    let err: OutOfMemory? = b.push_ptr_len(ptr, len);
-    put_buf(mut self, b);
-    return err;
+    return self.buf.push_ptr_len(ptr, len);
   }
 
   /**
    * Append a decimal `u64`.
    */
   public fn push_u64 (mut self: &Writer, value: u64) -> OutOfMemory? {
-    let mut b: BufferU8 = take_buf(mut self);
     if value == 0 {
-      let err0: OutOfMemory? = b.push_u8(48);
-      put_buf(mut self, b);
-      return err0;
+      return self.buf.push_u8(48);
     }
 
-    let mut v: u64 = value;
+    var v: u64 = value;
     let mut tmp: u8[32] = [
       0, 0, 0, 0, 0, 0, 0, 0,
       0, 0, 0, 0, 0, 0, 0, 0,
@@ -167,15 +140,13 @@ impl Writer {
 
     var i: i64 = n - 1;
     while i >= 0 {
-      let err: OutOfMemory? = b.push_u8(tmp[i]);
+      let err: OutOfMemory? = self.buf.push_u8(tmp[i]);
       if err != None {
-        put_buf(mut self, b);
         return err;
       }
       i = i - 1;
     }
 
-    put_buf(mut self, b);
     return None;
   }
 
@@ -183,18 +154,14 @@ impl Writer {
    * Append a decimal `i64`.
    */
   public fn push_i64 (mut self: &Writer, value: i64) -> OutOfMemory? {
-    let mut b: BufferU8 = take_buf(mut self);
     if value == 0 {
-      let err0: OutOfMemory? = b.push_u8(48);
-      put_buf(mut self, b);
-      return err0;
+      return self.buf.push_u8(48);
     }
 
-    let mut v: u64 = 0;
+    var v: u64 = 0;
     if value < 0 {
-      let err0: OutOfMemory? = b.push_u8(45);
+      let err0: OutOfMemory? = self.buf.push_u8(45);
       if err0 != None {
-        put_buf(mut self, b);
         return err0;
       }
       v = (0 - value) as u64;
@@ -202,7 +169,6 @@ impl Writer {
       v = value as u64;
     }
 
-    put_buf(mut self, b);
     return self.push_u64(v);
   }
 
@@ -212,11 +178,9 @@ impl Writer {
    * @returns bool `true` on success.
    */
   public fn flush (mut self: &Writer) -> bool {
-    let mut b: BufferU8 = take_buf(mut self);
-    let bytes = b.as_bytes();
+    let bytes = self.buf.as_bytes();
     let ok: bool = write_all(self.fd, bytes.ptr, bytes.len);
-    b.clear();
-    put_buf(mut self, b);
+    self.buf.clear();
     return ok;
   }
 
@@ -230,8 +194,7 @@ impl Writer {
 
 impl Writer as std::interfaces::Drop {
   public fn drop (mut self: &Writer) -> void {
-    let mut b: BufferU8 = take_buf(mut self);
-    b.drop();
+    self.buf.drop();
     self.fd = -1;
     self.color = false;
   }

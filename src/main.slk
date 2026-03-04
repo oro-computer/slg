@@ -6,10 +6,11 @@ import std::runtime::mem;
 import std::runtime::posix::fs;
 import std::runtime::posix::io;
 
-import { Config, parse_cli, print_help, print_version } from "./slg/cli.slk";
+import { Config, MAX_JOBS_HARD, parse_cli, print_help, print_version } from "./slg/cli.slk";
 import { run_auto } from "./slg/engine.slk";
 import { BufferU8 } from "./slg/buf.slk";
 import { dup, memcpy, memmem } from "./slg/os.slk";
+import { vararg_string_at } from "./slg/varargs.slk";
 
 async fn run_cfg (cfg: Config) -> int {
   if cfg.help {
@@ -104,51 +105,6 @@ fn argv_free_partial (argv: u64, count: int) -> void {
 }
 
 /**
- * Return the `index`th vararg `string`, or `None` when out of range.
- *
- * Note: Silk varargs are currently represented as `len` plus a fixed set of
- * fields (`a0..a31`), so indexing is manually unrolled here.
- */
-fn argv_vararg_at (index: int, ...args: string) -> string? {
-  if index < 0 || index >= args.len {
-    return None;
-  }
-  if index == 0 { return Some(args.a0); }
-  if index == 1 { return Some(args.a1); }
-  if index == 2 { return Some(args.a2); }
-  if index == 3 { return Some(args.a3); }
-  if index == 4 { return Some(args.a4); }
-  if index == 5 { return Some(args.a5); }
-  if index == 6 { return Some(args.a6); }
-  if index == 7 { return Some(args.a7); }
-  if index == 8 { return Some(args.a8); }
-  if index == 9 { return Some(args.a9); }
-  if index == 10 { return Some(args.a10); }
-  if index == 11 { return Some(args.a11); }
-  if index == 12 { return Some(args.a12); }
-  if index == 13 { return Some(args.a13); }
-  if index == 14 { return Some(args.a14); }
-  if index == 15 { return Some(args.a15); }
-  if index == 16 { return Some(args.a16); }
-  if index == 17 { return Some(args.a17); }
-  if index == 18 { return Some(args.a18); }
-  if index == 19 { return Some(args.a19); }
-  if index == 20 { return Some(args.a20); }
-  if index == 21 { return Some(args.a21); }
-  if index == 22 { return Some(args.a22); }
-  if index == 23 { return Some(args.a23); }
-  if index == 24 { return Some(args.a24); }
-  if index == 25 { return Some(args.a25); }
-  if index == 26 { return Some(args.a26); }
-  if index == 27 { return Some(args.a27); }
-  if index == 28 { return Some(args.a28); }
-  if index == 29 { return Some(args.a29); }
-  if index == 30 { return Some(args.a30); }
-  if index == 31 { return Some(args.a31); }
-  return None;
-}
-
-/**
  * Allocate an owned argv list for end-to-end CLI tests.
  *
  * This allocates:
@@ -172,7 +128,7 @@ fn argv_alloc (...args: string) -> ArgvOwned? {
 
   var i: int = 0;
   while i < argc {
-    let s_opt: string? = argv_vararg_at(i, args);
+    let s_opt: string? = vararg_string_at(i, args);
     let s: string = s_opt ?? "";
 
     let p: u64 = cstr_alloc(s);
@@ -229,6 +185,35 @@ fn read_all_fd (fd: int) -> BufferU8? {
 
   std::runtime::mem::free(chunk);
   return Some(b);
+}
+
+/**
+ * Write all bytes to `fd` (blocking).
+ *
+ * This is a tiny `write(2)` loop used by end-to-end tests that create files.
+ *
+ * @returns bool `true` on success.
+ */
+fn write_all_fd (fd: int, ptr: u64, len: i64) -> bool {
+  if fd < 0 {
+    return false;
+  }
+  if len <= 0 {
+    return true;
+  }
+  if ptr == 0 {
+    return false;
+  }
+
+  var off: i64 = 0;
+  while off < len {
+    let n: int = std::runtime::posix::io::write(fd, ptr + (off as u64), len - off);
+    if n <= 0 {
+      return false;
+    }
+    off = off + (n as i64);
+  }
+  return true;
 }
 
 /**
@@ -390,16 +375,25 @@ test "slg e2e - help is descriptive" {
   assert(contains(out_s, "USAGE:"), "help output should include USAGE");
   assert(contains(out_s, "EXAMPLES:"), "help output should include EXAMPLES");
   assert(contains(out_s, "--jobs"), "help output should include --jobs");
+  assert(contains(out_s, "--threads"), "help output should include --threads");
   assert(contains(out_s, "--max-workers"), "help output should include --max-workers");
+  assert(contains(out_s, "--file-batch"), "help output should include --file-batch");
+  assert(contains(out_s, "--no-file-jobs"), "help output should include --no-file-jobs");
   assert(contains(out_s, "--parallel-files"), "help output should include --parallel-files");
   assert(contains(out_s, "--no-parallel"), "help output should include --no-parallel");
+  assert(contains(out_s, "--no-line-number"), "help output should include --no-line-number");
+  assert(contains(out_s, "--literal"), "help output should include --literal");
+  assert(contains(out_s, "--smart-case"), "help output should include --smart-case");
+  assert(contains(out_s, "--no-ignore"), "help output should include --no-ignore");
+  assert(contains(out_s, "--ignore-files"), "help output should include --ignore-files");
+  assert(contains(out_s, "end option parsing"), "help output should mention `--`");
 
   cap.drop();
   av.drop();
 }
 
 test "slg e2e - --files can run in parallel" {
-  let av_opt: ArgvOwned? = argv_alloc("slg", "--files", "--parallel-files", "--jobs=4", "testdata/basic");
+  let av_opt: ArgvOwned? = argv_alloc("slg", "--files", "--parallel-files", "--jobs=4", "--file-batch=1", "testdata/basic");
   assert(av_opt != None, "argv alloc failed");
   let mut av: ArgvOwned = av_opt ?? ArgvOwned{ argc: 0, argv: 0 };
 
@@ -419,6 +413,31 @@ test "slg e2e - --files can run in parallel" {
   assert(contains(out_s, "testdata/basic/a.txt"), "expected a file path in output");
   assert(contains(out_s, "testdata/basic/sub/b.txt"), "expected a file path in output");
   assert(!contains(out_s, ".hidden.txt"), "should not include hidden files by default");
+
+  cap.drop();
+  av.drop();
+}
+
+test "slg e2e - file-batch jobs can run in parallel search" {
+  let av_opt: ArgvOwned? = argv_alloc("slg", "--jobs=4", "--file-batch=1", "-F", "TODO", "testdata/basic");
+  assert(av_opt != None, "argv alloc failed");
+  let mut av: ArgvOwned = av_opt ?? ArgvOwned{ argc: 0, argv: 0 };
+
+  let args: Args = Args.init(av.argc, av.argv);
+  let cfg_opt: Config? = parse_cli(args);
+  assert(cfg_opt != None, "parse_cli should succeed");
+
+  let cap_opt: Capture? = match (cfg_opt) {
+    Some(cfg) => await capture_stdout_run_cfg(cfg),
+    None => None,
+  };
+  assert(cap_opt != None, "capture failed");
+  let mut cap: Capture = cap_opt ?? Capture{ code: 2, out: BufferU8.empty() };
+
+  assert(cap.code == 0, "expected exit code 0 (match found)");
+  let out_s: string = buffer_as_string(cap.out);
+  assert(contains(out_s, "testdata/basic/a.txt"), "expected matched file path in output");
+  assert(contains(out_s, "TODO"), "expected match text in output");
 
   cap.drop();
   av.drop();
@@ -469,6 +488,138 @@ test "slg e2e - fixed search finds a match" {
   av.drop();
 }
 
+test "slg e2e - -Q is an alias for -F" {
+  let av_opt: ArgvOwned? = argv_alloc("slg", "-Q", "TODO", "testdata/basic");
+  assert(av_opt != None, "argv alloc failed");
+  let mut av: ArgvOwned = av_opt ?? ArgvOwned{ argc: 0, argv: 0 };
+
+  let args: Args = Args.init(av.argc, av.argv);
+  let cfg_opt: Config? = parse_cli(args);
+  assert(cfg_opt != None, "parse_cli should succeed");
+
+  let cap_opt: Capture? = match (cfg_opt) {
+    Some(cfg) => await capture_stdout_run_cfg(cfg),
+    None => None,
+  };
+  assert(cap_opt != None, "capture failed");
+  let mut cap: Capture = cap_opt ?? Capture{ code: 2, out: BufferU8.empty() };
+
+  assert(cap.code == 0, "expected exit code 0 (match found)");
+  let out_s: string = buffer_as_string(cap.out);
+  assert(contains(out_s, "testdata/basic/a.txt"), "expected matched file path in output");
+  assert(contains(out_s, "TODO"), "expected match text in output");
+
+  cap.drop();
+  av.drop();
+}
+
+test "slg e2e - smart-case enables ignore-case for lowercase patterns" {
+  let av_opt: ArgvOwned? = argv_alloc("slg", "-S", "todo", "testdata/basic");
+  assert(av_opt != None, "argv alloc failed");
+  let mut av: ArgvOwned = av_opt ?? ArgvOwned{ argc: 0, argv: 0 };
+
+  let args: Args = Args.init(av.argc, av.argv);
+  let cfg_opt: Config? = parse_cli(args);
+  assert(cfg_opt != None, "parse_cli should succeed");
+
+  let cap_opt: Capture? = match (cfg_opt) {
+    Some(cfg) => await capture_stdout_run_cfg(cfg),
+    None => None,
+  };
+  assert(cap_opt != None, "capture failed");
+  let mut cap: Capture = cap_opt ?? Capture{ code: 2, out: BufferU8.empty() };
+
+  assert(cap.code == 0, "expected exit code 0 (match found)");
+  let out_s: string = buffer_as_string(cap.out);
+  assert(contains(out_s, "testdata/basic/a.txt"), "expected matched file path in output");
+  assert(contains(out_s, "TODO: visible match"), "expected smart-case to match TODO");
+
+  cap.drop();
+  av.drop();
+}
+
+test "slg e2e - smart-case keeps uppercase patterns case-sensitive" {
+  let av_opt: ArgvOwned? = argv_alloc("slg", "--smart-case", "Todo", "testdata/basic");
+  assert(av_opt != None, "argv alloc failed");
+  let mut av: ArgvOwned = av_opt ?? ArgvOwned{ argc: 0, argv: 0 };
+
+  let args: Args = Args.init(av.argc, av.argv);
+  let cfg_opt: Config? = parse_cli(args);
+  assert(cfg_opt != None, "parse_cli should succeed");
+
+  let cap_opt: Capture? = match (cfg_opt) {
+    Some(cfg) => await capture_stdout_run_cfg(cfg),
+    None => None,
+  };
+  assert(cap_opt != None, "capture failed");
+  let mut cap: Capture = cap_opt ?? Capture{ code: 2, out: BufferU8.empty() };
+
+  assert(cap.code == 1, "expected exit code 1 (no match)");
+
+  cap.drop();
+  av.drop();
+}
+
+test "slg e2e - --no-line-number suppresses numbers" {
+  let av_opt: ArgvOwned? = argv_alloc("slg", "--no-line-number", "-F", "TODO", "testdata/basic");
+  assert(av_opt != None, "argv alloc failed");
+  let mut av: ArgvOwned = av_opt ?? ArgvOwned{ argc: 0, argv: 0 };
+
+  let args: Args = Args.init(av.argc, av.argv);
+  let cfg_opt: Config? = parse_cli(args);
+  assert(cfg_opt != None, "parse_cli should succeed");
+
+  let cap_opt: Capture? = match (cfg_opt) {
+    Some(cfg) => await capture_stdout_run_cfg(cfg),
+    None => None,
+  };
+  assert(cap_opt != None, "capture failed");
+  let mut cap: Capture = cap_opt ?? Capture{ code: 2, out: BufferU8.empty() };
+
+  assert(cap.code == 0, "expected exit code 0 (match found)");
+  let out_s: string = buffer_as_string(cap.out);
+  assert(contains(out_s, "testdata/basic/a.txt:"), "expected matched file path in output");
+  assert(contains(out_s, "TODO"), "expected match text in output");
+  assert(!contains(out_s, "testdata/basic/a.txt:2:"), "expected line numbers to be suppressed");
+
+  cap.drop();
+  av.drop();
+}
+
+test "slg e2e - --column requires line numbers" {
+  let av_opt: ArgvOwned? = argv_alloc("slg", "--no-line-number", "--column", "-F", "TODO", "testdata/basic");
+  assert(av_opt != None, "argv alloc failed");
+  let mut av: ArgvOwned = av_opt ?? ArgvOwned{ argc: 0, argv: 0 };
+
+  let args: Args = Args.init(av.argc, av.argv);
+  let cfg_opt: Config? = parse_cli(args);
+  assert(cfg_opt == None, "expected parse_cli to fail when --column is used without line numbers");
+
+  av.drop();
+}
+
+test "slg e2e - `--` allows patterns starting with '-'" {
+  let av_opt: ArgvOwned? = argv_alloc("slg", "-F", "--", "--no-ignore-files", "testdata/basic");
+  assert(av_opt != None, "argv alloc failed");
+  let mut av: ArgvOwned = av_opt ?? ArgvOwned{ argc: 0, argv: 0 };
+
+  let args: Args = Args.init(av.argc, av.argv);
+  let cfg_opt: Config? = parse_cli(args);
+  assert(cfg_opt != None, "parse_cli should succeed");
+
+  let Some(cfg) = cfg_opt else {
+    assert(false, "config should exist");
+    av.drop();
+    return;
+  };
+
+  assert(cfg.fixed_string, "expected -F to be set");
+  let pat: string = cfg.pattern ?? "";
+  assert(pat == "--no-ignore-files", "expected pattern to be parsed after `--`");
+
+  av.drop();
+}
+
 test "slg e2e - --jobs 1 forces single-threaded" {
   let av_opt: ArgvOwned? = argv_alloc("slg", "--jobs=1", "-F", "TODO", "testdata/basic");
   assert(av_opt != None, "argv alloc failed");
@@ -494,9 +645,49 @@ test "slg e2e - --jobs 1 forces single-threaded" {
   av.drop();
 }
 
-test "slg e2e - concurrency values are clamped" {
+test "slg e2e - --threads is an alias for --jobs" {
+  let av_opt: ArgvOwned? = argv_alloc("slg", "--threads=1", "-F", "TODO", "testdata/basic");
+  assert(av_opt != None, "argv alloc failed");
+  let mut av: ArgvOwned = av_opt ?? ArgvOwned{ argc: 0, argv: 0 };
+
+  let args: Args = Args.init(av.argc, av.argv);
+  let cfg_opt: Config? = parse_cli(args);
+  assert(cfg_opt != None, "parse_cli should succeed");
+
+  let Some(cfg) = cfg_opt else {
+    assert(false, "config should exist");
+    av.drop();
+    return;
+  };
+  assert(cfg.jobs == 1, "expected --threads to configure jobs");
+
+  let cap_opt: Capture? = await capture_stdout_run_cfg(cfg);
+  assert(cap_opt != None, "capture failed");
+  let mut cap: Capture = cap_opt ?? Capture{ code: 2, out: BufferU8.empty() };
+
+  assert(cap.code == 0, "expected exit code 0 (match found)");
+  let out_s: string = buffer_as_string(cap.out);
+  assert(contains(out_s, "testdata/basic/a.txt"), "expected matched file path in output");
+  assert(contains(out_s, "TODO"), "expected match text in output");
+
+  cap.drop();
+  av.drop();
+}
+
+test "slg e2e - concurrency options accept auto keyword" {
   let av_opt: ArgvOwned? =
-    argv_alloc("slg", "--jobs=999", "--max-workers=999", "-F", "TODO", "testdata/basic");
+    argv_alloc(
+      "slg",
+      "--jobs", "auto",
+      "--split-depth=auto",
+      "--queue-cap", "auto",
+      "--target-jobs", "auto",
+      "--max-jobs-total", "AUTO",
+      "--file-batch=auto",
+      "-F",
+      "TODO",
+      "testdata/basic"
+    );
   assert(av_opt != None, "argv alloc failed");
   let mut av: ArgvOwned = av_opt ?? ArgvOwned{ argc: 0, argv: 0 };
 
@@ -510,9 +701,61 @@ test "slg e2e - concurrency values are clamped" {
     return;
   };
 
-  // Current implementation limit: 1 orchestrator + 8 worker slots.
-  assert(cfg.jobs == 9, "expected --jobs to clamp to 9");
-  assert(cfg.max_workers == 8, "expected --max-workers to clamp to 8");
+  assert(cfg.jobs == 0, "expected --jobs auto to parse to 0");
+  assert(cfg.split_depth == 0, "expected --split-depth auto to parse to 0");
+  assert(cfg.queue_cap == 0, "expected --queue-cap auto to parse to 0");
+  assert(cfg.target_jobs == 0, "expected --target-jobs auto to parse to 0");
+  assert(cfg.max_jobs_total == 0, "expected --max-jobs-total auto to parse to 0");
+  assert(cfg.file_batch == 0, "expected --file-batch auto to parse to 0");
+
+  let cap_opt: Capture? = await capture_stdout_run_cfg(cfg);
+  assert(cap_opt != None, "capture failed");
+  let mut cap: Capture = cap_opt ?? Capture{ code: 2, out: BufferU8.empty() };
+
+  assert(cap.code == 0, "expected exit code 0 (match found)");
+  let out_s: string = buffer_as_string(cap.out);
+  assert(contains(out_s, "testdata/basic/a.txt"), "expected matched file path in output");
+  assert(contains(out_s, "TODO"), "expected match text in output");
+
+  cap.drop();
+  av.drop();
+}
+
+test "slg e2e - concurrency values are clamped" {
+  let av_opt: ArgvOwned? =
+    argv_alloc(
+      "slg",
+      "--jobs=999999",
+      "--max-workers=999999",
+      "--split-depth=999",
+      "--queue-cap=999999",
+      "--target-jobs=9999999",
+      "--max-jobs-total=9999999",
+      "--file-batch=999999",
+      "-F",
+      "TODO",
+      "testdata/basic"
+    );
+  assert(av_opt != None, "argv alloc failed");
+  let mut av: ArgvOwned = av_opt ?? ArgvOwned{ argc: 0, argv: 0 };
+
+  let args: Args = Args.init(av.argc, av.argv);
+  let cfg_opt: Config? = parse_cli(args);
+  assert(cfg_opt != None, "parse_cli should succeed");
+
+  let Some(cfg) = cfg_opt else {
+    assert(false, "config should exist");
+    av.drop();
+    return;
+  };
+
+  assert(cfg.jobs == MAX_JOBS_HARD, "expected --jobs to clamp to MAX_JOBS_HARD");
+  assert(cfg.max_workers == (MAX_JOBS_HARD - 1), "expected --max-workers to clamp to MAX_JOBS_HARD - 1");
+  assert(cfg.split_depth == 8, "expected --split-depth to clamp to 8");
+  assert(cfg.queue_cap == 65536, "expected --queue-cap to clamp to 65536");
+  assert(cfg.target_jobs == 1048576, "expected --target-jobs to clamp to 1048576");
+  assert(cfg.max_jobs_total == 1048576, "expected --max-jobs-total to clamp to 1048576");
+  assert(cfg.file_batch == 4096, "expected --file-batch to clamp to 4096");
 
   av.drop();
 }
@@ -651,4 +894,161 @@ test "slg e2e - ignore files are respected" {
 
   cap2.drop();
   av2.drop();
+}
+
+test "slg e2e - --no-ignore disables ignore rules" {
+  let av_opt: ArgvOwned? = argv_alloc("slg", "--files", "--no-ignore", "testdata/ignore");
+  assert(av_opt != None, "argv alloc failed");
+  let mut av: ArgvOwned = av_opt ?? ArgvOwned{ argc: 0, argv: 0 };
+
+  let args: Args = Args.init(av.argc, av.argv);
+  let cfg_opt: Config? = parse_cli(args);
+  assert(cfg_opt != None, "parse_cli should succeed");
+
+  let cap_opt: Capture? = match (cfg_opt) {
+    Some(cfg) => await capture_stdout_run_cfg(cfg),
+    None => None,
+  };
+  assert(cap_opt != None, "capture failed");
+  let mut cap: Capture = cap_opt ?? Capture{ code: 2, out: BufferU8.empty() };
+
+  assert(cap.code == 0, "expected exit code 0");
+  let out_s: string = buffer_as_string(cap.out);
+  assert(contains(out_s, "testdata/ignore/ignored.txt"), "expected ignored file to appear with --no-ignore");
+  assert(contains(out_s, "testdata/ignore/ignored_dir/x.txt"), "expected ignored directory contents to appear with --no-ignore");
+
+  cap.drop();
+  av.drop();
+}
+
+test "slg e2e - --ignore re-enables ignore behavior" {
+  let av_opt: ArgvOwned? = argv_alloc("slg", "--files", "--no-ignore", "--ignore", "testdata/ignore");
+  assert(av_opt != None, "argv alloc failed");
+  let mut av: ArgvOwned = av_opt ?? ArgvOwned{ argc: 0, argv: 0 };
+
+  let args: Args = Args.init(av.argc, av.argv);
+  let cfg_opt: Config? = parse_cli(args);
+  assert(cfg_opt != None, "parse_cli should succeed");
+
+  let cap_opt: Capture? = match (cfg_opt) {
+    Some(cfg) => await capture_stdout_run_cfg(cfg),
+    None => None,
+  };
+  assert(cap_opt != None, "capture failed");
+  let mut cap: Capture = cap_opt ?? Capture{ code: 2, out: BufferU8.empty() };
+
+  assert(cap.code == 0, "expected exit code 0");
+  let out_s: string = buffer_as_string(cap.out);
+  assert(contains(out_s, "testdata/ignore/a.txt"), "expected some files in list");
+  assert(!contains(out_s, "testdata/ignore/ignored.txt"), "expected ignored file to be skipped after --ignore");
+
+  cap.drop();
+  av.drop();
+}
+
+test "slg e2e - --ignore-files re-enables ignore files after --no-ignore" {
+  let av_opt: ArgvOwned? = argv_alloc("slg", "--files", "--no-ignore", "--ignore-files", "testdata/ignore");
+  assert(av_opt != None, "argv alloc failed");
+  let mut av: ArgvOwned = av_opt ?? ArgvOwned{ argc: 0, argv: 0 };
+
+  let args: Args = Args.init(av.argc, av.argv);
+  let cfg_opt: Config? = parse_cli(args);
+  assert(cfg_opt != None, "parse_cli should succeed");
+
+  let cap_opt: Capture? = match (cfg_opt) {
+    Some(cfg) => await capture_stdout_run_cfg(cfg),
+    None => None,
+  };
+  assert(cap_opt != None, "capture failed");
+  let mut cap: Capture = cap_opt ?? Capture{ code: 2, out: BufferU8.empty() };
+
+  assert(cap.code == 0, "expected exit code 0");
+  let out_s: string = buffer_as_string(cap.out);
+  assert(contains(out_s, "testdata/ignore/a.txt"), "expected some files in list");
+  assert(!contains(out_s, "testdata/ignore/ignored.txt"), "expected ignore files to be respected after --ignore-files");
+
+  cap.drop();
+  av.drop();
+}
+
+test "slg e2e - -l regex prefix scan avoids false positives" {
+  // Regression test: in `-l` mode the engine may scan an initial prefix of a
+  // large file. If the prefix ends mid-line, regex patterns like `foo$` must
+  // not match based on the truncated line.
+  //
+  // This constructs a file where the first `probe` bytes end with `needle`,
+  // but the line continues past the probe. The regex `needle$` should not
+  // match the full file.
+
+  let probe: i64 = 16384; // `slg::engine::READ_SCRATCH_PROBE` (duplicated here on purpose).
+  let needle: string = "SLG_E2E_ANCHOR_TEST_12345";
+  let pat: string = "SLG_E2E_ANCHOR_TEST_12345$";
+
+  let path: string = "testdata/basic/anchor_long_line.txt";
+
+  let needle_len: i64 = std::runtime::mem::string_len(needle);
+  assert(needle_len > 0, "needle should be non-empty");
+  assert(needle_len < probe, "needle must fit in probe");
+
+  let total_len: i64 = probe + 16;
+  let buf: u64 = std::runtime::mem::alloc(total_len);
+  assert(buf != 0, "alloc failed");
+
+  // Fill with 'a'.
+  var i: i64 = 0;
+  while i < total_len {
+    std::runtime::mem::store_u8(buf, i, 97); // 'a'
+    i = i + 1;
+  }
+
+  // Place `needle` at the end of the probe.
+  let needle_ptr: u64 = std::runtime::mem::string_ptr(needle);
+  let start: i64 = probe - needle_len;
+  var j: i64 = 0;
+  while j < needle_len {
+    let b: u8 = std::runtime::mem::load_u8(needle_ptr, j);
+    std::runtime::mem::store_u8(buf, start + j, b);
+    j = j + 1;
+  }
+
+  // Ensure the file continues past the probe and does not end in `needle`.
+  std::runtime::mem::store_u8(buf, probe, 120); // 'x'
+
+  let fd: int =
+  std::runtime::posix::fs::open(
+    path,
+    std::runtime::posix::fs::O_WRONLY | std::runtime::posix::fs::O_CREAT | std::runtime::posix::fs::O_TRUNC,
+    420 // 0644
+  ) as int;
+  assert(fd >= 0, "open failed");
+  let ok_write: bool = write_all_fd(fd, buf, total_len);
+  let _ = std::runtime::posix::fs::close(fd);
+  std::runtime::mem::free(buf);
+  assert(ok_write, "write failed");
+
+  // Run `slg -l`.
+  let av_opt: ArgvOwned? = argv_alloc("slg", "-l", pat, "testdata/basic");
+  assert(av_opt != None, "argv alloc failed");
+  let mut av: ArgvOwned = av_opt ?? ArgvOwned{ argc: 0, argv: 0 };
+
+  let args: Args = Args.init(av.argc, av.argv);
+  let cfg_opt: Config? = parse_cli(args);
+  assert(cfg_opt != None, "parse_cli should succeed");
+
+  let cap_opt: Capture? = match (cfg_opt) {
+    Some(cfg) => await capture_stdout_run_cfg(cfg),
+    None => None,
+  };
+  assert(cap_opt != None, "capture failed");
+  let mut cap: Capture = cap_opt ?? Capture{ code: 2, out: BufferU8.empty() };
+
+  // Cleanup before assertions (so failures don't leave test files behind).
+  let _ = std::runtime::posix::fs::unlink(path);
+
+  assert(cap.code == 1, "expected exit code 1 (no match)");
+  let out_s: string = buffer_as_string(cap.out);
+  assert(!contains(out_s, "anchor_long_line.txt"), "should not report a false match");
+
+  cap.drop();
+  av.drop();
 }

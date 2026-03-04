@@ -14,19 +14,36 @@ It recursively walks directory trees and searches file contents.
 .PP
 By default, \fIpattern\fR is a regular expression (Silk runtime regex).
 With \fB-F\fR/\fB--fixed-string\fR, \fIpattern\fR is treated as a literal byte substring (fast path).
+Aliases for fixed-string mode include \fB-Q\fR/\fB--literal\fR and \fB--fixed-strings\fR.
 .PP
 Options must appear before \fIpattern\fR.
 Any arguments after \fIpattern\fR are treated as \fIpath\fR values.
 If no paths are provided, \fBslg\fR searches the current directory (\fB.\fR).
+.PP
+Use
+.B --
+to end option parsing (useful for patterns starting with \fB-\fR).
 .SH OPTIONS
 .SS Pattern / Matching
 .TP
 .BR -F ", " --fixed-string
 Treat \fIpattern\fR as a literal byte substring.
 .TP
+.BR -Q ", " --literal
+Alias for \fB-F\fR/\fB--fixed-string\fR.
+.TP
+.B --fixed-strings
+Alias for \fB-F\fR/\fB--fixed-string\fR (compat).
+.TP
 .BR -i ", " --ignore-case
 Case-insensitive matching.
 With \fB-F\fR, this is ASCII-only.
+.TP
+.BR -S ", " --smart-case
+Smart case: when \fB-i\fR/\fB--ignore-case\fR is not set and \fIpattern\fR contains no ASCII uppercase letters, \fBslg\fR enables ignore-case matching.
+.TP
+.B --no-smart-case
+Disable smart-case (default).
 .TP
 .BR -m ", " --max-count " " \fIn\fR
 Stop after \fIn\fR matching lines per file.
@@ -43,6 +60,21 @@ Follow symlinks (may loop).
 Limit recursion depth.
 Use \fB0\fR for only the root(s).
 .TP
+.B --no-ignore
+Do not respect any ignore sources (common heavy directories, VCS directories, ignore files).
+.TP
+.B --ignore
+Re-enable ignore behavior (default).
+.TP
+.B --ignore-common
+Re-enable skipping common heavy directories (default).
+.TP
+.B --ignore-vcs
+Re-enable skipping \fB.git\fR/\fB.hg\fR/\fB.svn\fR directories (default).
+.TP
+.B --ignore-files
+Re-enable reading ignore files (default).
+.TP
 .B --no-ignore-common
 Do not skip common heavy directories (by default: \fBnode_modules\fR, \fBbuild\fR, \fBdist\fR, \fBtarget\fR, \fBtmp\fR, \fB.cache\fR).
 .TP
@@ -56,16 +88,64 @@ Note: these names are also hidden; use \fB--hidden\fR to traverse them.
 .TP
 .BR -j ", " --jobs " " \fIn\fR
 Parallel tasks.
-\fB0\fR means auto (use available CPUs, clamped to the current implementation limit).
+\fB0\fR means auto (use available CPUs, clamped to a hard safety limit).
+\fBauto\fR is accepted as an alias for \fB0\fR.
 \fB1\fR forces single-threaded mode.
-Values above \fB9\fR are clamped to \fB9\fR in this snapshot.
+Note: worker tasks spawn OS threads in this snapshot.
+Values above \fB1024\fR are clamped to \fB1024\fR in this snapshot.
+.TP
+.BR --threads " " \fIn\fR
+Alias for \fB--jobs\fR.
 .TP
 .BR --max-workers " " \fIn\fR
 Cap worker tasks for parallel traversal.
-\fB0\fR means no cap (still clamped to the current implementation limit).
-Values above \fB8\fR are clamped to \fB8\fR in this snapshot.
-Current implementation limit: \fB8\fR.
+\fB0\fR means no cap (capped by \fB--jobs-1\fR).
+Values above \fB1023\fR are clamped to \fB1023\fR in this snapshot.
 Default: \fB0\fR.
+.TP
+.BR --split-depth " " \fIn\fR
+Maximum directory split depth for parallel jobs.
+\fB0\fR means auto.
+\fBauto\fR is accepted as an alias for \fB0\fR.
+Higher values create smaller subtree jobs (more scheduling overhead).
+Values above \fB8\fR are clamped to \fB8\fR in this snapshot.
+Default: \fB0\fR.
+.TP
+.BR --queue-cap " " \fIn\fR
+Bounded job queue capacity for parallel traversal/search.
+\fB0\fR means auto.
+\fBauto\fR is accepted as an alias for \fB0\fR.
+Values below \fB8\fR are clamped to \fB8\fR in this snapshot.
+Values above \fB65536\fR are clamped to \fB65536\fR in this snapshot.
+Default: \fB0\fR.
+.TP
+.BR --target-jobs " " \fIn\fR
+Stop splitting deeper after scheduling approximately \fBN\fR subtrees.
+\fB0\fR means auto.
+\fBauto\fR is accepted as an alias for \fB0\fR.
+Values above \fB1048576\fR are clamped to \fB1048576\fR in this snapshot.
+Default: \fB0\fR.
+.TP
+.BR --max-jobs-total " " \fIn\fR
+Cap total enqueued jobs across the run for parallel traversal/search.
+\fB0\fR means auto.
+\fBauto\fR is accepted as an alias for \fB0\fR.
+Values above \fB1048576\fR are clamped to \fB1048576\fR in this snapshot.
+Default: \fB0\fR.
+.TP
+.BR --file-batch " " \fIn\fR
+Parallelize within a single directory by enqueueing file-batch jobs.
+Useful for very flat, file-heavy directories.
+\fB0\fR means auto.
+\fBauto\fR is accepted as an alias for \fB0\fR.
+Values above \fB4096\fR are clamped to \fB4096\fR in this snapshot.
+Default: \fB0\fR.
+.TP
+.B --no-file-jobs
+Disable file-batch jobs (default: enabled).
+.TP
+.B --file-jobs
+Enable file-batch jobs (default).
 .TP
 .B --parallel-files
 Parallelize \fB--files\fR traversal when \fB--jobs\fR > 1.
@@ -87,8 +167,14 @@ Print a file header before its matches.
 .BR -n ", " --line-number
 Show 1-based line numbers (default: on).
 .TP
+.B --no-line-number
+Do not show line numbers.
+.TP
+.B --no-numbers
+Alias for \fB--no-line-number\fR.
+.TP
 .B --column
-Show the 1-based match column (byte offset).
+Show the 1-based match column (byte offset). Requires line numbers.
 .TP
 .B --stats
 Print a summary to stderr.

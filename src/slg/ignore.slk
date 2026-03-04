@@ -1,6 +1,7 @@
 module slg::ignore;
 
 import std::path;
+import std::interfaces;
 import std::runtime::mem;
 import std::runtime::posix::fs;
 import { OutOfMemory } from "std/memory";
@@ -13,6 +14,7 @@ import {
   errno,
   memchr,
   memcmp,
+  memcpy,
   mmap,
   munmap,
 } from "./os.slk";
@@ -55,6 +57,241 @@ let FLAG_ANCHORED: u64 = 4;
 let FLAG_HAS_SLASH: u64 = 8;
 let FLAG_HAS_GLOB: u64 = 16;
 
+// ---------------------------------------------------------------------------
+// Ignore directory cache.
+//
+// In the parallel engine, workers sometimes need to rebuild ignore state for
+// many jobs rooted under the same directory tree. Without a cache, we would
+// repeatedly open + parse the same ignore files (especially top-level
+// `.gitignore`), which can dominate runtime on large trees.
+//
+// This cache stores either:
+// - "no rules" for a directory path, or
+// - a parsed ignore payload (content bytes + packed rule records).
+//
+// On a cache hit with rules, we push a *borrowed* ignore entry into the ignore
+// stack (pointers owned by the cache) and mark it as borrowed via
+// `content_len < 0` in the packed stack record.
+//
+// To keep those borrows safe, cached rule payloads are never evicted. When the
+// cache is full of rule entries, we simply stop caching new rule payloads.
+
+let CACHE_SLOT_BYTES: i64 = 64;
+let CACHE_OFF_HASH: i64 = 0;
+let CACHE_OFF_KIND: i64 = 8;
+let CACHE_OFF_KEY_PTR: i64 = 16;
+let CACHE_OFF_KEY_LEN: i64 = 24;
+let CACHE_OFF_CONTENT_PTR: i64 = 32;
+let CACHE_OFF_CONTENT_LEN: i64 = 40;
+let CACHE_OFF_RULES_PTR: i64 = 48;
+let CACHE_OFF_RULES_LEN: i64 = 56;
+
+let CACHE_KIND_NONE: u64 = 0;
+let CACHE_KIND_RULES: u64 = 1;
+
+export struct IgnoreCache {
+  ptr: u64,
+  cap: i64,
+  mask: i64,
+  next_evict: i64,
+}
+
+fn cache_slot_ptr (cache: &IgnoreCache, slot: i64) -> u64 {
+  return cache.ptr + ((slot * CACHE_SLOT_BYTES) as u64);
+}
+
+fn hash_str_ptr_len (ptr: u64, len: i64) -> u64 {
+  // 64-bit FNV-1a.
+  let off: u64 = 1469598103934665603;
+  let prime: u64 = 1099511628211;
+  var h: u64 = off;
+  if ptr == 0 || len <= 0 {
+    return h;
+  }
+
+  var i: i64 = 0;
+  while i < len {
+    let b: u64 = std::runtime::mem::load_u8(ptr, i) as u64;
+    h = h ^ b;
+    h = h * prime;
+    i = i + 1;
+  }
+
+  if h == 0 {
+    return 1;
+  }
+  return h;
+}
+
+struct CacheProbe {
+  hit_slot: i64,
+  empty_slot: i64,
+}
+
+fn cache_probe (cache: &IgnoreCache, key_ptr: u64, key_len: i64, hash: u64) -> CacheProbe {
+  if cache.ptr == 0 || cache.cap <= 0 {
+    return CacheProbe{ hit_slot: -1, empty_slot: -1 };
+  }
+
+  let idx0: i64 = (hash as i64) & cache.mask;
+  var probe: i64 = 0;
+  var empty_slot: i64 = -1;
+  while probe < cache.cap {
+    let slot: i64 = (idx0 + probe) & cache.mask;
+    let sp: u64 = cache_slot_ptr(cache, slot);
+    let h2: u64 = std::runtime::mem::load_u64(sp, CACHE_OFF_HASH);
+    if h2 == 0 {
+      empty_slot = slot;
+      break;
+    }
+    if h2 == hash {
+      let klen: i64 = std::runtime::mem::load_u64(sp, CACHE_OFF_KEY_LEN) as i64;
+      if klen == key_len {
+        if key_len <= 0 {
+          return CacheProbe{ hit_slot: slot, empty_slot: empty_slot };
+        }
+        let kptr: u64 = std::runtime::mem::load_u64(sp, CACHE_OFF_KEY_PTR);
+        if kptr != 0 && key_ptr != 0 && memcmp(kptr, key_ptr, key_len as u64) == 0 {
+          return CacheProbe{ hit_slot: slot, empty_slot: empty_slot };
+        }
+      }
+    }
+    probe = probe + 1;
+  }
+
+  return CacheProbe{ hit_slot: -1, empty_slot: empty_slot };
+}
+
+fn alloc_copy (src_ptr: u64, len: i64) -> u64 {
+  if src_ptr == 0 || len <= 0 {
+    return 0;
+  }
+  let dst: u64 = std::runtime::mem::alloc(len);
+  if dst == 0 {
+    return 0;
+  }
+  let _ = memcpy(dst, src_ptr, len);
+  return dst;
+}
+
+fn cache_free_slot (cache: &IgnoreCache, slot: i64) -> void {
+  if cache.ptr == 0 || cache.cap <= 0 {
+    return;
+  }
+  let sp: u64 = cache_slot_ptr(cache, slot);
+  let h: u64 = std::runtime::mem::load_u64(sp, CACHE_OFF_HASH);
+  if h == 0 {
+    return;
+  }
+
+  let key_ptr: u64 = std::runtime::mem::load_u64(sp, CACHE_OFF_KEY_PTR);
+  if key_ptr != 0 {
+    std::runtime::mem::free(key_ptr);
+  }
+
+  let kind: u64 = std::runtime::mem::load_u64(sp, CACHE_OFF_KIND);
+  if kind == CACHE_KIND_RULES {
+    let cptr: u64 = std::runtime::mem::load_u64(sp, CACHE_OFF_CONTENT_PTR);
+    let rptr: u64 = std::runtime::mem::load_u64(sp, CACHE_OFF_RULES_PTR);
+    if cptr != 0 {
+      std::runtime::mem::free(cptr);
+    }
+    if rptr != 0 {
+      std::runtime::mem::free(rptr);
+    }
+  }
+}
+
+fn cache_choose_evict_slot (mut cache: &IgnoreCache) -> i64 {
+  if cache.ptr == 0 || cache.cap <= 0 {
+    return -1;
+  }
+
+  // Never evict cached rule payloads: the ignore stack can borrow pointers to
+  // cached entries. We only evict "no rules" entries.
+  var slot: i64 = cache.next_evict & cache.mask;
+  var attempts: i64 = 0;
+  while attempts < cache.cap {
+    let sp: u64 = cache_slot_ptr(cache, slot);
+    let kind: u64 = std::runtime::mem::load_u64(sp, CACHE_OFF_KIND);
+    if kind != CACHE_KIND_RULES {
+      cache.next_evict = (slot + 1) & cache.mask;
+      return slot;
+    }
+    slot = (slot + 1) & cache.mask;
+    attempts = attempts + 1;
+  }
+
+  // Cache is full of rule entries; refuse to evict.
+  return -1;
+}
+
+fn cache_insert_entry (
+  mut cache: &IgnoreCache,
+  hash: u64,
+  kind: u64,
+  key_ptr: u64,
+  key_len: i64,
+  content_ptr: u64,
+  content_len: i64,
+  rules_ptr: u64,
+  rules_len: i64,
+  empty_slot: i64
+) -> bool {
+  if cache.ptr == 0 || cache.cap <= 0 {
+    return false;
+  }
+
+  var slot: i64 = empty_slot;
+  if slot < 0 {
+    slot = cache_choose_evict_slot(mut cache);
+    if slot < 0 {
+      return false;
+    }
+    cache_free_slot(cache, slot);
+  }
+
+  let sp: u64 = cache_slot_ptr(cache, slot);
+  std::runtime::mem::store_u64(sp, CACHE_OFF_HASH, hash);
+  std::runtime::mem::store_u64(sp, CACHE_OFF_KIND, kind);
+  std::runtime::mem::store_u64(sp, CACHE_OFF_KEY_PTR, key_ptr);
+  std::runtime::mem::store_u64(sp, CACHE_OFF_KEY_LEN, key_len as u64);
+  std::runtime::mem::store_u64(sp, CACHE_OFF_CONTENT_PTR, content_ptr);
+  std::runtime::mem::store_u64(sp, CACHE_OFF_CONTENT_LEN, content_len as u64);
+  std::runtime::mem::store_u64(sp, CACHE_OFF_RULES_PTR, rules_ptr);
+  std::runtime::mem::store_u64(sp, CACHE_OFF_RULES_LEN, rules_len as u64);
+  return true;
+}
+
+export fn init_cache (slots: int = 16384) -> IgnoreCache {
+  var cap: i64 = slots as i64;
+  if cap < 16 {
+    cap = 16;
+  }
+
+  // Round up to a power of two for fast masking.
+  var p: i64 = 1;
+  while p < cap {
+    p = p * 2;
+  }
+  cap = p;
+
+  let bytes: i64 = cap * CACHE_SLOT_BYTES;
+  let ptr: u64 = std::runtime::mem::alloc(bytes);
+  if ptr == 0 {
+    return IgnoreCache{ ptr: 0, cap: 0, mask: 0, next_evict: 0 };
+  }
+
+  // Zero initialize the table (malloc is not guaranteed to).
+  var off: i64 = 0;
+  while off < bytes {
+    std::runtime::mem::store_u64(ptr, off, 0);
+    off = off + 8;
+  }
+
+  return IgnoreCache{ ptr: ptr, cap: cap, mask: cap - 1, next_evict: 0 };
+}
+
 let DIR_OFF_BASE_LEN: i64 = 0;
 let DIR_OFF_CONTENT_PTR: i64 = 8;
 let DIR_OFF_CONTENT_LEN: i64 = 16;
@@ -89,19 +326,6 @@ struct DirRec {
 export struct IgnoreStack {
   // Packed DirRec records (each record owns `content_ptr` + `rules_ptr`).
   dirs: BufferU8,
-}
-
-fn take_dirs (mut stack: &IgnoreStack) -> BufferU8 {
-  let dirs: BufferU8 = stack.dirs;
-  stack.dirs = BufferU8.empty();
-  return dirs;
-}
-
-fn put_dirs (mut stack: &IgnoreStack, mut dirs: BufferU8) -> void {
-  stack.dirs = dirs;
-  dirs.ptr = 0;
-  dirs.len = 0;
-  dirs.cap = 0;
 }
 
 fn rules_count_len (rules_len: i64) -> i64 {
@@ -320,19 +544,13 @@ fn mmap_append_file (mut content: &BufferU8, mut rules: &BufferU8, path: string)
 
 fn path_truncate (mut path: &PathBuf, new_len: i64) -> void {
   if new_len < 0 {
-    path.len = 0;
-    if path.ptr != 0 {
-      std::runtime::mem::store_u8(path.ptr, 0, 0);
-    }
+    let _ = path.truncate_len(0);
     return;
   }
   if new_len >= path.len {
     return;
   }
-  path.len = new_len;
-  if path.ptr != 0 {
-    std::runtime::mem::store_u8(path.ptr, new_len, 0);
-  }
+  let _ = path.truncate_len(new_len);
 }
 
 fn load_one_ignore_file (
@@ -345,12 +563,77 @@ fn load_one_ignore_file (
   let perr = path.push(name);
   if perr != None {
     path_truncate(mut path, base_len);
-    return true;
+    return false;
   }
   let file_path: string = path.as_string();
   let ok: bool = mmap_append_file(mut content, mut rules, file_path);
   path_truncate(mut path, base_len);
   return ok;
+}
+
+struct DirRulesLoad {
+  // Encoding:
+  // - `code < 0` = failed (OOM during path push, buffer growth, or rule parsing)
+  // - `code == 0` = loaded successfully, but no ignore rules were found
+  // - `code == 1` = ignore rules loaded successfully (owned pointers below)
+  code: int,
+  content_ptr: u64,
+  content_len: i64,
+  rules_ptr: u64,
+  rules_len: i64,
+}
+
+fn load_dir_rules_owned (mut path: &PathBuf, base_len: i64) -> DirRulesLoad {
+  let mut content: BufferU8 = BufferU8.empty();
+  let mut rules: BufferU8 = BufferU8.empty();
+
+  let saved_len: i64 = base_len;
+
+  // Read ignore files for this directory in a stable order.
+  if !load_one_ignore_file(mut content, mut rules, mut path, saved_len, ".gitignore") {
+    content.drop();
+    rules.drop();
+    return DirRulesLoad{ code: -1, content_ptr: 0, content_len: 0, rules_ptr: 0, rules_len: 0 };
+  }
+
+  if !load_one_ignore_file(mut content, mut rules, mut path, saved_len, ".ignore") {
+    content.drop();
+    rules.drop();
+    return DirRulesLoad{ code: -1, content_ptr: 0, content_len: 0, rules_ptr: 0, rules_len: 0 };
+  }
+
+  if !load_one_ignore_file(mut content, mut rules, mut path, saved_len, ".agignore") {
+    content.drop();
+    rules.drop();
+    return DirRulesLoad{ code: -1, content_ptr: 0, content_len: 0, rules_ptr: 0, rules_len: 0 };
+  }
+
+  if rules_count_len(rules.len) <= 0 {
+    content.drop();
+    rules.drop();
+    return DirRulesLoad{ code: 0, content_ptr: 0, content_len: 0, rules_ptr: 0, rules_len: 0 };
+  }
+
+  // Detach owned buffers into raw values.
+  let content_ptr: u64 = content.ptr;
+  let content_len: i64 = content.len;
+  content.ptr = 0;
+  content.len = 0;
+  content.cap = 0;
+
+  let rules_ptr: u64 = rules.ptr;
+  let rules_len: i64 = rules.len;
+  rules.ptr = 0;
+  rules.len = 0;
+  rules.cap = 0;
+
+  return DirRulesLoad{
+    code: 1,
+    content_ptr: content_ptr,
+    content_len: content_len,
+    rules_ptr: rules_ptr,
+    rules_len: rules_len,
+  };
 }
 
 fn is_globstar_segment (ptr: u64, off: i64, len: i64) -> bool {
@@ -631,22 +914,24 @@ fn rule_matches (
   return match_component(pat_ptr, r.pat_len, name_ptr, name_len);
 }
 
-export fn is_ignored (stack: &IgnoreStack, full_path: string, name: string, is_dir: bool) -> bool {
+fn is_ignored_ptr_len_impl (stack: &IgnoreStack, full_ptr: u64, full_len: i64, name_ptr: u64, name_len: i64, is_dir: bool) -> bool {
   if stack.dirs.ptr == 0 || stack.dirs.len <= 0 {
     return false;
   }
 
-  let full_ptr: u64 = std::runtime::mem::string_ptr(full_path);
-  let full_len: i64 = std::runtime::mem::string_len(full_path);
-  let name_ptr: u64 = std::runtime::mem::string_ptr(name);
-  let name_len: i64 = std::runtime::mem::string_len(name);
+  if full_ptr == 0 || full_len <= 0 || name_ptr == 0 || name_len <= 0 {
+    return false;
+  }
 
   let dcount: i64 = dirs_count_len(stack.dirs.len);
   var di: i64 = dcount - 1;
   while di >= 0 {
     let d: DirRec = dirs_get(stack.dirs.ptr, di);
     let rel: slg::buf::ByteSlice = rel_slice(full_ptr, full_len, d.base_len);
-    let rel_slash: bool = rel.ptr != 0 && rel.len > 0 && memchr(rel.ptr, 47, rel.len) != 0;
+    // `rel` is `full_path` relative to the ignore directory. It contains a
+    // slash iff the path has more than one component under that directory.
+    // Since `name` is the basename, `rel.len > name_len` implies a slash.
+    let rel_slash: bool = rel.ptr != 0 && rel.len > name_len;
     let n: i64 = rules_count_len(d.rules_len);
     var i: i64 = n - 1;
     while i >= 0 {
@@ -660,6 +945,18 @@ export fn is_ignored (stack: &IgnoreStack, full_path: string, name: string, is_d
   }
 
   return false;
+}
+
+export fn is_ignored_ptr_len (stack: &IgnoreStack, full_ptr: u64, full_len: i64, name_ptr: u64, name_len: i64, is_dir: bool) -> bool {
+  return is_ignored_ptr_len_impl(stack, full_ptr, full_len, name_ptr, name_len, is_dir);
+}
+
+export fn is_ignored (stack: &IgnoreStack, full_path: string, name: string, is_dir: bool) -> bool {
+  let full_ptr: u64 = std::runtime::mem::string_ptr(full_path);
+  let full_len: i64 = std::runtime::mem::string_len(full_path);
+  let name_ptr: u64 = std::runtime::mem::string_ptr(name);
+  let name_len: i64 = std::runtime::mem::string_len(name);
+  return is_ignored_ptr_len_impl(stack, full_ptr, full_len, name_ptr, name_len, is_dir);
 }
 
 export fn init () -> IgnoreStack {
@@ -684,9 +981,14 @@ fn pop_dirs_to (mut dirs: &BufferU8, mark: i64) -> void {
   var off: i64 = dirs.len - DIR_REC_SIZE;
   while off >= m {
     let content_ptr: u64 = std::runtime::mem::load_u64(dirs.ptr, off + DIR_OFF_CONTENT_PTR);
+    let content_len: i64 = std::runtime::mem::load_u64(dirs.ptr, off + DIR_OFF_CONTENT_LEN) as i64;
     let rules_ptr: u64 = std::runtime::mem::load_u64(dirs.ptr, off + DIR_OFF_RULES_PTR);
-    std::runtime::mem::free(content_ptr);
-    std::runtime::mem::free(rules_ptr);
+    // `content_len < 0` marks a borrowed ignore entry (pointers owned by the
+    // per-thread ignore cache).
+    if content_len >= 0 {
+      std::runtime::mem::free(content_ptr);
+      std::runtime::mem::free(rules_ptr);
+    }
     off = off - DIR_REC_SIZE;
   }
 
@@ -694,15 +996,12 @@ fn pop_dirs_to (mut dirs: &BufferU8, mark: i64) -> void {
 }
 
 export fn pop_to (mut stack: &IgnoreStack, mark: i64) -> void {
-  let mut dirs: BufferU8 = take_dirs(mut stack);
-  pop_dirs_to(mut dirs, mark);
-  put_dirs(mut stack, dirs);
+  pop_dirs_to(mut stack.dirs, mark);
 }
 
 export fn drop_stack (mut stack: &IgnoreStack) -> void {
-  let mut dirs: BufferU8 = take_dirs(mut stack);
-  pop_dirs_to(mut dirs, 0);
-  dirs.drop();
+  pop_dirs_to(mut stack.dirs, 0);
+  stack.dirs.drop();
 }
 
 export fn push_dir (enabled: bool, mut stack: &IgnoreStack, mut path: &PathBuf) -> void {
@@ -711,58 +1010,190 @@ export fn push_dir (enabled: bool, mut stack: &IgnoreStack, mut path: &PathBuf) 
   }
 
   let base_len: i64 = path.len;
-  let mut content: BufferU8 = BufferU8.empty();
-  let mut rules: BufferU8 = BufferU8.empty();
-
-  let saved_len: i64 = path.len;
-
-  // Read ignore files for this directory in a stable order.
-  if !load_one_ignore_file(mut content, mut rules, mut path, saved_len, ".gitignore") {
-    content.drop();
-    rules.drop();
+  let loaded: DirRulesLoad = load_dir_rules_owned(mut path, base_len);
+  if loaded.code != 1 {
     return;
   }
 
-  if !load_one_ignore_file(mut content, mut rules, mut path, saved_len, ".ignore") {
-    content.drop();
-    rules.drop();
-    return;
-  }
-
-  if !load_one_ignore_file(mut content, mut rules, mut path, saved_len, ".agignore") {
-    content.drop();
-    rules.drop();
-    return;
-  }
-
-  if rules_count_len(rules.len) <= 0 {
-    content.drop();
-    rules.drop();
-    return;
-  }
-
-  // Detach the owned buffers into raw values so we can store them in a packed
-  // stack record without relying on self-referential borrows.
-  let content_ptr: u64 = content.ptr;
-  let content_len: i64 = content.len;
-  content.ptr = 0;
-  content.len = 0;
-  content.cap = 0;
-
-  let rules_ptr: u64 = rules.ptr;
-  let rules_len: i64 = rules.len;
-  rules.ptr = 0;
-  rules.len = 0;
-  rules.cap = 0;
-
-  let mut dirs: BufferU8 = take_dirs(mut stack);
-  let ok: bool = dirs_push(mut dirs, base_len, content_ptr, content_len, rules_ptr, rules_len);
-  put_dirs(mut stack, dirs);
+  let ok: bool = dirs_push(
+    mut stack.dirs,
+    base_len,
+    loaded.content_ptr,
+    loaded.content_len,
+    loaded.rules_ptr,
+    loaded.rules_len
+  );
   if !ok {
-    std::runtime::mem::free(content_ptr);
-    std::runtime::mem::free(rules_ptr);
+    std::runtime::mem::free(loaded.content_ptr);
+    std::runtime::mem::free(loaded.rules_ptr);
+  }
+}
+
+export fn push_dir_cached (enabled: bool, mut stack: &IgnoreStack, mut path: &PathBuf, mut cache: &IgnoreCache) -> void {
+  if !enabled {
     return;
+  }
+
+  if cache.ptr == 0 || cache.cap <= 0 {
+    push_dir(true, mut stack, mut path);
+    return;
+  }
+
+  // Use the `PathBuf` bytes directly to avoid allocating a `string` on every
+  // push in ignore-stack rebuilds (hot path in the parallel engine).
+  let key_ptr: u64 = path.ptr;
+  let key_len: i64 = path.len;
+  let hash: u64 = hash_str_ptr_len(key_ptr, key_len);
+  let p: CacheProbe = cache_probe(cache, key_ptr, key_len, hash);
+
+  if p.hit_slot >= 0 {
+    let sp: u64 = cache_slot_ptr(cache, p.hit_slot);
+    let kind: u64 = std::runtime::mem::load_u64(sp, CACHE_OFF_KIND);
+    if kind == CACHE_KIND_NONE {
+      return;
+    }
+
+    let cptr: u64 = std::runtime::mem::load_u64(sp, CACHE_OFF_CONTENT_PTR);
+    let clen: i64 = std::runtime::mem::load_u64(sp, CACHE_OFF_CONTENT_LEN) as i64;
+    let rptr: u64 = std::runtime::mem::load_u64(sp, CACHE_OFF_RULES_PTR);
+    let rlen: i64 = std::runtime::mem::load_u64(sp, CACHE_OFF_RULES_LEN) as i64;
+
+    let base_len: i64 = path.len;
+    // Push a borrowed ignore entry: these pointers remain valid for the
+    // lifetime of the process (cached entries are never evicted).
+    let borrowed_clen: i64 = if clen > 0 { 0 - clen } else { -1 };
+    let _ok: bool = dirs_push(mut stack.dirs, base_len, cptr, borrowed_clen, rptr, rlen);
+    return;
+  }
+
+  // Cache miss: read + parse, and remember the result.
+  let base_len: i64 = path.len;
+  let loaded: DirRulesLoad = load_dir_rules_owned(mut path, base_len);
+  if loaded.code < 0 {
+    // Loading failed (best-effort): do not cache.
+    return;
+  }
+
+  if loaded.code == 0 {
+    // Remember "no rules" so future rebuilds skip syscalls.
+    //
+    // Note: do not cache failures (OOM during path push, buffer growth, or
+    // rule parsing). Those should remain best-effort and retryable.
+    let cur_ptr: u64 = path.ptr;
+    let key_copy: u64 = if key_len > 0 { alloc_copy(cur_ptr, key_len) } else { 0 };
+    if key_len > 0 && key_copy == 0 {
+      // OOM: skip caching so a future attempt can retry.
+      return;
+    }
+    let ok: bool = cache_insert_entry(mut cache, hash, CACHE_KIND_NONE, key_copy, key_len, 0, 0, 0, 0, p.empty_slot);
+    if !ok && key_copy != 0 {
+      std::runtime::mem::free(key_copy);
+    }
+    return;
+  }
+
+  // Loaded ignore rules successfully.
+  //
+  // Prefer inserting the owned payload into the cache and then pushing a
+  // borrowed stack record. This avoids copying potentially large ignore
+  // payloads (especially `.gitignore` at the repo root) during parallel ignore
+  // rebuilds.
+  var cached: bool = false;
+  var key_copy: u64 = 0;
+
+  if key_len > 0 {
+    let cur_ptr: u64 = path.ptr;
+    key_copy = alloc_copy(cur_ptr, key_len);
+    if key_copy != 0 {
+      let ok_cache: bool = cache_insert_entry(
+        mut cache,
+        hash,
+        CACHE_KIND_RULES,
+        key_copy,
+        key_len,
+        loaded.content_ptr,
+        loaded.content_len,
+        loaded.rules_ptr,
+        loaded.rules_len,
+        p.empty_slot
+      );
+      if ok_cache {
+        cached = true;
+      } else {
+        std::runtime::mem::free(key_copy);
+        key_copy = 0;
+      }
+    }
+  } else {
+    let ok_cache: bool = cache_insert_entry(
+      mut cache,
+      hash,
+      CACHE_KIND_RULES,
+      0,
+      0,
+      loaded.content_ptr,
+      loaded.content_len,
+      loaded.rules_ptr,
+      loaded.rules_len,
+      p.empty_slot
+    );
+    if ok_cache {
+      cached = true;
+    }
+  }
+
+  if cached {
+    // Push a borrowed ignore entry: these pointers remain valid for the
+    // lifetime of the process (cached entries are never evicted).
+    let borrowed_clen: i64 = if loaded.content_len > 0 { 0 - loaded.content_len } else { -1 };
+    let _ok: bool = dirs_push(
+      mut stack.dirs,
+      base_len,
+      loaded.content_ptr,
+      borrowed_clen,
+      loaded.rules_ptr,
+      loaded.rules_len
+    );
+    return;
+  }
+
+  // Cache insertion failed: push an owned stack record.
+  let ok: bool = dirs_push(
+    mut stack.dirs,
+    base_len,
+    loaded.content_ptr,
+    loaded.content_len,
+    loaded.rules_ptr,
+    loaded.rules_len
+  );
+  if !ok {
+    std::runtime::mem::free(loaded.content_ptr);
+    std::runtime::mem::free(loaded.rules_ptr);
   }
 }
 
 // NOTE: popping/dropping is handled by `pop_to` / `drop_stack`.
+
+impl IgnoreCache as std::interfaces::Drop {
+  public fn drop (mut self: &IgnoreCache) -> void {
+    if self.ptr == 0 || self.cap <= 0 {
+      self.ptr = 0;
+      self.cap = 0;
+      self.mask = 0;
+      self.next_evict = 0;
+      return;
+    }
+
+    var slot: i64 = 0;
+    while slot < self.cap {
+      cache_free_slot(self, slot);
+      slot = slot + 1;
+    }
+
+    std::runtime::mem::free(self.ptr);
+    self.ptr = 0;
+    self.cap = 0;
+    self.mask = 0;
+    self.next_evict = 0;
+  }
+}

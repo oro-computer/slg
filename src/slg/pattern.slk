@@ -121,6 +121,23 @@ fn is_ascii_upper (b: u8) -> bool {
   return b >= 65 && b <= 90;
 }
 
+fn is_ascii_text (text: string) -> bool {
+  let n: i64 = std::runtime::mem::string_len(text);
+  if n <= 0 {
+    return true;
+  }
+  let ptr: u64 = std::runtime::mem::string_ptr(text);
+  var i: i64 = 0;
+  while i < n {
+    let b: u8 = std::runtime::mem::load_u8(ptr, i);
+    if b >= 128 {
+      return false;
+    }
+    i = i + 1;
+  }
+  return true;
+}
+
 fn ascii_lower (b: u8) -> u8 {
   if is_ascii_upper(b) {
     return b + 32;
@@ -307,9 +324,16 @@ export fn compile (text: string, fixed: bool, ignore_case: bool) -> PatternResul
 
   // Fast path: when the pattern contains no regex metacharacters, regex
   // semantics are identical to a fixed substring search. In that case we can
-  // skip regex compilation and use the fixed matcher (case-sensitive only).
+  // skip regex compilation and use the fixed matcher.
+  //
+  // Notes:
+  // - When `ignore_case` is set, the fixed matcher uses ASCII case-insensitive
+  //   matching (byte-based). Only use the fixed matcher for ignore-case when
+  //   the pattern is ASCII; the runtime regex engine can apply non-ASCII case
+  //   folding rules.
+  let literal: bool = is_literal_regex(text);
   let effective_fixed: bool =
-    fixed || (!ignore_case && is_literal_regex(text));
+    fixed || (literal && (!ignore_case || is_ascii_text(text)));
 
   if effective_fixed {
     return Ok(Pattern{
@@ -385,6 +409,36 @@ export fn next_match (p: &Pattern, line: string, start: i64) -> Match? {
 }
 
 /**
+ * Return the first match at or after `start` within a raw byte span.
+ *
+ * This is a pointer/length variant of `next_match(...)` for hot paths that
+ * already operate on raw bytes (e.g., `mmap`/`read` buffers).
+ *
+ * Notes:
+ * - This currently supports only `PatternKind::Fixed` patterns.
+ * - For `PatternKind::Regex`, callers should use `next_match(...)` with a
+ *   `string` input.
+ */
+export fn next_match_ptr_len (p: &Pattern, ptr: u64, len: i64, start: i64) -> Match? {
+  if ptr == 0 || len <= 0 {
+    return None;
+  }
+  if start < 0 || start > len {
+    return None;
+  }
+  if p.kind != PatternKind::Fixed {
+    return None;
+  }
+
+  let needle_ptr: u64 = std::runtime::mem::string_ptr(p.needle);
+  let needle_len: i64 = std::runtime::mem::string_len(p.needle);
+  if p.ignore_case {
+    return next_fixed_ascii_case_insensitive(ptr, len, needle_ptr, needle_len, start);
+  }
+  return next_fixed_case_sensitive(ptr, len, needle_ptr, needle_len, start);
+}
+
+/**
  * Return whether `line` matches `p`.
  */
 export fn is_match (p: &Pattern, line: string) -> bool {
@@ -412,6 +466,22 @@ test "slg::pattern - fixed ignore-case (ASCII)" {
     Ok(v) => v,
     Err(_) => Pattern{ kind: PatternKind::Fixed, needle: "", ignore_case: true, regex: std::regex::RegExp.empty() },
   };
+
+  let m0: Match? = next_match(p, "--abc--", 0);
+  assert(m0 != None, "expected match");
+  let m: Match = m0 ?? Match{ start: -1, end: -1 };
+  assert(m.start == 2 && m.end == 5, "unexpected match location");
+}
+
+test "slg::pattern - regex literal ignore-case (ASCII) uses fixed" {
+  let p_r: PatternResult = compile("AbC", false, true);
+  assert(p_r.is_ok(), "compile should succeed");
+  let p: Pattern = match (p_r) {
+    Ok(v) => v,
+    Err(_) => Pattern{ kind: PatternKind::Fixed, needle: "", ignore_case: true, regex: std::regex::RegExp.empty() },
+  };
+
+  assert(p.kind == PatternKind::Fixed, "literal regex should use fixed matcher");
 
   let m0: Match? = next_match(p, "--abc--", 0);
   assert(m0 != None, "expected match");
