@@ -22,7 +22,6 @@ import {
   memmem,
   opendir,
 } from "./slg/os.slk";
-import { vararg_string_at } from "./slg/varargs.slk";
 
 async fn run_cfg (cfg: Config) -> int {
   if cfg.help {
@@ -147,8 +146,7 @@ fn argv_alloc (...args: string) -> ArgvOwned? {
 
   var i: int = 0;
   while i < argc {
-    let s_opt: string? = vararg_string_at(i, args);
-    let s: string = s_opt ?? "";
+    let s: string = args[i];
 
     let p: u64 = cstr_alloc(s);
     if p == 0 {

@@ -87,7 +87,7 @@ Note: these names are also hidden; use \fB--hidden\fR to traverse them.
 .TP
 .BR -j ", " --jobs " " \fIn\fR
 Parallel tasks.
-\fB0\fR means auto (use available CPUs, clamped to a hard safety limit).
+\fB0\fR means auto (use available CPUs, capped to 9 by default, and clamped to a hard safety limit).
 \fBauto\fR is accepted as an alias for \fB0\fR.
 \fB1\fR forces single-threaded mode.
 Note: worker tasks spawn OS threads in this snapshot.

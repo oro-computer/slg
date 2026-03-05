@@ -80,7 +80,7 @@ slg --follow "TODO" .
 slg --max-depth 2 "TODO" .
 
 # Parallelism control:
-#   --jobs 0|auto = auto (default), --jobs 1 = single-threaded, --no-parallel = --jobs 1
+#   --jobs 0|auto = auto (default; capped to 9), --jobs 1 = single-threaded, --no-parallel = --jobs 1
 #   --threads is an alias for --jobs
 #   --max-workers 0 = no cap (default; capped by --jobs-1), --max-workers >= 1 caps worker tasks (clamped to 1023)
 #   --split-depth 0|auto = auto (default), --split-depth 1..8 bounds how deep the orchestrator splits directory subtrees into jobs

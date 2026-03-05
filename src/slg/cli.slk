@@ -6,7 +6,6 @@ import std::runtime::mem;
 import { write_str } from "./out.slk";
 import { ColorMode, parse_mode } from "./color.slk";
 import { NAME, VERSION } from "./version.slk";
-import { vararg_string_at } from "./varargs.slk";
 
 // Hard safety limits for the task-based parallel engine.
 //
@@ -133,15 +132,7 @@ export struct Config {
   max_count: int,
 
   // Colors.
-  // Encoding:
-  // - 0 = auto
-  // - 1 = always
-  // - 2 = never
-  //
-  // NOTE: Storing `ColorMode` directly here currently triggers a backend
-  // lowering bug when `Config` is exported and this module exports functions.
-  // Keep it as an `int` until the toolchain fixes cross-module enum fields.
-  color_mode: int,
+  color_mode: ColorMode,
 
   // Meta.
   help: bool,
@@ -169,14 +160,6 @@ impl Config {
     return Some(self.args.get(self.paths_start + index));
   }
 
-}
-
-fn color_mode_code (m: ColorMode) -> int {
-  return match (m) {
-    ColorMode::Auto => 0,
-    ColorMode::Always => 1,
-    ColorMode::Never => 2,
-  };
 }
 
 fn usage_text () -> string {
@@ -221,7 +204,7 @@ TRAVERSAL OPTIONS:
       --no-ignore-files     Do not read .gitignore/.ignore/.agignore ignore files
 
 PARALLELISM:
-  -j, --jobs <n>            Parallel tasks (0|auto = auto, 1 = single-threaded, max: 1024)
+  -j, --jobs <n>            Parallel tasks (0|auto = auto (default; capped to 9), 1 = single-threaded, max: 1024)
                             Note: worker tasks spawn OS threads in this snapshot.
       --threads <n>         Alias for --jobs
       --max-workers <n>     Cap worker tasks (0 = no cap, default: 0, max effective: 1023)
@@ -278,8 +261,7 @@ export fn print_help () -> void {
 fn print_error (...parts: string) -> void {
   var i: int = 0;
   while i < parts.len {
-    let s_opt: string? = vararg_string_at(i, parts);
-    let s: string = s_opt ?? "";
+    let s: string = parts[i];
     let _ = write_str(2, s);
     i = i + 1;
   }
@@ -1173,40 +1155,40 @@ export fn parse_cli (args: Args) -> Config? {
   }
 
   return Some(Config{
-      args: args,
-      mode: mode,
-      pattern: pattern,
-      paths_start: paths_start,
-      paths_count: paths_count,
-      fixed_string: fixed_string,
-      ignore_case: ignore_case,
-      hidden: hidden,
-      follow: follow,
-      max_depth: max_depth,
-      ignore_common: ignore_common,
-      ignore_vcs: ignore_vcs,
-      ignore_files: ignore_files,
-      jobs: jobs,
-      max_workers: max_workers,
-      split_depth: split_depth,
-      queue_cap: queue_cap,
-      target_jobs: target_jobs,
-      max_jobs_total: max_jobs_total,
-      file_jobs: file_jobs,
-      file_batch: file_batch,
-      parallel_files: parallel_files,
-      text: text,
-      files_with_matches: files_with_matches,
-      heading: heading,
-      line_number: line_number,
-      column: column,
-      stats: stats,
-      quiet: quiet,
-      max_count: max_count,
-      color_mode: color_mode_code(color_mode),
-      help: help,
-      version: version,
-    });
+    args: args,
+    mode: mode,
+    pattern: pattern,
+    paths_start: paths_start,
+    paths_count: paths_count,
+    fixed_string: fixed_string,
+    ignore_case: ignore_case,
+    hidden: hidden,
+    follow: follow,
+    max_depth: max_depth,
+    ignore_common: ignore_common,
+    ignore_vcs: ignore_vcs,
+    ignore_files: ignore_files,
+    jobs: jobs,
+    max_workers: max_workers,
+    split_depth: split_depth,
+    queue_cap: queue_cap,
+    target_jobs: target_jobs,
+    max_jobs_total: max_jobs_total,
+    file_jobs: file_jobs,
+    file_batch: file_batch,
+    parallel_files: parallel_files,
+    text: text,
+    files_with_matches: files_with_matches,
+    heading: heading,
+    line_number: line_number,
+    column: column,
+    stats: stats,
+    quiet: quiet,
+    max_count: max_count,
+    color_mode: color_mode,
+    help: help,
+    version: version,
+  });
 }
 
 /**
