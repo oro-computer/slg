@@ -27,11 +27,11 @@ export enum Mode {
  *
  * This struct keeps string data borrowed from `argv`:
  * - `args` is a view into `argv` memory (no allocation),
- * - `pattern` refers to an argument string,
- * - `paths_*` refers to a compacted slice of the argv pointer list.
+ * - `pattern` refers directly to the matching positional argument.
  *
- * During parsing, `slg` rewrites only the argv pointer list (not the string
- * bytes) so path arguments stay contiguous even when flags are interleaved.
+ * Root paths are re-discovered from the validated `args` view on demand, which
+ * lets option flags appear before or after positional arguments without extra
+ * allocations.
  */
 export struct Config {
   // argv view
@@ -43,8 +43,7 @@ export struct Config {
   // Search query (Mode::Search only).
   pattern: string?,
 
-  // Root path arguments (indices into `args`).
-  paths_start: int,
+  // Number of root path arguments.
   paths_count: int,
 
   // Matching.
@@ -139,6 +138,15 @@ export struct Config {
   version: bool,
 }
 
+export struct PathIter {
+  args: Args,
+  mode: Mode,
+  argc: int,
+  i: int,
+  end_flags: bool,
+  saw_pattern: bool,
+}
+
 impl Config {
   /**
    * Return the number of configured root paths.
@@ -157,9 +165,60 @@ impl Config {
       return None;
     }
 
-    return Some(self.args.get(self.paths_start + index));
+    let mut paths: PathIter = self.paths();
+    var i: int = 0;
+    while i <= index {
+      let path_opt: string? = paths.next();
+      if i == index {
+        return path_opt;
+      }
+      i = i + 1;
+    }
+    return None;
   }
 
+  public fn paths (self: &Config) -> PathIter {
+    return PathIter{
+      args: self.args,
+      mode: self.mode,
+      argc: self.args.count(),
+      i: 1,
+      end_flags: false,
+      saw_pattern: false,
+    };
+  }
+
+}
+
+impl PathIter {
+  public fn next (mut self: &PathIter) -> string? {
+    while self.i < self.argc {
+      let a: string = self.args.get(self.i);
+
+      if !self.end_flags && is_flag(a) && a != "-" {
+        if a == "--" {
+          self.end_flags = true;
+          self.i = self.i + 1;
+          continue;
+        }
+        if flag_consumes_next_arg(a) {
+          self.i = self.i + 2;
+          continue;
+        }
+        self.i = self.i + 1;
+        continue;
+      }
+
+      self.i = self.i + 1;
+      if self.mode == Mode::Search && !self.saw_pattern {
+        self.saw_pattern = true;
+        continue;
+      }
+      return Some(a);
+    }
+
+    return None;
+  }
 }
 
 fn usage_text () -> string {
@@ -171,7 +230,8 @@ USAGE:
   slg --files [options] [path ...]
 
 NOTES:
-  Options may appear before or after <pattern> and [path ...].
+  Options may appear before or after positional arguments.
+  In search mode, the first positional is <pattern> and later positionals are <path> values.
   Use `--` to end option parsing (useful for patterns or paths starting with '-').
   Exit status: 0 match found (or --files), 1 no match, 2 error.
 
@@ -411,8 +471,68 @@ fn parse_int_or_auto (s: string) -> int? {
   return parse_int(s);
 }
 
-fn argv_set_ptr (args: &Args, index: int, ptr: u64) -> void {
-  std::runtime::mem::store_u64(args.argv, (index * 8) as i64, ptr);
+fn flag_consumes_next_arg (a: string) -> bool {
+  return a == "-m" ||
+    a == "--max-count" ||
+    a == "--max-depth" ||
+    a == "-j" ||
+    a == "--jobs" ||
+    a == "--threads" ||
+    a == "--max-workers" ||
+    a == "--split-depth" ||
+    a == "--queue-cap" ||
+    a == "--target-jobs" ||
+    a == "--max-jobs-total" ||
+    a == "--file-batch" ||
+    a == "--color";
+}
+
+struct PositionalScan {
+  pattern: string?,
+  paths_count: int,
+  nth_path: string?,
+}
+
+fn scan_positionals (args: &Args, mode: Mode, target_path_index: int) -> PositionalScan {
+  let argc: int = args.count();
+  var i: int = 1;
+  var end_flags: bool = false;
+  var scan: PositionalScan = PositionalScan{
+    pattern: None,
+    paths_count: 0,
+    nth_path: None,
+  };
+
+  while i < argc {
+    let a: string = args.get(i);
+
+    if !end_flags && is_flag(a) && a != "-" {
+      if a == "--" {
+        end_flags = true;
+        i = i + 1;
+        continue;
+      }
+      if flag_consumes_next_arg(a) {
+        i = i + 2;
+        continue;
+      }
+      i = i + 1;
+      continue;
+    }
+
+    if mode == Mode::Search && scan.pattern == None {
+      scan.pattern = Some(a);
+    } else {
+      if scan.paths_count == target_path_index {
+        scan.nth_path = Some(a);
+      }
+      scan.paths_count = scan.paths_count + 1;
+    }
+
+    i = i + 1;
+  }
+
+  return scan;
 }
 
 /**
@@ -457,10 +577,7 @@ export fn parse_cli (args: Args) -> Config? {
   var i: int = 1;
   var end_flags: bool = false;
   var pattern: string? = None;
-  var pattern_index: int = -1;
-  var paths_start: int = 0;
   var paths_count: int = 0;
-  var path_write: int = 0;
 
   while i < argc {
     let a: string = args.get(i);
@@ -486,14 +603,6 @@ export fn parse_cli (args: Args) -> Config? {
       }
 
       if a == "--files" {
-        if mode != Mode::Files && pattern != None && pattern_index >= 0 {
-          paths_start = pattern_index;
-          path_write = pattern_index + 1 + paths_count;
-          paths_count = paths_count + 1;
-          pattern = None;
-          pattern_index = -1;
-        }
-
         mode = Mode::Files;
         i = i + 1;
         continue;
@@ -1079,32 +1188,13 @@ export fn parse_cli (args: Args) -> Config? {
       print_error("slg: unknown flag: ", a, ". Try: slg --help");
       return None;
     }
-
-    // Search mode: first positional is the pattern.
-    if mode == Mode::Search && pattern == None {
-      pattern = Some(a);
-      pattern_index = i;
-      i = i + 1;
-      continue;
-    }
-
-    // Remaining positionals are root paths.
-    if paths_count <= 0 {
-      if mode == Mode::Search && pattern_index >= 0 {
-        paths_start = pattern_index + 1;
-      } else {
-        paths_start = i;
-      }
-
-      path_write = paths_start;
-    }
-
-    argv_set_ptr(&args, path_write, args.ptr(i));
-    path_write = path_write + 1;
-    paths_count = paths_count + 1;
-
     i = i + 1;
   }
+
+  // Classify positional arguments using the final parsing mode.
+  let scan: PositionalScan = scan_positionals(&args, mode, -1);
+  pattern = scan.pattern;
+  paths_count = scan.paths_count;
 
   if mode == Mode::Search && pattern == None && !help && !version {
     print_error("slg: missing <pattern>. Try: ", "slg --help");
@@ -1158,7 +1248,6 @@ export fn parse_cli (args: Args) -> Config? {
     args: args,
     mode: mode,
     pattern: pattern,
-    paths_start: paths_start,
     paths_count: paths_count,
     fixed_string: fixed_string,
     ignore_case: ignore_case,

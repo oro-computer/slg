@@ -10,7 +10,7 @@ import std::task;
 import std::vector;
 
 import { BufferU8 } from "./buf.slk";
-import { Config, MAX_JOBS_HARD, Mode } from "./cli.slk";
+import { Config, MAX_JOBS_HARD, Mode, PathIter } from "./cli.slk";
 import {
   BOLD,
   ColorMode,
@@ -4216,20 +4216,15 @@ export async fn run_parallel (cfg: Config) -> int {
   let mut sched: ScheduleCounter = ScheduleCounter{ scheduled_units: 0, enqueued_jobs: 0 };
 
   // Walk roots, enqueueing subtree jobs.
-  let n: int = cfg.path_count();
-  var root_end: int = 1;
-  if n > 0 {
-    root_end = n;
-  }
-
-  var root_i: int = 0;
+  let mut roots: PathIter = cfg.paths();
+  let first_root_opt: string? = roots.next();
   var stop_roots: bool = false;
-  while root_i < root_end && !stop_roots {
-    var root: string = ".";
-    if n > 0 {
-      let root_opt: string? = cfg.path_at(root_i);
-      root = root_opt ?? ".";
-    }
+  var root_opt: string? = first_root_opt;
+  if root_opt == None {
+    root_opt = Some(".");
+  }
+  while root_opt != None && !stop_roots {
+    let root: string = root_opt ?? ".";
 
     var open_root: string = root;
     if open_root == "" { open_root = "."; }
@@ -4276,7 +4271,7 @@ export async fn run_parallel (cfg: Config) -> int {
       }
     }
 
-    root_i = root_i + 1;
+    root_opt = roots.next();
   }
 
   // No more jobs will be produced.
@@ -4433,25 +4428,24 @@ export fn run (cfg: Config) -> int {
   var found_any: bool = false;
 
   if mode == Mode::Files {
-    let n: int = cfg.path_count();
-    if n <= 0 {
+    let mut roots: PathIter = cfg.paths();
+    let first_root_opt: string? = roots.next();
+    if first_root_opt == None {
       let o: Outcome = handle_root_files(cfg, ".", &io, mut out, mut err, mut stats);
       if o.stop {
         found_any = true;
       }
     } else {
-      var i: int = 0;
       var stop_roots: bool = false;
-      while i < n && !stop_roots {
-        let root_opt: string? = cfg.path_at(i);
+      var root_opt: string? = first_root_opt;
+      while root_opt != None && !stop_roots {
         let root: string = root_opt ?? ".";
         let o: Outcome = handle_root_files(cfg, root, &io, mut out, mut err, mut stats);
         if o.stop {
           found_any = true;
           stop_roots = true;
         }
-
-        i = i + 1;
+        root_opt = roots.next();
       }
     }
   } else {
@@ -4478,17 +4472,17 @@ export fn run (cfg: Config) -> int {
       None => BufferU8.empty(),
     };
 
-    let n: int = cfg.path_count();
-    if n <= 0 {
+    let mut roots: PathIter = cfg.paths();
+    let first_root_opt: string? = roots.next();
+    if first_root_opt == None {
       let o: Outcome = handle_root_search(cfg, &pat, ".", mut scratch, &io, mut out, mut err, mut stats);
       if o.found {
         found_any = true;
       }
     } else {
-      var i: int = 0;
       var stop_roots: bool = false;
-      while i < n && !stop_roots {
-        let root_opt: string? = cfg.path_at(i);
+      var root_opt: string? = first_root_opt;
+      while root_opt != None && !stop_roots {
         let root: string = root_opt ?? ".";
         let o: Outcome = handle_root_search(cfg, &pat, root, mut scratch, &io, mut out, mut err, mut stats);
         if o.found {
@@ -4499,8 +4493,7 @@ export fn run (cfg: Config) -> int {
           found_any = true;
           stop_roots = true;
         }
-
-        i = i + 1;
+        root_opt = roots.next();
       }
     }
 

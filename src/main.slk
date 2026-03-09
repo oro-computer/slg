@@ -1047,6 +1047,81 @@ test "slg e2e - hidden files require --hidden" {
   av2.drop();
 }
 
+test "slg e2e - search options may follow pattern and paths" {
+  let av_opt: ArgvOwned? = argv_alloc("slg", "-F", "needle_hidden", "testdata/basic", "--hidden");
+  assert(av_opt != None, "argv alloc failed");
+  let mut av: ArgvOwned = av_opt ?? ArgvOwned{ argc: 0, argv: 0 };
+
+  let args: Args = Args.init(av.argc, av.argv);
+  let cfg_opt: Config? = parse_cli(args);
+  assert(cfg_opt != None, "parse_cli should succeed");
+
+  let cap_opt: Capture? = match (cfg_opt) {
+    Some(cfg) => await capture_stdout_run_cfg(cfg),
+    None => None,
+  };
+  assert(cap_opt != None, "capture failed");
+  let mut cap: Capture = cap_opt ?? Capture{ code: 2, out: BufferU8.empty() };
+
+  assert(cap.code == 0, "expected exit code 0");
+  let out_s: string = buffer_as_string(cap.out);
+  assert(contains(out_s, ".hidden.txt"), "expected hidden file path in output");
+  assert(contains(out_s, "needle_hidden"), "expected hidden match text in output");
+
+  cap.drop();
+  av.drop();
+}
+
+test "slg e2e - --files may follow positional paths" {
+  let av_opt: ArgvOwned? = argv_alloc("slg", "testdata/basic", "--files", "--hidden");
+  assert(av_opt != None, "argv alloc failed");
+  let mut av: ArgvOwned = av_opt ?? ArgvOwned{ argc: 0, argv: 0 };
+
+  let args: Args = Args.init(av.argc, av.argv);
+  let cfg_opt: Config? = parse_cli(args);
+  assert(cfg_opt != None, "parse_cli should succeed");
+
+  let cap_opt: Capture? = match (cfg_opt) {
+    Some(cfg) => await capture_stdout_run_cfg(cfg),
+    None => None,
+  };
+  assert(cap_opt != None, "capture failed");
+  let mut cap: Capture = cap_opt ?? Capture{ code: 2, out: BufferU8.empty() };
+
+  assert(cap.code == 0, "expected exit code 0");
+  let out_s: string = buffer_as_string(cap.out);
+  assert(contains(out_s, "testdata/basic/.hidden.txt"), "expected hidden file in file list");
+  assert(contains(out_s, "testdata/basic/a.txt"), "expected a.txt in file list");
+
+  cap.drop();
+  av.drop();
+}
+
+test "slg e2e - value-taking options may follow positional paths" {
+  let av_opt: ArgvOwned? = argv_alloc("slg", "testdata/basic", "--files", "--max-depth", "0");
+  assert(av_opt != None, "argv alloc failed");
+  let mut av: ArgvOwned = av_opt ?? ArgvOwned{ argc: 0, argv: 0 };
+
+  let args: Args = Args.init(av.argc, av.argv);
+  let cfg_opt: Config? = parse_cli(args);
+  assert(cfg_opt != None, "parse_cli should succeed");
+
+  let cap_opt: Capture? = match (cfg_opt) {
+    Some(cfg) => await capture_stdout_run_cfg(cfg),
+    None => None,
+  };
+  assert(cap_opt != None, "capture failed");
+  let mut cap: Capture = cap_opt ?? Capture{ code: 2, out: BufferU8.empty() };
+
+  assert(cap.code == 0, "expected exit code 0");
+  let out_s: string = buffer_as_string(cap.out);
+  assert(contains(out_s, "testdata/basic/a.txt"), "expected a.txt in file list");
+  assert(!contains(out_s, "testdata/basic/sub/b.txt"), "max-depth 0 should skip nested files");
+
+  cap.drop();
+  av.drop();
+}
+
 test "slg e2e - --files lists searchable files" {
   let av_opt: ArgvOwned? = argv_alloc("slg", "--files", "testdata/basic");
   assert(av_opt != None, "argv alloc failed");

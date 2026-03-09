@@ -16,7 +16,8 @@ By default, \fIpattern\fR is a regular expression (Silk runtime regex).
 With \fB-F\fR/\fB--fixed-string\fR, \fIpattern\fR is treated as a literal byte substring (fast path).
 Aliases for fixed-string mode include \fB-Q\fR/\fB--literal\fR and \fB--fixed-strings\fR.
 .PP
-Options may appear before or after \fIpattern\fR and \fIpath\fR values.
+Options may appear before or after positional arguments.
+In search mode, the first positional argument is \fIpattern\fR and any later positional arguments are treated as \fIpath\fR values.
 If no paths are provided, \fBslg\fR searches the current directory (\fB.\fR).
 .PP
 Use

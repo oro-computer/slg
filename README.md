@@ -37,7 +37,8 @@ slg --files [options] [path ...]
 ```
 
 Argument parsing:
-- Options may appear before or after `<pattern>` and `[path ...]`.
+- Options may appear before or after positional arguments.
+- In search mode, the first positional is `<pattern>` and any later positional arguments are treated as paths.
 - Use `--` to end option parsing (useful for patterns or paths starting with `-`).
 
 Exit status:
