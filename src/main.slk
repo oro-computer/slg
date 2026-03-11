@@ -9,7 +9,7 @@ import std::runtime::posix::io;
 import { Config, MAX_JOBS_HARD, parse_cli, print_help, print_version } from "./slg/cli.slk";
 import { run_auto } from "./slg/engine.slk";
 import { BufferU8 } from "./slg/buf.slk";
-import { dup, memcpy, memmem } from "./slg/os.slk";
+import { closedir, dup, memcpy, memmem, opendir } from "./slg/os.slk";
 import { vararg_string_at } from "./slg/varargs.slk";
 
 async fn run_cfg (cfg: Config) -> int {
@@ -212,6 +212,62 @@ fn write_all_fd (fd: int, ptr: u64, len: i64) -> bool {
       return false;
     }
     off = off + (n as i64);
+  }
+  return true;
+}
+
+fn write_text_file (path: string, content: string) -> bool {
+  let fd: int =
+  std::runtime::posix::fs::open(
+    path,
+    std::runtime::posix::fs::O_WRONLY | std::runtime::posix::fs::O_CREAT | std::runtime::posix::fs::O_TRUNC,
+    420 // 0644
+  ) as int;
+  if fd < 0 {
+    return false;
+  }
+
+  let ptr: u64 = std::runtime::mem::string_ptr(content);
+  let len: i64 = std::runtime::mem::string_len(content);
+  let ok: bool = write_all_fd(fd, ptr, len);
+  let _ = std::runtime::posix::fs::close(fd);
+  return ok;
+}
+
+fn ensure_dir_exists (path: string) -> bool {
+  let rc: int = std::runtime::posix::fs::mkdir(path, 493) as int; // 0755
+  if rc == 0 {
+    return true;
+  }
+  let dir: u64 = opendir(path);
+  if dir == 0 {
+    return false;
+  }
+  let _ = closedir(dir);
+  return true;
+}
+
+fn prepare_ignore_fixture () -> bool {
+  if !write_text_file("testdata/ignore/ignored.txt", "ignored by .gitignore\n") {
+    return false;
+  }
+  if !write_text_file("testdata/ignore/a.log", "glob ignored log file\n") {
+    return false;
+  }
+  if !write_text_file("testdata/ignore/anchored.txt", "anchored ignore file\n") {
+    return false;
+  }
+  if !write_text_file("testdata/ignore/deep.txt", "globstar ignored at root\n") {
+    return false;
+  }
+  if !write_text_file("testdata/ignore/sub/deep.txt", "globstar ignored in subdir\n") {
+    return false;
+  }
+  if !ensure_dir_exists("testdata/ignore/ignored_dir") {
+    return false;
+  }
+  if !write_text_file("testdata/ignore/ignored_dir/x.txt", "ignored directory child\n") {
+    return false;
   }
   return true;
 }
@@ -620,6 +676,93 @@ test "slg e2e - `--` allows patterns starting with '-'" {
   av.drop();
 }
 
+test "slg cli - flags may appear after the pattern" {
+  let av_opt: ArgvOwned? = argv_alloc("slg", "foo", "-l");
+  assert(av_opt != None, "argv alloc failed");
+  let mut av: ArgvOwned = av_opt ?? ArgvOwned{ argc: 0, argv: 0 };
+
+  let args: Args = Args.init(av.argc, av.argv);
+  let cfg_opt: Config? = parse_cli(args);
+  assert(cfg_opt != None, "parse_cli should succeed");
+
+  let Some(cfg) = cfg_opt else {
+    assert(false, "config should exist");
+    av.drop();
+    return;
+  };
+
+  let pat: string = cfg.pattern ?? "";
+  assert(pat == "foo", "expected the first positional to stay the pattern");
+  assert(cfg.files_with_matches, "expected trailing -l to be parsed as a flag");
+  assert(cfg.path_count() == 0, "expected no explicit root paths");
+
+  av.drop();
+}
+
+test "slg e2e - trailing flags after paths preserve explicit roots" {
+  let av_opt: ArgvOwned? = argv_alloc("slg", "-F", "TODO", "testdata/basic", "-l");
+  assert(av_opt != None, "argv alloc failed");
+  let mut av: ArgvOwned = av_opt ?? ArgvOwned{ argc: 0, argv: 0 };
+
+  let args: Args = Args.init(av.argc, av.argv);
+  let cfg_opt: Config? = parse_cli(args);
+  assert(cfg_opt != None, "parse_cli should succeed");
+
+  let Some(cfg) = cfg_opt else {
+    assert(false, "config should exist");
+    av.drop();
+    return;
+  };
+
+  let root: string = cfg.path_at(0) ?? "";
+  assert(root == "testdata/basic", "expected the explicit path to be preserved");
+
+  let cap_opt: Capture? = await capture_stdout_run_cfg(cfg);
+  assert(cap_opt != None, "capture failed");
+  let mut cap: Capture = cap_opt ?? Capture{ code: 2, out: BufferU8.empty() };
+
+  assert(cap.code == 0, "expected exit code 0 (match found)");
+  let out_s: string = buffer_as_string(cap.out);
+  assert(contains(out_s, "testdata/basic/a.txt"), "expected the matching file path in output");
+  assert(!contains(out_s, "TODO: visible match"), "expected -l to suppress matched line content");
+  assert(!contains(out_s, "testdata/basic/sub/b.txt"), "expected only matching files to be printed");
+
+  cap.drop();
+  av.drop();
+}
+
+test "slg e2e - --files may appear after a path" {
+  let av_opt: ArgvOwned? = argv_alloc("slg", "testdata/basic", "--files");
+  assert(av_opt != None, "argv alloc failed");
+  let mut av: ArgvOwned = av_opt ?? ArgvOwned{ argc: 0, argv: 0 };
+
+  let args: Args = Args.init(av.argc, av.argv);
+  let cfg_opt: Config? = parse_cli(args);
+  assert(cfg_opt != None, "parse_cli should succeed");
+
+  let Some(cfg) = cfg_opt else {
+    assert(false, "config should exist");
+    av.drop();
+    return;
+  };
+
+  let root: string = cfg.path_at(0) ?? "";
+  assert(root == "testdata/basic", "expected the earlier positional to become a path");
+
+  let cap_opt: Capture? = await capture_stdout_run_cfg(cfg);
+  assert(cap_opt != None, "capture failed");
+  let mut cap: Capture = cap_opt ?? Capture{ code: 2, out: BufferU8.empty() };
+
+  assert(cap.code == 0, "expected exit code 0 for --files");
+  let out_s: string = buffer_as_string(cap.out);
+  assert(contains(out_s, "testdata/basic/a.txt"), "expected a.txt in file listing");
+  assert(contains(out_s, "testdata/basic/sub/b.txt"), "expected b.txt in file listing");
+  assert(!contains(out_s, "TODO: visible match"), "expected --files mode to list paths only");
+
+  cap.drop();
+  av.drop();
+}
+
 test "slg e2e - --jobs 1 forces single-threaded" {
   let av_opt: ArgvOwned? = argv_alloc("slg", "--jobs=1", "-F", "TODO", "testdata/basic");
   assert(av_opt != None, "argv alloc failed");
@@ -835,6 +978,8 @@ test "slg e2e - --files lists searchable files" {
 }
 
 test "slg e2e - ignore files are respected" {
+  assert(prepare_ignore_fixture(), "ignore fixture setup failed");
+
   // With ignore files enabled (default): ignored paths should be skipped.
   let av1_opt: ArgvOwned? = argv_alloc("slg", "--files", "testdata/ignore");
   assert(av1_opt != None, "argv alloc failed");
@@ -875,11 +1020,14 @@ test "slg e2e - ignore files are respected" {
   let args2: Args = Args.init(av2.argc, av2.argv);
   let cfg2_opt: Config? = parse_cli(args2);
   assert(cfg2_opt != None, "parse_cli should succeed");
-
-  let cap2_opt: Capture? = match (cfg2_opt) {
-    Some(cfg) => await capture_stdout_run_cfg(cfg),
-    None => None,
+  let Some(cfg2) = cfg2_opt else {
+    assert(false, "config should exist");
+    av2.drop();
+    return;
   };
+  assert(!cfg2.ignore_files, "expected --no-ignore-files to disable ignore files in config");
+
+  let cap2_opt: Capture? = await capture_stdout_run_cfg(cfg2);
   assert(cap2_opt != None, "capture failed");
   let mut cap2: Capture = cap2_opt ?? Capture{ code: 2, out: BufferU8.empty() };
 
@@ -897,6 +1045,8 @@ test "slg e2e - ignore files are respected" {
 }
 
 test "slg e2e - --no-ignore disables ignore rules" {
+  assert(prepare_ignore_fixture(), "ignore fixture setup failed");
+
   let av_opt: ArgvOwned? = argv_alloc("slg", "--files", "--no-ignore", "testdata/ignore");
   assert(av_opt != None, "argv alloc failed");
   let mut av: ArgvOwned = av_opt ?? ArgvOwned{ argc: 0, argv: 0 };
@@ -904,11 +1054,16 @@ test "slg e2e - --no-ignore disables ignore rules" {
   let args: Args = Args.init(av.argc, av.argv);
   let cfg_opt: Config? = parse_cli(args);
   assert(cfg_opt != None, "parse_cli should succeed");
-
-  let cap_opt: Capture? = match (cfg_opt) {
-    Some(cfg) => await capture_stdout_run_cfg(cfg),
-    None => None,
+  let Some(cfg) = cfg_opt else {
+    assert(false, "config should exist");
+    av.drop();
+    return;
   };
+  assert(!cfg.ignore_common, "expected --no-ignore to disable common directory ignores");
+  assert(!cfg.ignore_vcs, "expected --no-ignore to disable VCS ignores");
+  assert(!cfg.ignore_files, "expected --no-ignore to disable ignore files");
+
+  let cap_opt: Capture? = await capture_stdout_run_cfg(cfg);
   assert(cap_opt != None, "capture failed");
   let mut cap: Capture = cap_opt ?? Capture{ code: 2, out: BufferU8.empty() };
 
@@ -922,6 +1077,8 @@ test "slg e2e - --no-ignore disables ignore rules" {
 }
 
 test "slg e2e - --ignore re-enables ignore behavior" {
+  assert(prepare_ignore_fixture(), "ignore fixture setup failed");
+
   let av_opt: ArgvOwned? = argv_alloc("slg", "--files", "--no-ignore", "--ignore", "testdata/ignore");
   assert(av_opt != None, "argv alloc failed");
   let mut av: ArgvOwned = av_opt ?? ArgvOwned{ argc: 0, argv: 0 };
@@ -947,6 +1104,8 @@ test "slg e2e - --ignore re-enables ignore behavior" {
 }
 
 test "slg e2e - --ignore-files re-enables ignore files after --no-ignore" {
+  assert(prepare_ignore_fixture(), "ignore fixture setup failed");
+
   let av_opt: ArgvOwned? = argv_alloc("slg", "--files", "--no-ignore", "--ignore-files", "testdata/ignore");
   assert(av_opt != None, "argv alloc failed");
   let mut av: ArgvOwned = av_opt ?? ArgvOwned{ argc: 0, argv: 0 };

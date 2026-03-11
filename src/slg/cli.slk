@@ -25,12 +25,13 @@ export enum Mode {
 /**
  * Parsed CLI configuration for `slg`.
  *
- * This struct is intentionally “borrow-only”:
+ * This struct keeps string data borrowed from `argv`:
  * - `args` is a view into `argv` memory (no allocation),
- * - `pattern` and the `paths_*` indices refer to argument strings.
+ * - `pattern` refers to an argument string,
+ * - `paths_*` refers to a compacted slice of the argv pointer list.
  *
- * This keeps startup fast and avoids depending on `std::vector` /
- * `std::strings::String` for basic argument plumbing.
+ * During parsing, `slg` rewrites only the argv pointer list (not the string
+ * bytes) so path arguments stay contiguous even when flags are interleaved.
  */
 export struct Config {
   // argv view
@@ -185,8 +186,8 @@ USAGE:
   slg --files [options] [path ...]
 
 NOTES:
-  Options must appear before <pattern> (flags after the pattern are treated as paths).
-  Use `--` to end option parsing (useful for patterns starting with '-').
+  Options may appear before or after <pattern> and [path ...].
+  Use `--` to end option parsing (useful for patterns or paths starting with '-').
   Exit status: 0 match found (or --files), 1 no match, 2 error.
 
 PATTERN:
@@ -409,6 +410,10 @@ fn parse_int_or_auto (s: string) -> int? {
   return parse_int(s);
 }
 
+fn argv_set_ptr (args: &Args, index: int, ptr: u64) -> void {
+  std::runtime::mem::store_u64(args.argv, (index * 8) as i64, ptr);
+}
+
 /**
  * Parse argv into a `Config`.
  *
@@ -451,8 +456,10 @@ export fn parse_cli (args: Args) -> Config? {
   var i: int = 1;
   var end_flags: bool = false;
   var pattern: string? = None;
+  var pattern_index: int = -1;
   var paths_start: int = 0;
   var paths_count: int = 0;
+  var path_write: int = 0;
 
   while i < argc {
     let a: string = args.get(i);
@@ -476,6 +483,13 @@ export fn parse_cli (args: Args) -> Config? {
         continue;
       }
       if a == "--files" {
+        if mode != Mode::Files && pattern != None && pattern_index >= 0 {
+          paths_start = pattern_index;
+          path_write = pattern_index + 1 + paths_count;
+          paths_count = paths_count + 1;
+          pattern = None;
+          pattern_index = -1;
+        }
         mode = Mode::Files;
         i = i + 1;
         continue;
@@ -1002,20 +1016,26 @@ export fn parse_cli (args: Args) -> Config? {
       return None;
     }
 
-    // Positional arguments.
-    if mode == Mode::Files {
-      paths_start = i;
-      paths_count = argc - i;
-      break;
+    // Search mode: first positional is the pattern.
+    if mode == Mode::Search && pattern == None {
+      pattern = Some(a);
+      pattern_index = i;
+      i = i + 1;
+      continue;
     }
 
-    // Search mode: first positional is pattern, remaining are paths.
-    if pattern == None {
-      pattern = Some(a);
-      paths_start = i + 1;
-      paths_count = argc - (i + 1);
-      break;
+    // Remaining positionals are root paths.
+    if paths_count <= 0 {
+      if mode == Mode::Search && pattern_index >= 0 {
+        paths_start = pattern_index + 1;
+      } else {
+        paths_start = i;
+      }
+      path_write = paths_start;
     }
+    argv_set_ptr(&args, path_write, args.ptr(i));
+    path_write = path_write + 1;
+    paths_count = paths_count + 1;
 
     i = i + 1;
   }

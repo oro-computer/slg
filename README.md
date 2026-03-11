@@ -36,9 +36,9 @@ List files that would be searched (no content search):
 slg --files [options] [path ...]
 ```
 
-Important parsing rule (for speed + simplicity):
-- Options must appear before `<pattern>`. Any arguments after `<pattern>` are treated as paths.
-- Use `--` to end option parsing (useful for patterns starting with `-`).
+Argument parsing:
+- Options may appear before or after `<pattern>` and `[path ...]`.
+- Use `--` to end option parsing (useful for patterns or paths starting with `-`).
 
 Exit status:
 - `0` match found (or `--files` completed successfully)
