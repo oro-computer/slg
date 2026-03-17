@@ -48,3 +48,7 @@ name = "slg"
 kind = "executable"
 entry = "src/main.slk"
 output = "build/bin/slg"
+
+[[target]]
+kind = "man"
+source = "man/slg.1"
