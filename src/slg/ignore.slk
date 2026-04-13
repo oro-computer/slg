@@ -120,6 +120,7 @@ fn hash_str_ptr_len (ptr: u64, len: i64) -> u64 {
   if h == 0 {
     return 1;
   }
+
   return h;
 }
 
@@ -144,18 +145,21 @@ fn cache_probe (cache: &IgnoreCache, key_ptr: u64, key_len: i64, hash: u64) -> C
       empty_slot = slot;
       break;
     }
+
     if h2 == hash {
       let klen: i64 = std::runtime::mem::load_u64(sp, CACHE_OFF_KEY_LEN) as i64;
       if klen == key_len {
         if key_len <= 0 {
           return CacheProbe{ hit_slot: slot, empty_slot: empty_slot };
         }
+
         let kptr: u64 = std::runtime::mem::load_u64(sp, CACHE_OFF_KEY_PTR);
         if kptr != 0 && key_ptr != 0 && memcmp(kptr, key_ptr, key_len as u64) == 0 {
           return CacheProbe{ hit_slot: slot, empty_slot: empty_slot };
         }
       }
     }
+
     probe = probe + 1;
   }
 
@@ -166,10 +170,12 @@ fn alloc_copy (src_ptr: u64, len: i64) -> u64 {
   if src_ptr == 0 || len <= 0 {
     return 0;
   }
+
   let dst: u64 = std::runtime::mem::alloc(len);
   if dst == 0 {
     return 0;
   }
+
   let _ = memcpy(dst, src_ptr, len);
   return dst;
 }
@@ -178,6 +184,7 @@ fn cache_free_slot (cache: &IgnoreCache, slot: i64) -> void {
   if cache.ptr == 0 || cache.cap <= 0 {
     return;
   }
+
   let sp: u64 = cache_slot_ptr(cache, slot);
   let h: u64 = std::runtime::mem::load_u64(sp, CACHE_OFF_HASH);
   if h == 0 {
@@ -196,6 +203,7 @@ fn cache_free_slot (cache: &IgnoreCache, slot: i64) -> void {
     if cptr != 0 {
       std::runtime::mem::free(cptr);
     }
+
     if rptr != 0 {
       std::runtime::mem::free(rptr);
     }
@@ -218,6 +226,7 @@ fn cache_choose_evict_slot (mut cache: &IgnoreCache) -> i64 {
       cache.next_evict = (slot + 1) & cache.mask;
       return slot;
     }
+
     slot = (slot + 1) & cache.mask;
     attempts = attempts + 1;
   }
@@ -248,6 +257,7 @@ fn cache_insert_entry (
     if slot < 0 {
       return false;
     }
+
     cache_free_slot(cache, slot);
   }
 
@@ -274,6 +284,7 @@ export fn init_cache (slots: int = 16384) -> IgnoreCache {
   while p < cap {
     p = p * 2;
   }
+
   cap = p;
 
   let bytes: i64 = cap * CACHE_SLOT_BYTES;
@@ -332,6 +343,7 @@ fn rules_count_len (rules_len: i64) -> i64 {
   if rules_len <= 0 {
     return 0;
   }
+
   return rules_len / RULE_REC_SIZE;
 }
 
@@ -339,6 +351,7 @@ fn dirs_count_len (dirs_len: i64) -> i64 {
   if dirs_len <= 0 {
     return 0;
   }
+
   return dirs_len / DIR_REC_SIZE;
 }
 
@@ -347,6 +360,7 @@ fn rules_push (mut rules: &BufferU8, pat_off: i64, pat_len: i64, flags: u64) -> 
   if err != None {
     return false;
   }
+
   let off: i64 = rules.len;
   std::runtime::mem::store_u64(rules.ptr, off + 0, pat_off as u64);
   std::runtime::mem::store_u64(rules.ptr, off + 8, pat_len as u64);
@@ -384,6 +398,7 @@ fn dirs_push (mut dirs: &BufferU8, base_len: i64, content_ptr: u64, content_len:
   if err != None {
     return false;
   }
+
   let off: i64 = dirs.len;
   std::runtime::mem::store_u64(dirs.ptr, off + DIR_OFF_BASE_LEN, base_len as u64);
   std::runtime::mem::store_u64(dirs.ptr, off + DIR_OFF_CONTENT_PTR, content_ptr);
@@ -409,8 +424,10 @@ fn trim_line_end (ptr: u64, start: i64, end: i64) -> i64 {
     if b != 32 && b != 9 {
       break;
     }
+
     e = e - 1;
   }
+
   return e;
 }
 
@@ -418,6 +435,7 @@ fn line_has_slash (ptr: u64, start: i64, end: i64) -> bool {
   if end <= start {
     return false;
   }
+
   return memchr(ptr + (start as u64), 47, end - start) != 0;
 }
 
@@ -425,6 +443,7 @@ fn line_has_glob (ptr: u64, start: i64, end: i64) -> bool {
   if end <= start {
     return false;
   }
+
   let n: i64 = end - start;
   let p: u64 = ptr + (start as u64);
   return memchr(p, 42, n) != 0 || memchr(p, 63, n) != 0;
@@ -441,7 +460,11 @@ fn parse_rules_range (content_ptr: u64, start_off: i64, len: i64, mut rules: &Bu
 
   while off <= end_off {
     let at_end: bool = off == end_off;
-    let b: u8 = if at_end { 10 } else { std::runtime::mem::load_u8(content_ptr, off) };
+    let b: u8 = if at_end {
+      10
+    } else {
+      std::runtime::mem::load_u8(content_ptr, off)
+    };
     if b != 10 {
       off = off + 1;
       continue;
@@ -493,6 +516,7 @@ fn parse_rules_range (content_ptr: u64, start_off: i64, len: i64, mut rules: &Bu
     if line_has_slash(content_ptr, start, end) {
       flags = flags | FLAG_HAS_SLASH;
     }
+
     if line_has_glob(content_ptr, start, end) {
       flags = flags | FLAG_HAS_GLOB;
     }
@@ -506,7 +530,7 @@ fn parse_rules_range (content_ptr: u64, start_off: i64, len: i64, mut rules: &Bu
 }
 
 fn mmap_append_file (mut content: &BufferU8, mut rules: &BufferU8, path: string) -> bool {
-  let fd: int = std::runtime::posix::fs::open(path, std::runtime::posix::fs::O_RDONLY, 0) as int;
+  let fd = std::runtime::posix::fs::open(path, std::runtime::posix::fs::O_RDONLY, 0);
   if fd < 0 {
     let e: int = errno();
     if e == ENOENT {
@@ -547,9 +571,11 @@ fn path_truncate (mut path: &PathBuf, new_len: i64) -> void {
     let _ = path.truncate_len(0);
     return;
   }
+
   if new_len >= path.len {
     return;
   }
+
   let _ = path.truncate_len(new_len);
 }
 
@@ -565,6 +591,7 @@ fn load_one_ignore_file (
     path_truncate(mut path, base_len);
     return false;
   }
+
   let file_path: string = path.as_string();
   let ok: bool = mmap_append_file(mut content, mut rules, file_path);
   path_truncate(mut path, base_len);
@@ -640,6 +667,7 @@ fn is_globstar_segment (ptr: u64, off: i64, len: i64) -> bool {
   if len != 2 {
     return false;
   }
+
   return std::runtime::mem::load_u8(ptr, off) == 42 && std::runtime::mem::load_u8(ptr, off + 1) == 42;
 }
 
@@ -656,6 +684,7 @@ fn match_component (pat_ptr: u64, pat_len: i64, text_ptr: u64, text_len: i64) ->
       while pi < pat_len && std::runtime::mem::load_u8(pat_ptr, pi) == 42 {
         pi = pi + 1;
       }
+
       star_pi = pi;
       star_ti = ti;
       continue;
@@ -684,6 +713,7 @@ fn match_component (pat_ptr: u64, pat_len: i64, text_ptr: u64, text_len: i64) ->
   while pi < pat_len && std::runtime::mem::load_u8(pat_ptr, pi) == 42 {
     pi = pi + 1;
   }
+
   return pi == pat_len;
 }
 
@@ -691,55 +721,58 @@ fn bytes_eq (a_ptr: u64, a_len: i64, b_ptr: u64, b_len: i64) -> bool {
   if a_len != b_len {
     return false;
   }
+
   if a_len <= 0 {
     return true;
   }
+
   if a_ptr == b_ptr {
     return true;
   }
+
   return memcmp(a_ptr, b_ptr, a_len as u64) == 0;
 }
 
 fn match_path (pat_ptr: u64, pat_len: i64, text_ptr: u64, text_len: i64) -> bool {
   let mut pat_offs: i64[64] = [
-  0, 0, 0, 0, 0, 0, 0, 0,
-  0, 0, 0, 0, 0, 0, 0, 0,
-  0, 0, 0, 0, 0, 0, 0, 0,
-  0, 0, 0, 0, 0, 0, 0, 0,
-  0, 0, 0, 0, 0, 0, 0, 0,
-  0, 0, 0, 0, 0, 0, 0, 0,
-  0, 0, 0, 0, 0, 0, 0, 0,
-  0, 0, 0, 0, 0, 0, 0, 0
+    0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0
   ];
   let mut pat_lens: i64[64] = [
-  0, 0, 0, 0, 0, 0, 0, 0,
-  0, 0, 0, 0, 0, 0, 0, 0,
-  0, 0, 0, 0, 0, 0, 0, 0,
-  0, 0, 0, 0, 0, 0, 0, 0,
-  0, 0, 0, 0, 0, 0, 0, 0,
-  0, 0, 0, 0, 0, 0, 0, 0,
-  0, 0, 0, 0, 0, 0, 0, 0,
-  0, 0, 0, 0, 0, 0, 0, 0
+    0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0
   ];
   let mut text_offs: i64[64] = [
-  0, 0, 0, 0, 0, 0, 0, 0,
-  0, 0, 0, 0, 0, 0, 0, 0,
-  0, 0, 0, 0, 0, 0, 0, 0,
-  0, 0, 0, 0, 0, 0, 0, 0,
-  0, 0, 0, 0, 0, 0, 0, 0,
-  0, 0, 0, 0, 0, 0, 0, 0,
-  0, 0, 0, 0, 0, 0, 0, 0,
-  0, 0, 0, 0, 0, 0, 0, 0
+    0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0
   ];
   let mut text_lens: i64[64] = [
-  0, 0, 0, 0, 0, 0, 0, 0,
-  0, 0, 0, 0, 0, 0, 0, 0,
-  0, 0, 0, 0, 0, 0, 0, 0,
-  0, 0, 0, 0, 0, 0, 0, 0,
-  0, 0, 0, 0, 0, 0, 0, 0,
-  0, 0, 0, 0, 0, 0, 0, 0,
-  0, 0, 0, 0, 0, 0, 0, 0,
-  0, 0, 0, 0, 0, 0, 0, 0
+    0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0
   ];
 
   var p_count: i64 = 0;
@@ -749,10 +782,12 @@ fn match_path (pat_ptr: u64, pat_len: i64, text_ptr: u64, text_len: i64) -> bool
       if p_count >= MAX_SEGMENTS {
         return false;
       }
+
       var j: i64 = i;
       while j < pat_len && std::runtime::mem::load_u8(pat_ptr, j) != 47 {
         j = j + 1;
       }
+
       pat_offs[p_count] = i;
       pat_lens[p_count] = j - i;
       p_count = p_count + 1;
@@ -767,10 +802,12 @@ fn match_path (pat_ptr: u64, pat_len: i64, text_ptr: u64, text_len: i64) -> bool
       if t_count >= MAX_SEGMENTS {
         return false;
       }
+
       var j: i64 = i;
       while j < text_len && std::runtime::mem::load_u8(text_ptr, j) != 47 {
         j = j + 1;
       }
+
       text_offs[t_count] = i;
       text_lens[t_count] = j - i;
       t_count = t_count + 1;
@@ -780,24 +817,24 @@ fn match_path (pat_ptr: u64, pat_len: i64, text_ptr: u64, text_len: i64) -> bool
 
   // Stack of active `**` segments for backtracking.
   let mut gs_pi: i64[64] = [
-  0, 0, 0, 0, 0, 0, 0, 0,
-  0, 0, 0, 0, 0, 0, 0, 0,
-  0, 0, 0, 0, 0, 0, 0, 0,
-  0, 0, 0, 0, 0, 0, 0, 0,
-  0, 0, 0, 0, 0, 0, 0, 0,
-  0, 0, 0, 0, 0, 0, 0, 0,
-  0, 0, 0, 0, 0, 0, 0, 0,
-  0, 0, 0, 0, 0, 0, 0, 0
+    0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0
   ];
   let mut gs_ti: i64[64] = [
-  0, 0, 0, 0, 0, 0, 0, 0,
-  0, 0, 0, 0, 0, 0, 0, 0,
-  0, 0, 0, 0, 0, 0, 0, 0,
-  0, 0, 0, 0, 0, 0, 0, 0,
-  0, 0, 0, 0, 0, 0, 0, 0,
-  0, 0, 0, 0, 0, 0, 0, 0,
-  0, 0, 0, 0, 0, 0, 0, 0,
-  0, 0, 0, 0, 0, 0, 0, 0
+    0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0
   ];
   var gs_sp: i64 = 0;
 
@@ -820,6 +857,7 @@ fn match_path (pat_ptr: u64, pat_len: i64, text_ptr: u64, text_len: i64) -> bool
           gs_ti[gs_sp] = ti;
           gs_sp = gs_sp + 1;
         }
+
         pi = pi + 1;
         continue;
       }
@@ -850,6 +888,7 @@ fn match_path (pat_ptr: u64, pat_len: i64, text_ptr: u64, text_len: i64) -> bool
         backtracked = true;
         break;
       }
+
       gs_sp = gs_sp - 1;
     }
 
@@ -857,6 +896,7 @@ fn match_path (pat_ptr: u64, pat_len: i64, text_ptr: u64, text_len: i64) -> bool
       return false;
     }
   }
+
   return false;
 }
 
@@ -873,6 +913,7 @@ fn rel_slice (full_ptr: u64, full_len: i64, base_len: i64) -> slg::buf::ByteSlic
   if base_len > 0 && std::runtime::mem::load_u8(full_ptr, base_len - 1) != 47 {
     off = off + 1;
   }
+
   if off >= full_len {
     return slg::buf::ByteSlice{ ptr: full_ptr + (full_len as u64), len: 0 };
   }
@@ -899,6 +940,7 @@ fn rule_matches (
     if (r.flags & FLAG_HAS_GLOB) == 0 {
       return bytes_eq(pat_ptr, r.pat_len, rel.ptr, rel.len);
     }
+
     return match_path(pat_ptr, r.pat_len, rel.ptr, rel.len);
   }
 
@@ -911,6 +953,7 @@ fn rule_matches (
   if (r.flags & FLAG_HAS_GLOB) == 0 {
     return bytes_eq(pat_ptr, r.pat_len, name_ptr, name_len);
   }
+
   return match_component(pat_ptr, r.pat_len, name_ptr, name_len);
 }
 
@@ -939,8 +982,10 @@ fn is_ignored_ptr_len_impl (stack: &IgnoreStack, full_ptr: u64, full_len: i64, n
       if rule_matches(d.content_ptr, r, rel, rel_slash, name_ptr, name_len, is_dir) {
         return (r.flags & FLAG_NEGATED) == 0;
       }
+
       i = i - 1;
     }
+
     di = di - 1;
   }
 
@@ -969,10 +1014,14 @@ export fn mark (stack: &IgnoreStack) -> i64 {
 
 fn pop_dirs_to (mut dirs: &BufferU8, mark: i64) -> void {
   var m: i64 = mark;
-  if m < 0 { m = 0; }
+  if m < 0 {
+    m = 0;
+  }
+
   if m >= dirs.len {
     return;
   }
+
   if dirs.ptr == 0 {
     dirs.len = 0;
     return;
@@ -989,6 +1038,7 @@ fn pop_dirs_to (mut dirs: &BufferU8, mark: i64) -> void {
       std::runtime::mem::free(content_ptr);
       std::runtime::mem::free(rules_ptr);
     }
+
     off = off - DIR_REC_SIZE;
   }
 
@@ -1061,7 +1111,11 @@ export fn push_dir_cached (enabled: bool, mut stack: &IgnoreStack, mut path: &Pa
     let base_len: i64 = path.len;
     // Push a borrowed ignore entry: these pointers remain valid for the
     // lifetime of the process (cached entries are never evicted).
-    let borrowed_clen: i64 = if clen > 0 { 0 - clen } else { -1 };
+    let borrowed_clen: i64 = if clen > 0 {
+      0 - clen
+    } else {
+      -1
+    };
     let _ok: bool = dirs_push(mut stack.dirs, base_len, cptr, borrowed_clen, rptr, rlen);
     return;
   }
@@ -1080,15 +1134,21 @@ export fn push_dir_cached (enabled: bool, mut stack: &IgnoreStack, mut path: &Pa
     // Note: do not cache failures (OOM during path push, buffer growth, or
     // rule parsing). Those should remain best-effort and retryable.
     let cur_ptr: u64 = path.ptr;
-    let key_copy: u64 = if key_len > 0 { alloc_copy(cur_ptr, key_len) } else { 0 };
+    let key_copy: u64 = if key_len > 0 {
+      alloc_copy(cur_ptr, key_len)
+    } else {
+      0
+    };
     if key_len > 0 && key_copy == 0 {
       // OOM: skip caching so a future attempt can retry.
       return;
     }
+
     let ok: bool = cache_insert_entry(mut cache, hash, CACHE_KIND_NONE, key_copy, key_len, 0, 0, 0, 0, p.empty_slot);
     if !ok && key_copy != 0 {
       std::runtime::mem::free(key_copy);
     }
+
     return;
   }
 
@@ -1145,7 +1205,11 @@ export fn push_dir_cached (enabled: bool, mut stack: &IgnoreStack, mut path: &Pa
   if cached {
     // Push a borrowed ignore entry: these pointers remain valid for the
     // lifetime of the process (cached entries are never evicted).
-    let borrowed_clen: i64 = if loaded.content_len > 0 { 0 - loaded.content_len } else { -1 };
+    let borrowed_clen: i64 = if loaded.content_len > 0 {
+      0 - loaded.content_len
+    } else {
+      -1
+    };
     let _ok: bool = dirs_push(
       mut stack.dirs,
       base_len,

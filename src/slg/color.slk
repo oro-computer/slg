@@ -29,6 +29,7 @@ export fn enabled (mode: ColorMode, fd: int) -> bool {
   if mode == ColorMode::Never {
     return false;
   }
+
   if mode == ColorMode::Always {
     return true;
   }
@@ -38,7 +39,7 @@ export fn enabled (mode: ColorMode, fd: int) -> bool {
     return false;
   }
 
-  let rc: i32 = isatty(fd);
+  let rc: i32 = isatty(fd as i32);
   return rc == 1;
 }
 
@@ -54,9 +55,18 @@ export fn enabled (mode: ColorMode, fd: int) -> bool {
  * @returns ColorMode? Parsed mode, or `None` for invalid input.
  */
 export fn parse_mode (s: string) -> ColorMode? {
-  if s == "auto" { return Some(ColorMode::Auto); }
-  if s == "always" { return Some(ColorMode::Always); }
-  if s == "never" { return Some(ColorMode::Never); }
+  if s == "auto" {
+    return Some(ColorMode::Auto);
+  }
+
+  if s == "always" {
+    return Some(ColorMode::Always);
+  }
+
+  if s == "never" {
+    return Some(ColorMode::Never);
+  }
+
   return None;
 }
 

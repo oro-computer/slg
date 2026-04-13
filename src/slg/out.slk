@@ -1,9 +1,9 @@
 module slg::out;
 
+import { OutOfMemory } from "std/memory";
 import std::interfaces;
 import std::runtime::mem;
 import std::runtime::posix::io;
-import { OutOfMemory } from "std/memory";
 
 import { BufferU8 } from "./buf.slk";
 
@@ -21,18 +21,21 @@ export fn write_all (fd: int, ptr: u64, len: i64) -> bool {
   if len <= 0 {
     return true;
   }
+
   if ptr == 0 {
     return false;
   }
 
   var off: i64 = 0;
   while off < len {
-    let n: int = std::runtime::posix::io::write(fd, ptr + (off as u64), len - off);
+    let n = std::runtime::posix::io::write(fd as i32, ptr + (off as u64), len - off);
     if n <= 0 {
       return false;
     }
+
     off = off + (n as i64);
   }
+
   return true;
 }
 
@@ -67,6 +70,7 @@ fn writer_init (fd: int, color: bool, cap: i64) -> Writer? {
   if b_opt == None {
     return None;
   }
+
   let b: BufferU8 = b_opt ?? BufferU8.empty();
   return Some(Writer{ fd: fd, color: color, buf: b });
 }
@@ -79,42 +83,42 @@ impl Writer {
     return writer_init(std::runtime::posix::io::STDOUT_FD, color, cap);
   }
 
-  /**
+/**
    * Create a stderr writer.
    */
   public fn stderr (color: bool, cap: i64 = 8192) -> Writer? {
     return writer_init(std::runtime::posix::io::STDERR_FD, color, cap);
   }
 
-  /**
+/**
    * Clear the internal buffer (does not write).
    */
   public fn clear (mut self: &Writer) -> void {
     self.buf.clear();
   }
 
-  /**
+/**
    * Append one byte.
    */
   public fn push_u8 (mut self: &Writer, value: u8) -> OutOfMemory? {
     return self.buf.push_u8(value);
   }
 
-  /**
+/**
    * Append a `string`.
    */
   public fn push_str (mut self: &Writer, s: string) -> OutOfMemory? {
     return self.buf.push_str(s);
   }
 
-  /**
+/**
    * Append `len` bytes from `ptr`.
    */
   public fn push_ptr_len (mut self: &Writer, ptr: u64, len: i64) -> OutOfMemory? {
     return self.buf.push_ptr_len(ptr, len);
   }
 
-  /**
+/**
    * Append a decimal `u64`.
    */
   public fn push_u64 (mut self: &Writer, value: u64) -> OutOfMemory? {
@@ -144,13 +148,14 @@ impl Writer {
       if err != None {
         return err;
       }
+
       i = i - 1;
     }
 
     return None;
   }
 
-  /**
+/**
    * Append a decimal `i64`.
    */
   public fn push_i64 (mut self: &Writer, value: i64) -> OutOfMemory? {
@@ -164,6 +169,7 @@ impl Writer {
       if err0 != None {
         return err0;
       }
+
       v = (0 - value) as u64;
     } else {
       v = value as u64;
@@ -172,7 +178,7 @@ impl Writer {
     return self.push_u64(v);
   }
 
-  /**
+/**
    * Flush the internal buffer to `fd`.
    *
    * @returns bool `true` on success.
@@ -184,7 +190,7 @@ impl Writer {
     return ok;
   }
 
-  /**
+/**
    * Write a string directly without buffering.
    */
   public fn write_str (self: &Writer, s: string) -> bool {

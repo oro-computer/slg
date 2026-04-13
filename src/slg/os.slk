@@ -40,7 +40,7 @@ export ext closedir = fn (u64) -> int;
  * @param fd: int File descriptor.
  * @returns int 1 for yes, 0 for no, -1 for error.
  */
-export ext isatty = fn (int) -> i32;
+export ext isatty = fn (i32) -> i32;
 
 /**
  * `dup(2)` — duplicate a file descriptor.
@@ -50,7 +50,7 @@ export ext isatty = fn (int) -> i32;
  * @param fd: int Existing file descriptor.
  * @returns int New file descriptor on success, otherwise -1.
  */
-export ext dup = fn (int) -> int;
+export ext dup = fn (i32) -> i32;
 
 /**
  * `fstat(2)` — get file metadata by file descriptor.
@@ -113,7 +113,7 @@ export ext memcmp = fn (u64, u64, u64) -> int;
 /**
  * `mmap(2)` — map a file into memory (POSIX hosted baseline).
  */
-export ext mmap = fn (u64, u64, int, int, int, i64) -> u64;
+export ext mmap = fn (u64, u64, int, int, i32, i64) -> u64;
 
 /**
  * `munmap(2)` — unmap a memory mapping.

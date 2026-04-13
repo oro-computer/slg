@@ -6,10 +6,22 @@ import std::runtime::mem;
 import std::runtime::posix::fs;
 import std::runtime::posix::io;
 
-import { Config, MAX_JOBS_HARD, parse_cli, print_help, print_version } from "./slg/cli.slk";
-import { run_auto } from "./slg/engine.slk";
 import { BufferU8 } from "./slg/buf.slk";
-import { closedir, dup, memcpy, memmem, opendir } from "./slg/os.slk";
+import {
+  Config,
+  MAX_JOBS_HARD,
+  parse_cli,
+  print_help,
+  print_version,
+} from "./slg/cli.slk";
+import { run_auto } from "./slg/engine.slk";
+import {
+  closedir,
+  dup,
+  memcpy,
+  memmem,
+  opendir,
+} from "./slg/os.slk";
 import { vararg_string_at } from "./slg/varargs.slk";
 
 async fn run_cfg (cfg: Config) -> int {
@@ -17,10 +29,12 @@ async fn run_cfg (cfg: Config) -> int {
     print_help();
     return 0;
   }
+
   if cfg.version {
     print_version();
     return 0;
   }
+
   let code: int = await run_auto(cfg);
   return code;
 }
@@ -78,6 +92,7 @@ fn cstr_alloc (s: string) -> u64 {
   if len < 0 {
     return 0;
   }
+
   let ptr: u64 = std::runtime::mem::alloc(len + 1);
   if ptr == 0 {
     return 0;
@@ -96,6 +111,7 @@ fn argv_free_partial (argv: u64, count: int) -> void {
   if argv == 0 || count <= 0 {
     return;
   }
+
   var i: int = 0;
   while i < count {
     let p: u64 = std::runtime::mem::load_u64(argv, (i * 8) as i64);
@@ -115,15 +131,18 @@ fn argv_alloc (...args: string) -> ArgvOwned? {
   if args.len <= 0 {
     return None;
   }
+
   if args.len > 32 {
     return None;
   }
+
   let argc: int = args.len;
   // Allocate a `char**` pointer list with a conventional trailing NULL slot.
   let argv: u64 = std::runtime::mem::alloc(((argc + 1) * 8) as i64);
   if argv == 0 {
     return None;
   }
+
   std::runtime::mem::store_u64(argv, (argc * 8) as i64, 0);
 
   var i: int = 0;
@@ -137,6 +156,7 @@ fn argv_alloc (...args: string) -> ArgvOwned? {
       std::runtime::mem::free(argv);
       return None;
     }
+
     std::runtime::mem::store_u64(argv, (i * 8) as i64, p);
     i = i + 1;
   }
@@ -161,6 +181,7 @@ fn read_all_fd (fd: int) -> BufferU8? {
   if b_opt == None {
     return None;
   }
+
   let mut b: BufferU8 = b_opt ?? BufferU8.empty();
 
   let chunk_size: i64 = 4096;
@@ -171,10 +192,11 @@ fn read_all_fd (fd: int) -> BufferU8? {
   }
 
   while true {
-    let n: int = std::runtime::posix::io::read(fd, chunk, chunk_size);
+    let n = std::runtime::posix::io::read(fd as i32, chunk, chunk_size);
     if n <= 0 {
       break;
     }
+
     let err = b.push_ptr_len(chunk, n as i64);
     if err != None {
       std::runtime::mem::free(chunk);
@@ -198,38 +220,42 @@ fn write_all_fd (fd: int, ptr: u64, len: i64) -> bool {
   if fd < 0 {
     return false;
   }
+
   if len <= 0 {
     return true;
   }
+
   if ptr == 0 {
     return false;
   }
 
   var off: i64 = 0;
   while off < len {
-    let n: int = std::runtime::posix::io::write(fd, ptr + (off as u64), len - off);
+    let n = std::runtime::posix::io::write(fd as i32, ptr + (off as u64), len - off);
     if n <= 0 {
       return false;
     }
+
     off = off + (n as i64);
   }
+
   return true;
 }
 
 fn write_text_file (path: string, content: string) -> bool {
-  let fd: int =
-  std::runtime::posix::fs::open(
+  let fd = std::runtime::posix::fs::open(
     path,
     std::runtime::posix::fs::O_WRONLY | std::runtime::posix::fs::O_CREAT | std::runtime::posix::fs::O_TRUNC,
     420 // 0644
-  ) as int;
+  );
+
   if fd < 0 {
     return false;
   }
 
   let ptr: u64 = std::runtime::mem::string_ptr(content);
   let len: i64 = std::runtime::mem::string_len(content);
-  let ok: bool = write_all_fd(fd, ptr, len);
+  let ok: bool = write_all_fd(fd as int, ptr, len);
   let _ = std::runtime::posix::fs::close(fd);
   return ok;
 }
@@ -239,10 +265,12 @@ fn ensure_dir_exists (path: string) -> bool {
   if rc == 0 {
     return true;
   }
+
   let dir: u64 = opendir(path);
   if dir == 0 {
     return false;
   }
+
   let _ = closedir(dir);
   return true;
 }
@@ -251,24 +279,31 @@ fn prepare_ignore_fixture () -> bool {
   if !write_text_file("testdata/ignore/ignored.txt", "ignored by .gitignore\n") {
     return false;
   }
+
   if !write_text_file("testdata/ignore/a.log", "glob ignored log file\n") {
     return false;
   }
+
   if !write_text_file("testdata/ignore/anchored.txt", "anchored ignore file\n") {
     return false;
   }
+
   if !write_text_file("testdata/ignore/deep.txt", "globstar ignored at root\n") {
     return false;
   }
+
   if !write_text_file("testdata/ignore/sub/deep.txt", "globstar ignored in subdir\n") {
     return false;
   }
+
   if !ensure_dir_exists("testdata/ignore/ignored_dir") {
     return false;
   }
+
   if !write_text_file("testdata/ignore/ignored_dir/x.txt", "ignored directory child\n") {
     return false;
   }
+
   return true;
 }
 
@@ -280,9 +315,14 @@ fn buffer_as_string (b: &BufferU8) -> string {
   if bytes.len <= 0 || bytes.ptr == 0 {
     return "";
   }
+
   let len_i64: i64 = bytes.len;
   let max_i32: i64 = 2147483647 as i64;
-  let len: int = if len_i64 > max_i32 { max_i32 as int } else { len_i64 as int };
+  let len: int = if len_i64 > max_i32 {
+    max_i32 as int
+  } else {
+    len_i64 as int
+  };
   return std::runtime::mem::string_from_ptr_len(bytes.ptr, len);
 }
 
@@ -294,6 +334,7 @@ fn contains (hay: string, needle: string) -> bool {
   if n_len <= 0 {
     return true;
   }
+
   let h_ptr: u64 = std::runtime::mem::string_ptr(hay);
   let h_len: i64 = std::runtime::mem::string_len(hay);
   let n_ptr: u64 = std::runtime::mem::string_ptr(needle);
@@ -333,24 +374,27 @@ async fn capture_stdout_run_cfg (cfg: Config) -> Capture? {
   if fds_ptr == 0 {
     return None;
   }
+
   let prc: int = std::runtime::posix::io::pipe(fds_ptr) as int;
   if prc != 0 {
     std::runtime::mem::free(fds_ptr);
     return None;
   }
+
   let rfd: int = load_i32_le(fds_ptr, 0);
   let wfd: int = load_i32_le(fds_ptr, 4);
   std::runtime::mem::free(fds_ptr);
 
   // Save stdout, then redirect fd=1 into the pipe.
-  let saved: int = dup(1);
+  let saved = dup(1);
   if saved < 0 {
-    let _ = std::runtime::posix::fs::close(rfd);
-    let _ = std::runtime::posix::fs::close(wfd);
+    let _ = std::runtime::posix::fs::close(rfd as i32);
+    let _ = std::runtime::posix::fs::close(wfd as i32);
     return None;
   }
-  let _ = std::runtime::posix::io::dup2(wfd, 1);
-  let _ = std::runtime::posix::fs::close(wfd);
+
+  let _ = std::runtime::posix::io::dup2(wfd as i32, 1);
+  let _ = std::runtime::posix::fs::close(wfd as i32);
 
   // Run.
   let code: int = await run_cfg(cfg);
@@ -361,10 +405,11 @@ async fn capture_stdout_run_cfg (cfg: Config) -> Capture? {
 
   // Drain captured output.
   let out_opt: BufferU8? = read_all_fd(rfd);
-  let _ = std::runtime::posix::fs::close(rfd);
+  let _ = std::runtime::posix::fs::close(rfd as i32);
   if out_opt == None {
     return None;
   }
+
   let out: BufferU8 = out_opt ?? BufferU8.empty();
   return Some(Capture{ code: code, out: out });
 }
@@ -381,25 +426,28 @@ async fn broken_stdout_run_cfg (cfg: Config) -> int? {
   if fds_ptr == 0 {
     return None;
   }
+
   let prc: int = std::runtime::posix::io::pipe(fds_ptr) as int;
   if prc != 0 {
     std::runtime::mem::free(fds_ptr);
     return None;
   }
+
   let rfd: int = load_i32_le(fds_ptr, 0);
   let wfd: int = load_i32_le(fds_ptr, 4);
   std::runtime::mem::free(fds_ptr);
 
   // Save stdout, then redirect fd=1 to the read end (writes will fail).
-  let saved: int = dup(1);
+  let saved = dup(1);
   if saved < 0 {
-    let _ = std::runtime::posix::fs::close(rfd);
-    let _ = std::runtime::posix::fs::close(wfd);
+    let _ = std::runtime::posix::fs::close(rfd as i32);
+    let _ = std::runtime::posix::fs::close(wfd as i32);
     return None;
   }
-  let _ = std::runtime::posix::io::dup2(rfd, 1);
-  let _ = std::runtime::posix::fs::close(rfd);
-  let _ = std::runtime::posix::fs::close(wfd);
+
+  let _ = std::runtime::posix::io::dup2(rfd as i32, 1);
+  let _ = std::runtime::posix::fs::close(rfd as i32);
+  let _ = std::runtime::posix::fs::close(wfd as i32);
 
   // Run.
   let code: int = await run_cfg(cfg);
@@ -763,6 +811,56 @@ test "slg e2e - --files may appear after a path" {
   av.drop();
 }
 
+test "slg e2e - implicit root search recurses into directories" {
+  let av_opt: ArgvOwned? = argv_alloc("slg", "export", "src");
+  assert(av_opt != None, "argv alloc failed");
+  let mut av: ArgvOwned = av_opt ?? ArgvOwned{ argc: 0, argv: 0 };
+
+  let args: Args = Args.init(av.argc, av.argv);
+  let cfg_opt: Config? = parse_cli(args);
+  assert(cfg_opt != None, "parse_cli should succeed");
+
+  let cap_opt: Capture? = match (cfg_opt) {
+    Some(cfg) => await capture_stdout_run_cfg(cfg),
+    None => None,
+  };
+  assert(cap_opt != None, "capture failed");
+  let mut cap: Capture = cap_opt ?? Capture{ code: 2, out: BufferU8.empty() };
+
+  assert(cap.code == 0, "expected exit code 0 (match found)");
+  let out_s: string = buffer_as_string(cap.out);
+  assert(contains(out_s, "src/main.slk:37:export async fn main"), "expected a recursive search hit in src/main.slk");
+  assert(contains(out_s, "src/slg/cli.slk"), "expected recursive search to reach nested files");
+
+  cap.drop();
+  av.drop();
+}
+
+test "slg e2e - --files recurses into explicit directories" {
+  let av_opt: ArgvOwned? = argv_alloc("slg", "--files", "src");
+  assert(av_opt != None, "argv alloc failed");
+  let mut av: ArgvOwned = av_opt ?? ArgvOwned{ argc: 0, argv: 0 };
+
+  let args: Args = Args.init(av.argc, av.argv);
+  let cfg_opt: Config? = parse_cli(args);
+  assert(cfg_opt != None, "parse_cli should succeed");
+
+  let cap_opt: Capture? = match (cfg_opt) {
+    Some(cfg) => await capture_stdout_run_cfg(cfg),
+    None => None,
+  };
+  assert(cap_opt != None, "capture failed");
+  let mut cap: Capture = cap_opt ?? Capture{ code: 2, out: BufferU8.empty() };
+
+  assert(cap.code == 0, "expected exit code 0 for --files");
+  let out_s: string = buffer_as_string(cap.out);
+  assert(contains(out_s, "src/main.slk"), "expected --files to list files from the explicit root");
+  assert(contains(out_s, "src/slg/engine.slk"), "expected --files to recurse into nested directories");
+
+  cap.drop();
+  av.drop();
+}
+
 test "slg e2e - --jobs 1 forces single-threaded" {
   let av_opt: ArgvOwned? = argv_alloc("slg", "--jobs=1", "-F", "TODO", "testdata/basic");
   assert(av_opt != None, "argv alloc failed");
@@ -819,18 +917,18 @@ test "slg e2e - --threads is an alias for --jobs" {
 
 test "slg e2e - concurrency options accept auto keyword" {
   let av_opt: ArgvOwned? =
-    argv_alloc(
-      "slg",
-      "--jobs", "auto",
-      "--split-depth=auto",
-      "--queue-cap", "auto",
-      "--target-jobs", "auto",
-      "--max-jobs-total", "AUTO",
-      "--file-batch=auto",
-      "-F",
-      "TODO",
-      "testdata/basic"
-    );
+  argv_alloc(
+    "slg",
+    "--jobs", "auto",
+    "--split-depth=auto",
+    "--queue-cap", "auto",
+    "--target-jobs", "auto",
+    "--max-jobs-total", "AUTO",
+    "--file-batch=auto",
+    "-F",
+    "TODO",
+    "testdata/basic"
+  );
   assert(av_opt != None, "argv alloc failed");
   let mut av: ArgvOwned = av_opt ?? ArgvOwned{ argc: 0, argv: 0 };
 
@@ -866,19 +964,19 @@ test "slg e2e - concurrency options accept auto keyword" {
 
 test "slg e2e - concurrency values are clamped" {
   let av_opt: ArgvOwned? =
-    argv_alloc(
-      "slg",
-      "--jobs=999999",
-      "--max-workers=999999",
-      "--split-depth=999",
-      "--queue-cap=999999",
-      "--target-jobs=9999999",
-      "--max-jobs-total=9999999",
-      "--file-batch=999999",
-      "-F",
-      "TODO",
-      "testdata/basic"
-    );
+  argv_alloc(
+    "slg",
+    "--jobs=999999",
+    "--max-workers=999999",
+    "--split-depth=999",
+    "--queue-cap=999999",
+    "--target-jobs=9999999",
+    "--max-jobs-total=9999999",
+    "--file-batch=999999",
+    "-F",
+    "TODO",
+    "testdata/basic"
+  );
   assert(av_opt != None, "argv alloc failed");
   let mut av: ArgvOwned = av_opt ?? ArgvOwned{ argc: 0, argv: 0 };
 
@@ -1173,14 +1271,14 @@ test "slg e2e - -l regex prefix scan avoids false positives" {
   // Ensure the file continues past the probe and does not end in `needle`.
   std::runtime::mem::store_u8(buf, probe, 120); // 'x'
 
-  let fd: int =
-  std::runtime::posix::fs::open(
+  let fd = std::runtime::posix::fs::open(
     path,
     std::runtime::posix::fs::O_WRONLY | std::runtime::posix::fs::O_CREAT | std::runtime::posix::fs::O_TRUNC,
     420 // 0644
-  ) as int;
+  );
+
   assert(fd >= 0, "open failed");
-  let ok_write: bool = write_all_fd(fd, buf, total_len);
+  let ok_write: bool = write_all_fd(fd as int, buf, total_len);
   let _ = std::runtime::posix::fs::close(fd);
   std::runtime::mem::free(buf);
   assert(ok_write, "write failed");

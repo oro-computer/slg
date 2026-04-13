@@ -1,8 +1,8 @@
 module slg::buf;
 
+import { OutOfMemory } from "std/memory";
 import std::interfaces;
 import std::runtime::mem;
-import { OutOfMemory } from "std/memory";
 
 import { memcpy } from "./os.slk";
 
@@ -50,7 +50,7 @@ impl BufferU8 {
     return BufferU8{ ptr: 0, len: 0, cap: 0 };
   }
 
-  /**
+/**
    * Allocate a new buffer with at least `cap` bytes of capacity.
    *
    * @param cap: i64 Initial capacity in bytes (<= 0 yields `empty()`).
@@ -60,28 +60,30 @@ impl BufferU8 {
     if cap <= 0 {
       return Some(BufferU8.empty());
     }
+
     let ptr: u64 = std::runtime::mem::alloc(cap);
     if ptr == 0 {
       return None;
     }
+
     return Some(BufferU8{ ptr: ptr, len: 0, cap: cap });
   }
 
-  /**
+/**
    * Return a slice view of the currently written bytes.
    */
   public fn as_bytes (self: &BufferU8) -> ByteSlice {
     return ByteSlice{ ptr: self.ptr, len: self.len };
   }
 
-  /**
+/**
    * Clear the logical contents without freeing capacity.
    */
   public fn clear (mut self: &BufferU8) -> void {
     self.len = 0;
   }
 
-  /**
+/**
    * Ensure there is capacity for at least `additional` more bytes.
    *
    * @returns OutOfMemory? `None` on success, otherwise `Some(OutOfMemory)`.
@@ -90,9 +92,11 @@ impl BufferU8 {
     if additional <= 0 {
       return None;
     }
+
     if self.len < 0 || self.cap < 0 {
       return Some(oom(additional));
     }
+
     let needed: i64 = self.len + additional;
     if needed <= self.cap {
       return None;
@@ -100,13 +104,18 @@ impl BufferU8 {
 
     // Growth policy: double, with a small baseline.
     let max_i64: i64 = 9223372036854775807 as i64;
-    var new_cap: i64 = if self.cap > 0 { self.cap } else { 64 };
+    var new_cap: i64 = if self.cap > 0 {
+      self.cap
+    } else {
+      64
+    };
     while new_cap < needed {
       // Prevent overflow on doubling (best-effort).
       if new_cap > max_i64 / 2 {
         new_cap = needed;
         break;
       }
+
       new_cap = new_cap * 2;
     }
 
@@ -114,12 +123,13 @@ impl BufferU8 {
     if new_ptr == 0 {
       return Some(oom(new_cap));
     }
+
     self.ptr = new_ptr;
     self.cap = new_cap;
     return None;
   }
 
-  /**
+/**
    * Append one byte.
    */
   public fn push_u8 (mut self: &BufferU8, value: u8) -> OutOfMemory? {
@@ -127,29 +137,32 @@ impl BufferU8 {
     if err != None {
       return err;
     }
+
     std::runtime::mem::store_u8(self.ptr, self.len, value);
     self.len = self.len + 1;
     return None;
   }
 
-  /**
+/**
    * Append `len` bytes starting at `ptr`.
    */
   public fn push_ptr_len (mut self: &BufferU8, ptr: u64, len: i64) -> OutOfMemory? {
     if len <= 0 {
       return None;
     }
+
     let err: OutOfMemory? = self.reserve_additional(len);
     if err != None {
       return err;
     }
+
     let dst: u64 = self.ptr + (self.len as u64);
     let _ = memcpy(dst, ptr, len);
     self.len = self.len + len;
     return None;
   }
 
-  /**
+/**
    * Append a `string`'s bytes.
    */
   public fn push_str (mut self: &BufferU8, s: string) -> OutOfMemory? {

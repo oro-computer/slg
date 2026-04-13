@@ -12,6 +12,7 @@ import { vararg_string_at } from "./varargs.slk";
 //
 // Note: `task fn` calls currently spawn OS threads in the hosted subset, so we
 // clamp values to avoid accidental thread explosions (e.g. `--jobs=9999999`).
+
 export const MAX_JOBS_HARD: int = 1024;
 
 /**
@@ -157,13 +158,14 @@ impl Config {
     return self.paths_count;
   }
 
-  /**
+/**
    * Return the `index`th root path from argv, or `None` when out of range.
    */
   public fn path_at (self: &Config, index: int) -> string? {
     if index < 0 || index >= self.paths_count {
       return None;
     }
+
     return Some(self.args.get(self.paths_start + index));
   }
 
@@ -281,6 +283,7 @@ fn print_error (...parts: string) -> void {
     let _ = write_str(2, s);
     i = i + 1;
   }
+
   let _ = write_str(2, "\n");
 }
 
@@ -289,6 +292,7 @@ fn is_flag (s: string) -> bool {
   if n < 2 {
     return false;
   }
+
   let p: u64 = std::runtime::mem::string_ptr(s);
   return std::runtime::mem::load_u8(p, 0) == 45; // '-'
 }
@@ -298,6 +302,7 @@ fn has_ascii_upper (s: string) -> bool {
   if n <= 0 {
     return false;
   }
+
   let p: u64 = std::runtime::mem::string_ptr(s);
   var i: i64 = 0;
   while i < n {
@@ -305,8 +310,10 @@ fn has_ascii_upper (s: string) -> bool {
     if b >= 65 && b <= 90 {
       return true;
     }
+
     i = i + 1;
   }
+
   return false;
 }
 
@@ -316,6 +323,7 @@ fn split_eq_value (s: string, prefix: string) -> string? {
   if s_len <= p_len + 1 {
     return None;
   }
+
   let s_ptr: u64 = std::runtime::mem::string_ptr(s);
   let p_ptr: u64 = std::runtime::mem::string_ptr(prefix);
 
@@ -325,6 +333,7 @@ fn split_eq_value (s: string, prefix: string) -> string? {
     if std::runtime::mem::load_u8(s_ptr, i) != std::runtime::mem::load_u8(p_ptr, i) {
       return None;
     }
+
     i = i + 1;
   }
 
@@ -338,6 +347,7 @@ fn split_eq_value (s: string, prefix: string) -> string? {
   if v_len <= 0 {
     return Some("");
   }
+
   return Some(std::runtime::mem::string_from_ptr_len(v_ptr, v_len as int));
 }
 
@@ -346,6 +356,7 @@ fn parse_int (s: string) -> int? {
   if n <= 0 {
     return None;
   }
+
   let ptr: u64 = std::runtime::mem::string_ptr(s);
 
   var i: i64 = 0;
@@ -357,6 +368,7 @@ fn parse_int (s: string) -> int? {
   } else if b0 == 43 { // '+'
     i = 1;
   }
+
   if i >= n {
     return None;
   }
@@ -367,6 +379,7 @@ fn parse_int (s: string) -> int? {
     if b < 48 || b > 57 {
       return None;
     }
+
     v = (v * 10) + ((b - 48) as i64);
     i = i + 1;
   }
@@ -379,6 +392,7 @@ fn is_ascii_auto (s: string) -> bool {
   if n != 4 {
     return false;
   }
+
   let ptr: u64 = std::runtime::mem::string_ptr(s);
   if ptr == 0 {
     return false;
@@ -388,18 +402,22 @@ fn is_ascii_auto (s: string) -> bool {
   if b0 != 97 && b0 != 65 { // a/A
     return false;
   }
+
   let b1: u8 = std::runtime::mem::load_u8(ptr, 1);
   if b1 != 117 && b1 != 85 { // u/U
     return false;
   }
+
   let b2: u8 = std::runtime::mem::load_u8(ptr, 2);
   if b2 != 116 && b2 != 84 { // t/T
     return false;
   }
+
   let b3: u8 = std::runtime::mem::load_u8(ptr, 3);
   if b3 != 111 && b3 != 79 { // o/O
     return false;
   }
+
   return true;
 }
 
@@ -407,6 +425,7 @@ fn parse_int_or_auto (s: string) -> int? {
   if is_ascii_auto(s) {
     return Some(0);
   }
+
   return parse_int(s);
 }
 
@@ -477,11 +496,13 @@ export fn parse_cli (args: Args) -> Config? {
         i = i + 1;
         continue;
       }
+
       if a == "-V" || a == "--version" {
         version = true;
         i = i + 1;
         continue;
       }
+
       if a == "--files" {
         if mode != Mode::Files && pattern != None && pattern_index >= 0 {
           paths_start = pattern_index;
@@ -490,6 +511,7 @@ export fn parse_cli (args: Args) -> Config? {
           pattern = None;
           pattern_index = -1;
         }
+
         mode = Mode::Files;
         i = i + 1;
         continue;
@@ -497,34 +519,39 @@ export fn parse_cli (args: Args) -> Config? {
 
       // Matching.
       if a == "-F" ||
-        a == "-Q" ||
-        a == "--fixed-string" ||
-        a == "--literal" ||
-        a == "--fixed-strings" {
+      a == "-Q" ||
+      a == "--fixed-string" ||
+      a == "--literal" ||
+      a == "--fixed-strings" {
         fixed_string = true;
         i = i + 1;
         continue;
       }
+
       if a == "-i" || a == "--ignore-case" {
         ignore_case = true;
         i = i + 1;
         continue;
       }
+
       if a == "-S" || a == "--smart-case" {
         smart_case = true;
         i = i + 1;
         continue;
       }
+
       if a == "--no-smart-case" {
         smart_case = false;
         i = i + 1;
         continue;
       }
+
       if a == "-m" || a == "--max-count" {
         if i + 1 >= argc {
           print_error("slg: missing value for ", a);
           return None;
         }
+
         let v_s: string = args.get(i + 1);
         let v_opt: int? = parse_int_or_auto(v_s);
         let Some(v) = v_opt else {
@@ -535,6 +562,7 @@ export fn parse_cli (args: Args) -> Config? {
           print_error("slg: invalid value for ", a, ": must be >= 0");
           return None;
         }
+
         max_count = v;
         i = i + 2;
         continue;
@@ -552,6 +580,7 @@ export fn parse_cli (args: Args) -> Config? {
           print_error("slg: invalid value for ", "--max-count", ": must be >= 0");
           return None;
         }
+
         max_count = v;
         i = i + 1;
         continue;
@@ -563,11 +592,13 @@ export fn parse_cli (args: Args) -> Config? {
         i = i + 1;
         continue;
       }
+
       if a == "--follow" {
         follow = true;
         i = i + 1;
         continue;
       }
+
       if a == "--no-ignore" {
         ignore_common = false;
         ignore_vcs = false;
@@ -575,6 +606,7 @@ export fn parse_cli (args: Args) -> Config? {
         i = i + 1;
         continue;
       }
+
       if a == "--ignore" {
         ignore_common = true;
         ignore_vcs = true;
@@ -582,36 +614,43 @@ export fn parse_cli (args: Args) -> Config? {
         i = i + 1;
         continue;
       }
+
       if a == "--ignore-common" {
         ignore_common = true;
         i = i + 1;
         continue;
       }
+
       if a == "--ignore-vcs" {
         ignore_vcs = true;
         i = i + 1;
         continue;
       }
+
       if a == "--ignore-files" {
         ignore_files = true;
         i = i + 1;
         continue;
       }
+
       if a == "--no-ignore-vcs" {
         ignore_vcs = false;
         i = i + 1;
         continue;
       }
+
       if a == "--no-ignore-files" {
         ignore_files = false;
         i = i + 1;
         continue;
       }
+
       if a == "--max-depth" {
         if i + 1 >= argc {
           print_error("slg: missing value for ", a);
           return None;
         }
+
         let v_s: string = args.get(i + 1);
         let v_opt: int? = parse_int(v_s);
         let Some(v) = v_opt else {
@@ -648,11 +687,13 @@ export fn parse_cli (args: Args) -> Config? {
         i = i + 1;
         continue;
       }
+
       if a == "-j" || a == "--jobs" || a == "--threads" {
         if i + 1 >= argc {
           print_error("slg: missing value for ", a);
           return None;
         }
+
         let v_s: string = args.get(i + 1);
         let v_opt: int? = parse_int_or_auto(v_s);
         let Some(v) = v_opt else {
@@ -663,10 +704,12 @@ export fn parse_cli (args: Args) -> Config? {
           print_error("slg: invalid value for ", a, ": must be >= 0");
           return None;
         }
+
         jobs = v;
         i = i + 2;
         continue;
       }
+
       let jobs_eq: string? = split_eq_value(a, "--jobs");
       if jobs_eq != None {
         let v_s: string = jobs_eq ?? "";
@@ -679,10 +722,12 @@ export fn parse_cli (args: Args) -> Config? {
           print_error("slg: invalid value for ", "--jobs", ": must be >= 0");
           return None;
         }
+
         jobs = v;
         i = i + 1;
         continue;
       }
+
       let threads_eq: string? = split_eq_value(a, "--threads");
       if threads_eq != None {
         let v_s: string = threads_eq ?? "";
@@ -695,6 +740,7 @@ export fn parse_cli (args: Args) -> Config? {
           print_error("slg: invalid value for ", "--threads", ": must be >= 0");
           return None;
         }
+
         jobs = v;
         i = i + 1;
         continue;
@@ -705,6 +751,7 @@ export fn parse_cli (args: Args) -> Config? {
           print_error("slg: missing value for ", a);
           return None;
         }
+
         let v_s: string = args.get(i + 1);
         let v_opt: int? = parse_int(v_s);
         let Some(v) = v_opt else {
@@ -715,10 +762,12 @@ export fn parse_cli (args: Args) -> Config? {
           print_error("slg: invalid value for ", a, ": must be >= 0");
           return None;
         }
+
         max_workers = v;
         i = i + 2;
         continue;
       }
+
       let max_workers_eq: string? = split_eq_value(a, "--max-workers");
       if max_workers_eq != None {
         let v_s: string = max_workers_eq ?? "";
@@ -731,6 +780,7 @@ export fn parse_cli (args: Args) -> Config? {
           print_error("slg: invalid value for ", "--max-workers", ": must be >= 0");
           return None;
         }
+
         max_workers = v;
         i = i + 1;
         continue;
@@ -741,6 +791,7 @@ export fn parse_cli (args: Args) -> Config? {
           print_error("slg: missing value for ", a);
           return None;
         }
+
         let v_s: string = args.get(i + 1);
         let v_opt: int? = parse_int_or_auto(v_s);
         let Some(v) = v_opt else {
@@ -751,10 +802,12 @@ export fn parse_cli (args: Args) -> Config? {
           print_error("slg: invalid value for ", a, ": must be >= 0");
           return None;
         }
+
         split_depth = v;
         i = i + 2;
         continue;
       }
+
       let split_depth_eq: string? = split_eq_value(a, "--split-depth");
       if split_depth_eq != None {
         let v_s: string = split_depth_eq ?? "";
@@ -767,6 +820,7 @@ export fn parse_cli (args: Args) -> Config? {
           print_error("slg: invalid value for ", "--split-depth", ": must be >= 0");
           return None;
         }
+
         split_depth = v;
         i = i + 1;
         continue;
@@ -777,6 +831,7 @@ export fn parse_cli (args: Args) -> Config? {
           print_error("slg: missing value for ", a);
           return None;
         }
+
         let v_s: string = args.get(i + 1);
         let v_opt: int? = parse_int_or_auto(v_s);
         let Some(v) = v_opt else {
@@ -787,10 +842,12 @@ export fn parse_cli (args: Args) -> Config? {
           print_error("slg: invalid value for ", a, ": must be >= 0");
           return None;
         }
+
         queue_cap = v;
         i = i + 2;
         continue;
       }
+
       let queue_cap_eq: string? = split_eq_value(a, "--queue-cap");
       if queue_cap_eq != None {
         let v_s: string = queue_cap_eq ?? "";
@@ -803,6 +860,7 @@ export fn parse_cli (args: Args) -> Config? {
           print_error("slg: invalid value for ", "--queue-cap", ": must be >= 0");
           return None;
         }
+
         queue_cap = v;
         i = i + 1;
         continue;
@@ -813,6 +871,7 @@ export fn parse_cli (args: Args) -> Config? {
           print_error("slg: missing value for ", a);
           return None;
         }
+
         let v_s: string = args.get(i + 1);
         let v_opt: int? = parse_int_or_auto(v_s);
         let Some(v) = v_opt else {
@@ -823,10 +882,12 @@ export fn parse_cli (args: Args) -> Config? {
           print_error("slg: invalid value for ", a, ": must be >= 0");
           return None;
         }
+
         target_jobs = v;
         i = i + 2;
         continue;
       }
+
       let target_jobs_eq: string? = split_eq_value(a, "--target-jobs");
       if target_jobs_eq != None {
         let v_s: string = target_jobs_eq ?? "";
@@ -839,6 +900,7 @@ export fn parse_cli (args: Args) -> Config? {
           print_error("slg: invalid value for ", "--target-jobs", ": must be >= 0");
           return None;
         }
+
         target_jobs = v;
         i = i + 1;
         continue;
@@ -849,6 +911,7 @@ export fn parse_cli (args: Args) -> Config? {
           print_error("slg: missing value for ", a);
           return None;
         }
+
         let v_s: string = args.get(i + 1);
         let v_opt: int? = parse_int_or_auto(v_s);
         let Some(v) = v_opt else {
@@ -859,10 +922,12 @@ export fn parse_cli (args: Args) -> Config? {
           print_error("slg: invalid value for ", a, ": must be >= 0");
           return None;
         }
+
         max_jobs_total = v;
         i = i + 2;
         continue;
       }
+
       let max_jobs_total_eq: string? = split_eq_value(a, "--max-jobs-total");
       if max_jobs_total_eq != None {
         let v_s: string = max_jobs_total_eq ?? "";
@@ -875,6 +940,7 @@ export fn parse_cli (args: Args) -> Config? {
           print_error("slg: invalid value for ", "--max-jobs-total", ": must be >= 0");
           return None;
         }
+
         max_jobs_total = v;
         i = i + 1;
         continue;
@@ -885,6 +951,7 @@ export fn parse_cli (args: Args) -> Config? {
         i = i + 1;
         continue;
       }
+
       if a == "--file-jobs" {
         file_jobs = true;
         i = i + 1;
@@ -896,6 +963,7 @@ export fn parse_cli (args: Args) -> Config? {
           print_error("slg: missing value for ", a);
           return None;
         }
+
         let v_s: string = args.get(i + 1);
         let v_opt: int? = parse_int_or_auto(v_s);
         let Some(v) = v_opt else {
@@ -906,10 +974,12 @@ export fn parse_cli (args: Args) -> Config? {
           print_error("slg: invalid value for ", a, ": must be >= 0");
           return None;
         }
+
         file_batch = v;
         i = i + 2;
         continue;
       }
+
       let file_batch_eq: string? = split_eq_value(a, "--file-batch");
       if file_batch_eq != None {
         let v_s: string = file_batch_eq ?? "";
@@ -922,6 +992,7 @@ export fn parse_cli (args: Args) -> Config? {
           print_error("slg: invalid value for ", "--file-batch", ": must be >= 0");
           return None;
         }
+
         file_batch = v;
         i = i + 1;
         continue;
@@ -946,31 +1017,37 @@ export fn parse_cli (args: Args) -> Config? {
         i = i + 1;
         continue;
       }
+
       if a == "--heading" {
         heading = true;
         i = i + 1;
         continue;
       }
+
       if a == "--no-line-number" || a == "--no-numbers" {
         line_number = false;
         i = i + 1;
         continue;
       }
+
       if a == "-n" || a == "--line-number" {
         line_number = true;
         i = i + 1;
         continue;
       }
+
       if a == "--column" {
         column = true;
         i = i + 1;
         continue;
       }
+
       if a == "--stats" {
         stats = true;
         i = i + 1;
         continue;
       }
+
       if a == "-q" || a == "--quiet" {
         quiet = true;
         i = i + 1;
@@ -983,21 +1060,25 @@ export fn parse_cli (args: Args) -> Config? {
         i = i + 1;
         continue;
       }
+
       if a == "--color" {
         if i + 1 >= argc {
           print_error("slg: missing value for ", a);
           return None;
         }
+
         let v_s: string = args.get(i + 1);
         let m_opt: ColorMode? = parse_mode(v_s);
         if m_opt == None {
           print_error("slg: invalid value for ", a, ": expected auto|always|never");
           return None;
         }
+
         color_mode = m_opt ?? ColorMode::Auto;
         i = i + 2;
         continue;
       }
+
       let color_eq: string? = split_eq_value(a, "--color");
       if color_eq != None {
         let v_s: string = color_eq ?? "";
@@ -1006,6 +1087,7 @@ export fn parse_cli (args: Args) -> Config? {
           print_error("slg: invalid value for ", "--color", ": expected auto|always|never");
           return None;
         }
+
         color_mode = m_opt ?? ColorMode::Auto;
         i = i + 1;
         continue;
@@ -1031,8 +1113,10 @@ export fn parse_cli (args: Args) -> Config? {
       } else {
         paths_start = i;
       }
+
       path_write = paths_start;
     }
+
     argv_set_ptr(&args, path_write, args.ptr(i));
     path_write = path_write + 1;
     paths_count = paths_count + 1;
@@ -1061,6 +1145,7 @@ export fn parse_cli (args: Args) -> Config? {
   if jobs > MAX_JOBS_HARD {
     jobs = MAX_JOBS_HARD;
   }
+
   if max_workers > (MAX_JOBS_HARD - 1) {
     max_workers = MAX_JOBS_HARD - 1;
   }
@@ -1071,46 +1156,57 @@ export fn parse_cli (args: Args) -> Config? {
   }
 
   // Clamp advanced scheduler tuning.
-  if queue_cap > 65536 { queue_cap = 65536; }
-  if target_jobs > 1048576 { target_jobs = 1048576; }
-  if max_jobs_total > 1048576 { max_jobs_total = 1048576; }
-  if file_batch > 4096 { file_batch = 4096; }
+  if queue_cap > 65536 {
+    queue_cap = 65536;
+  }
+
+  if target_jobs > 1048576 {
+    target_jobs = 1048576;
+  }
+
+  if max_jobs_total > 1048576 {
+    max_jobs_total = 1048576;
+  }
+
+  if file_batch > 4096 {
+    file_batch = 4096;
+  }
 
   return Some(Config{
-    args: args,
-    mode: mode,
-    pattern: pattern,
-    paths_start: paths_start,
-    paths_count: paths_count,
-    fixed_string: fixed_string,
-    ignore_case: ignore_case,
-    hidden: hidden,
-    follow: follow,
-    max_depth: max_depth,
-    ignore_common: ignore_common,
-    ignore_vcs: ignore_vcs,
-    ignore_files: ignore_files,
-    jobs: jobs,
-    max_workers: max_workers,
-    split_depth: split_depth,
-    queue_cap: queue_cap,
-    target_jobs: target_jobs,
-    max_jobs_total: max_jobs_total,
-    file_jobs: file_jobs,
-    file_batch: file_batch,
-    parallel_files: parallel_files,
-    text: text,
-    files_with_matches: files_with_matches,
-    heading: heading,
-    line_number: line_number,
-    column: column,
-    stats: stats,
-    quiet: quiet,
-    max_count: max_count,
-    color_mode: color_mode_code(color_mode),
-    help: help,
-    version: version,
-  });
+      args: args,
+      mode: mode,
+      pattern: pattern,
+      paths_start: paths_start,
+      paths_count: paths_count,
+      fixed_string: fixed_string,
+      ignore_case: ignore_case,
+      hidden: hidden,
+      follow: follow,
+      max_depth: max_depth,
+      ignore_common: ignore_common,
+      ignore_vcs: ignore_vcs,
+      ignore_files: ignore_files,
+      jobs: jobs,
+      max_workers: max_workers,
+      split_depth: split_depth,
+      queue_cap: queue_cap,
+      target_jobs: target_jobs,
+      max_jobs_total: max_jobs_total,
+      file_jobs: file_jobs,
+      file_batch: file_batch,
+      parallel_files: parallel_files,
+      text: text,
+      files_with_matches: files_with_matches,
+      heading: heading,
+      line_number: line_number,
+      column: column,
+      stats: stats,
+      quiet: quiet,
+      max_count: max_count,
+      color_mode: color_mode_code(color_mode),
+      help: help,
+      version: version,
+    });
 }
 
 /**
