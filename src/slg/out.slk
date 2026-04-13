@@ -34,8 +34,10 @@ export fn write_all (fd: int, ptr: u64, len: i64) -> bool {
       if errno() == EINTR {
         continue;
       }
+
       return false;
     }
+
     if n == 0 {
       return false;
     }

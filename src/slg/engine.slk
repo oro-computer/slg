@@ -10,7 +10,12 @@ import std::task;
 import std::vector;
 
 import { BufferU8 } from "./buf.slk";
-import { Config, MAX_JOBS_HARD, Mode, PathIter } from "./cli.slk";
+import {
+  Config,
+  MAX_JOBS_HARD,
+  Mode,
+  PathIter,
+} from "./cli.slk";
 import {
   BOLD,
   ColorMode,
@@ -56,7 +61,7 @@ import {
   mmap,
   munmap,
   opendir,
-  readdir
+  readdir,
 } from "./os.slk";
 import { Writer } from "./out.slk";
 import {
@@ -194,6 +199,7 @@ fn path_view (p: &PathBuf) -> PathView {
   if p.ptr == 0 || p.len <= 0 {
     return PathView{ ptr: std::runtime::mem::string_ptr(DOT_PATH), len: DOT_PATH_LEN };
   }
+
   return PathView{ ptr: p.ptr, len: p.len };
 }
 
@@ -203,6 +209,7 @@ fn path_view_str (s: string) -> PathView {
   if ptr == 0 || len <= 0 {
     return PathView{ ptr: std::runtime::mem::string_ptr(DOT_PATH), len: DOT_PATH_LEN };
   }
+
   return PathView{ ptr: ptr, len: len };
 }
 
@@ -210,6 +217,7 @@ fn path_view_string (p: PathView) -> string {
   if p.ptr == 0 || p.len <= 0 {
     return DOT_PATH;
   }
+
   return std::runtime::mem::string_from_ptr_len(p.ptr, p.len as int);
 }
 
@@ -218,6 +226,7 @@ fn path_open_path (p: &PathBuf) -> string {
   if p.ptr == 0 || p.len <= 0 {
     return DOT_PATH;
   }
+
   return p.as_string();
 }
 
@@ -586,6 +595,7 @@ fn dirent_d_type (dent: u64) -> u8 {
 fn dirent_name_ptr (dent: u64) -> u64 {
   return dent + (dirent_name_offset(dent) as u64);
 }
+
 fn detect_binary (ptr: u64, len: i64) -> bool {
   if ptr == 0 || len <= 0 {
     return false;
@@ -651,7 +661,10 @@ fn write_error (mut err: &Writer, io: &IO, path: PathView, msg: string) -> void 
   let _ = err.push_str(msg);
   let _ = err.push_str(": ");
   let _ = err.push_ptr_len(path.ptr, path.len);
-  if err.color { let _ = err.push_str(reset); }
+  if err.color {
+    let _ = err.push_str(reset);
+  }
+
   let _ = err.push_u8(10);
   let _ = flush_locked_or_cancel(mut err, io, io.err_lock);
 }
@@ -664,8 +677,12 @@ fn print_heading (mut out: &Writer, io: &IO, path: PathView) -> bool {
     let _ = out.push_str(bold);
     let _ = out.push_str(underline);
   }
+
   let _ = out.push_ptr_len(path.ptr, path.len);
-  if out.color { let _ = out.push_str(reset); }
+  if out.color {
+    let _ = out.push_str(reset);
+  }
+
   let _ = out.push_u8(10);
   return flush_out_if_needed(mut out, io);
 }
@@ -694,9 +711,15 @@ fn append_match_line (
 
   // Prefix.
   if !cfg.heading {
-    if out.color { let _ = out.push_str(fg_cyan); }
+    if out.color {
+      let _ = out.push_str(fg_cyan);
+    }
+
     let _ = out.push_ptr_len(path.ptr, path.len);
-    if out.color { let _ = out.push_str(reset); }
+    if out.color {
+      let _ = out.push_str(reset);
+    }
+
     let _ = out.push_u8(58); // ':'
   }
 
@@ -1188,7 +1211,11 @@ fn search_file_bytes (
         while counted_off < match_off {
           let seg_ptr: u64 = ptr + (counted_off as u64);
           let seg_len: i64 = match_off - counted_off;
-          let seg_nl: u64 = if seg_len > 0 { memchr(seg_ptr, 10, seg_len) } else { 0 };
+          let seg_nl: u64 = if seg_len > 0 {
+            memchr(seg_ptr, 10, seg_len)
+          } else {
+            0
+          };
           if seg_nl == 0 {
             break;
           } else {
@@ -1196,6 +1223,7 @@ fn search_file_bytes (
             line_no = line_no + 1;
           }
         }
+
         let line_start: i64 = counted_off;
 
         // Find the end of the containing line by scanning forward for '\n'.
@@ -1318,7 +1346,11 @@ fn search_file_bytes (
       while counted_off < match_off {
         let seg_ptr: u64 = ptr + (counted_off as u64);
         let seg_len: i64 = match_off - counted_off;
-        let seg_nl: u64 = if seg_len > 0 { memchr(seg_ptr, 10, seg_len) } else { 0 };
+        let seg_nl: u64 = if seg_len > 0 {
+          memchr(seg_ptr, 10, seg_len)
+        } else {
+          0
+        };
         if seg_nl == 0 {
           break;
         } else {
@@ -1326,6 +1358,7 @@ fn search_file_bytes (
           line_no = line_no + 1;
         }
       }
+
       let line_start: i64 = counted_off;
 
       // Find the end of the containing line by scanning forward for '\n'.
@@ -1700,9 +1733,12 @@ fn search_file (
       size_is_known = true;
       needs_restore = size <= scratch.cap;
     }
+
     if size_is_known && needs_restore {
       let back: i64 = std::runtime::posix::fs::lseek(fd, cur_off, std::runtime::posix::fs::SEEK_SET);
-      if back >= 0 { offset_restored = true; }
+      if back >= 0 {
+        offset_restored = true;
+      }
     }
 
     if size_is_known {
@@ -2183,6 +2219,7 @@ fn handle_root_files (cfg: &Config, root: string, io: &IO, mut out: &Writer, mut
   if open_root == "" {
     open_root = ".";
   }
+
   let open_root_view: PathView = path_view_str(open_root);
   let dir: u64 = opendir(open_root);
   if dir == 0 {
@@ -2234,6 +2271,7 @@ fn handle_root_search (cfg: &Config, p: &Pattern, root: string, mut scratch: &Bu
   if open_root == "" {
     open_root = ".";
   }
+
   let open_root_view: PathView = path_view_str(open_root);
   let dir: u64 = opendir(open_root);
   if dir == 0 {
@@ -3360,6 +3398,7 @@ fn split_dir_search_jobs (
                     if o.found {
                       found_any = true;
                     }
+
                     if o.stop {
                       let _ = closedir(dir);
                       path_truncate(mut path, saved_len);
@@ -3945,17 +3984,24 @@ fn resolve_jobs (cfg: &Config) -> int {
   // Heuristic:
   // - Cap auto parallelism to keep overhead reasonable on very high core-count
   //   machines (this is I/O heavy work; too many threads can be slower).
+  // - Large trees still benefit from more than the previous 8-worker ceiling,
+  //   especially on 16+ core hosts.
   // - Users can always override via `--jobs N`.
-  let auto_jobs_cap: int = 9; // 8 workers + 1 orchestrator
+  let auto_jobs_cap: int = 16; // 15 workers + 1 orchestrator
   let n: int = std::task::available_parallelism();
-  if n <= 0 { return 1; }
+  if n <= 0 {
+    return 1;
+  }
+
   var jobs: int = n;
   if jobs > auto_jobs_cap {
     jobs = auto_jobs_cap;
   }
+
   if jobs > max_jobs {
     jobs = max_jobs;
   }
+
   return jobs;
 }
 
@@ -4065,7 +4111,11 @@ export async fn run_parallel (cfg: Config) -> int {
   }
 
   let out_flush_threshold: i64 =
-    if isatty(FD_STDOUT as i32) == 1 { STDOUT_TTY_FLUSH_THRESHOLD } else { STDOUT_BUF_CAP };
+  if isatty(FD_STDOUT as i32) == 1 {
+    STDOUT_TTY_FLUSH_THRESHOLD
+  } else {
+    STDOUT_BUF_CAP
+  };
   let io: IO = IO{
     out_lock: Some(lock),
     err_lock: Some(lock),
@@ -4223,11 +4273,15 @@ export async fn run_parallel (cfg: Config) -> int {
   if root_opt == None {
     root_opt = Some(".");
   }
+
   while root_opt != None && !stop_roots {
     let root: string = root_opt ?? ".";
 
     var open_root: string = root;
-    if open_root == "" { open_root = "."; }
+    if open_root == "" {
+      open_root = ".";
+    }
+
     let open_root_view: PathView = path_view_str(open_root);
 
     let base: string = if root == "." {
@@ -4389,7 +4443,11 @@ export async fn run_auto (cfg: Config) -> int {
 export fn run (cfg: Config) -> int {
   let mode: Mode = cfg.mode;
   let out_flush_threshold: i64 =
-    if isatty(FD_STDOUT as i32) == 1 { STDOUT_TTY_FLUSH_THRESHOLD } else { STDOUT_BUF_CAP };
+  if isatty(FD_STDOUT as i32) == 1 {
+    STDOUT_TTY_FLUSH_THRESHOLD
+  } else {
+    STDOUT_BUF_CAP
+  };
   let io: IO = IO{
     out_lock: None,
     err_lock: None,
@@ -4445,6 +4503,7 @@ export fn run (cfg: Config) -> int {
           found_any = true;
           stop_roots = true;
         }
+
         root_opt = roots.next();
       }
     }
@@ -4493,6 +4552,7 @@ export fn run (cfg: Config) -> int {
           found_any = true;
           stop_roots = true;
         }
+
         root_opt = roots.next();
       }
     }

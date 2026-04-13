@@ -172,8 +172,10 @@ impl Config {
       if i == index {
         return path_opt;
       }
+
       i = i + 1;
     }
+
     return None;
   }
 
@@ -201,10 +203,12 @@ impl PathIter {
           self.i = self.i + 1;
           continue;
         }
+
         if flag_consumes_next_arg(a) {
           self.i = self.i + 2;
           continue;
         }
+
         self.i = self.i + 1;
         continue;
       }
@@ -214,6 +218,7 @@ impl PathIter {
         self.saw_pattern = true;
         continue;
       }
+
       return Some(a);
     }
 
@@ -264,7 +269,7 @@ TRAVERSAL OPTIONS:
       --no-ignore-files     Do not read .gitignore/.ignore/.agignore ignore files
 
 PARALLELISM:
-  -j, --jobs <n>            Parallel tasks (0|auto = auto (default; capped to 9), 1 = single-threaded, max: 1024)
+  -j, --jobs <n>            Parallel tasks (0|auto = auto (default; capped to 16), 1 = single-threaded, max: 1024)
                             Note: worker tasks spawn OS threads in this snapshot.
       --threads <n>         Alias for --jobs
       --max-workers <n>     Cap worker tasks (0 = no cap, default: 0, max effective: 1023)
@@ -473,18 +478,18 @@ fn parse_int_or_auto (s: string) -> int? {
 
 fn flag_consumes_next_arg (a: string) -> bool {
   return a == "-m" ||
-    a == "--max-count" ||
-    a == "--max-depth" ||
-    a == "-j" ||
-    a == "--jobs" ||
-    a == "--threads" ||
-    a == "--max-workers" ||
-    a == "--split-depth" ||
-    a == "--queue-cap" ||
-    a == "--target-jobs" ||
-    a == "--max-jobs-total" ||
-    a == "--file-batch" ||
-    a == "--color";
+  a == "--max-count" ||
+  a == "--max-depth" ||
+  a == "-j" ||
+  a == "--jobs" ||
+  a == "--threads" ||
+  a == "--max-workers" ||
+  a == "--split-depth" ||
+  a == "--queue-cap" ||
+  a == "--target-jobs" ||
+  a == "--max-jobs-total" ||
+  a == "--file-batch" ||
+  a == "--color";
 }
 
 struct PositionalScan {
@@ -512,10 +517,12 @@ fn scan_positionals (args: &Args, mode: Mode, target_path_index: int) -> Positio
         i = i + 1;
         continue;
       }
+
       if flag_consumes_next_arg(a) {
         i = i + 2;
         continue;
       }
+
       i = i + 1;
       continue;
     }
@@ -526,6 +533,7 @@ fn scan_positionals (args: &Args, mode: Mode, target_path_index: int) -> Positio
       if scan.paths_count == target_path_index {
         scan.nth_path = Some(a);
       }
+
       scan.paths_count = scan.paths_count + 1;
     }
 
@@ -1188,6 +1196,7 @@ export fn parse_cli (args: Args) -> Config? {
       print_error("slg: unknown flag: ", a, ". Try: slg --help");
       return None;
     }
+
     i = i + 1;
   }
 
@@ -1245,39 +1254,39 @@ export fn parse_cli (args: Args) -> Config? {
   }
 
   return Some(Config{
-    args: args,
-    mode: mode,
-    pattern: pattern,
-    paths_count: paths_count,
-    fixed_string: fixed_string,
-    ignore_case: ignore_case,
-    hidden: hidden,
-    follow: follow,
-    max_depth: max_depth,
-    ignore_common: ignore_common,
-    ignore_vcs: ignore_vcs,
-    ignore_files: ignore_files,
-    jobs: jobs,
-    max_workers: max_workers,
-    split_depth: split_depth,
-    queue_cap: queue_cap,
-    target_jobs: target_jobs,
-    max_jobs_total: max_jobs_total,
-    file_jobs: file_jobs,
-    file_batch: file_batch,
-    parallel_files: parallel_files,
-    text: text,
-    files_with_matches: files_with_matches,
-    heading: heading,
-    line_number: line_number,
-    column: column,
-    stats: stats,
-    quiet: quiet,
-    max_count: max_count,
-    color_mode: color_mode,
-    help: help,
-    version: version,
-  });
+      args: args,
+      mode: mode,
+      pattern: pattern,
+      paths_count: paths_count,
+      fixed_string: fixed_string,
+      ignore_case: ignore_case,
+      hidden: hidden,
+      follow: follow,
+      max_depth: max_depth,
+      ignore_common: ignore_common,
+      ignore_vcs: ignore_vcs,
+      ignore_files: ignore_files,
+      jobs: jobs,
+      max_workers: max_workers,
+      split_depth: split_depth,
+      queue_cap: queue_cap,
+      target_jobs: target_jobs,
+      max_jobs_total: max_jobs_total,
+      file_jobs: file_jobs,
+      file_batch: file_batch,
+      parallel_files: parallel_files,
+      text: text,
+      files_with_matches: files_with_matches,
+      heading: heading,
+      line_number: line_number,
+      column: column,
+      stats: stats,
+      quiet: quiet,
+      max_count: max_count,
+      color_mode: color_mode,
+      help: help,
+      version: version,
+    });
 }
 
 /**
