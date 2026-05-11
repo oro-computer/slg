@@ -1,13 +1,25 @@
 module slg::engine;
 
-import std::path;
-import std::runtime::mem;
-import std::runtime::posix::fs;
-import std::runtime::posix::io;
-import std::runtime::posix::time;
-import std::sync;
+import { from_raw as bytes_from_raw } from "std/bytes";
+import {
+  Dir,
+  DirEntryType,
+  FSErrorKind,
+  File,
+  MMap,
+  PathKind,
+  path_kind,
+} from "std/fs";
+import { isatty } from "std/io";
+import { PathBuf } from "std/path";
+import { RegExp } from "std/regex";
+import mem from "std/runtime/mem";
+import { CancellationTokenBorrow, Channel, MutexBorrow } from "std/sync";
+import sync from "std/sync";
+import { available_parallelism } from "std/task";
+import { monotonic_now } from "std/time";
+import { Vector } from "std/vector";
 import std::task;
-import std::vector;
 
 import { BufferU8 } from "./buf.slk";
 import {
@@ -43,25 +55,10 @@ import {
   push_dir_cached as ignore_push_dir_cached,
 } from "./ignore.slk";
 import {
-  DT_DIR,
-  DT_LNK,
-  DT_REG,
-  DT_UNKNOWN,
-  EINTR,
-  ENOTDIR,
-  MAP_FAILED,
-  MAP_PRIVATE,
-  PROT_READ,
-  closedir,
-  errno,
-  isatty,
   memchr,
+  memcmp,
   memcpy,
   memmem,
-  mmap,
-  munmap,
-  opendir,
-  readdir,
 } from "./os.slk";
 import { Writer } from "./out.slk";
 import {
@@ -75,10 +72,7 @@ import {
   next_match_ptr_len,
 } from "./pattern.slk";
 
-type PathBuf = std::path::PathBuf;
-type PathBufResult = std::path::PathBufResult;
-type JobChannel = std::sync::__ChannelU64;
-type JobChannelResult = std::result::Result(JobChannel, std::sync::SyncFailed);
+type JobChannel = Channel(u64);
 
 // Output buffering.
 //
@@ -89,16 +83,17 @@ let STDOUT_BUF_CAP: i64 = 65536;
 let STDERR_BUF_CAP: i64 = 16384;
 let STDOUT_TTY_FLUSH_THRESHOLD: i64 = 8192;
 let READ_SCRATCH_CAP: i64 = 65536;
-let READ_SCRATCH_PROBE: i64 = 16384;
+let READ_SCRATCH_PROBE: i64 = 4096;
+
 /**
- * Truncate a `std::path::PathBuf` to `new_len` bytes (O(1)).
+ * Truncate a `PathBuf` to `new_len` bytes (O(1)).
  *
  * `slg` uses a single mutable path buffer in hot directory-walk loops:
  * - append a component (`path_push_component_ptr_len(...)`),
  * - process the child path,
  * - restore the previous length.
  *
- * `std::path::PathBuf` provides `truncate_len` for this, but we keep a small
+ * `PathBuf` provides `truncate_len` for this, but we keep a small
  * wrapper so hot loops stay consistent and easy to grep.
  *
  * @param p: &mut PathBuf Path buffer to truncate.
@@ -136,7 +131,7 @@ fn path_reserve_additional (mut p: &PathBuf, additional: i64) -> bool {
     new_cap = new_cap * 2;
   }
 
-  let new_ptr: u64 = std::runtime::mem::realloc(p.ptr, new_cap);
+  let new_ptr: u64 = mem::realloc(p.ptr, new_cap);
   if new_ptr == 0 {
     return false;
   }
@@ -144,7 +139,7 @@ fn path_reserve_additional (mut p: &PathBuf, additional: i64) -> bool {
   p.ptr = new_ptr;
   p.cap = new_cap;
   if p.len == 0 {
-    std::runtime::mem::store_u8(p.ptr, 0, 0);
+    mem::store_u8(p.ptr, 0, 0);
   }
 
   return true;
@@ -157,7 +152,7 @@ fn path_push_component_ptr_len (mut p: &PathBuf, part_ptr: u64, part_len: i64) -
 
   var need_sep: bool = false;
   if p.len > 0 && p.ptr != 0 {
-    let last: u8 = std::runtime::mem::load_u8(p.ptr, p.len - 1);
+    let last: u8 = mem::load_u8(p.ptr, p.len - 1);
     if last != 47 { // '/'
       need_sep = true;
     }
@@ -173,21 +168,21 @@ fn path_push_component_ptr_len (mut p: &PathBuf, part_ptr: u64, part_len: i64) -
   }
 
   if need_sep {
-    std::runtime::mem::store_u8(p.ptr, p.len, 47);
+    mem::store_u8(p.ptr, p.len, 47);
     p.len = p.len + 1;
   }
 
   let dst: u64 = p.ptr + (p.len as u64);
   let _ = memcpy(dst, part_ptr, part_len);
   p.len = p.len + part_len;
-  std::runtime::mem::store_u8(p.ptr, p.len, 0);
+  mem::store_u8(p.ptr, p.len, 0);
   return true;
 }
 
 struct PathView {
-  // Pointer to NUL-terminated bytes.
+  // Pointer to path bytes.
   ptr: u64,
-  // Byte length (excluding NUL).
+  // Byte length.
   len: i64,
 }
 
@@ -197,17 +192,17 @@ let DOT_PATH_LEN: i64 = 1;
 fn path_view (p: &PathBuf) -> PathView {
   // `PathBuf{len==0}` represents the implicit `"."` root in `slg`.
   if p.ptr == 0 || p.len <= 0 {
-    return PathView{ ptr: std::runtime::mem::string_ptr(DOT_PATH), len: DOT_PATH_LEN };
+    return PathView{ ptr: DOT_PATH as raw u64, len: DOT_PATH_LEN };
   }
 
   return PathView{ ptr: p.ptr, len: p.len };
 }
 
 fn path_view_str (s: string) -> PathView {
-  let ptr: u64 = std::runtime::mem::string_ptr(s);
-  let len: i64 = std::runtime::mem::string_len(s);
+  let ptr: u64 = s as raw u64;
+  let len: i64 = sizeof(s) as i64;
   if ptr == 0 || len <= 0 {
-    return PathView{ ptr: std::runtime::mem::string_ptr(DOT_PATH), len: DOT_PATH_LEN };
+    return PathView{ ptr: DOT_PATH as raw u64, len: DOT_PATH_LEN };
   }
 
   return PathView{ ptr: ptr, len: len };
@@ -218,16 +213,7 @@ fn path_view_string (p: PathView) -> string {
     return DOT_PATH;
   }
 
-  return std::runtime::mem::string_from_ptr_len(p.ptr, p.len as int);
-}
-
-fn path_open_path (p: &PathBuf) -> string {
-  // `PathBuf{len==0}` represents the implicit `"."` root in `slg`.
-  if p.ptr == 0 || p.len <= 0 {
-    return DOT_PATH;
-  }
-
-  return p.as_string();
+  return p.ptr as string(p.len);
 }
 
 fn path_parent_len (p: &PathBuf) -> i64 {
@@ -237,7 +223,7 @@ fn path_parent_len (p: &PathBuf) -> i64 {
 
   var i: i64 = p.len - 1;
   while i >= 0 {
-    if std::runtime::mem::load_u8(p.ptr, i) == 47 { // '/'
+    if mem::load_u8(p.ptr, i) == 47 { // '/'
       if i == 0 {
         // Root directory ("/").
         return 1;
@@ -282,6 +268,13 @@ fn stats_add (mut a: &Stats, b: &Stats) -> void {
   a.errors = a.errors + b.errors;
 }
 
+fn now_monotonic_ns_or (fallback: i64) -> i64 {
+  return match (monotonic_now()) {
+    Ok(t) => t as i64,
+    Err(_) => fallback,
+  };
+}
+
 /**
  * Cross-cutting runtime knobs for the engine.
  *
@@ -290,45 +283,76 @@ fn stats_add (mut a: &Stats, b: &Stats) -> void {
  * - short-circuit work when cancellation is requested (`--quiet`, output failure).
  */
 struct IO {
-  out_lock: std::sync::MutexBorrow?,
-  err_lock: std::sync::MutexBorrow?,
-  cancel: std::sync::CancellationTokenBorrow?,
+  out_lock_handle: u64,
+  err_lock_handle: u64,
+  cancel_handle: u64,
+  has_out_lock: bool,
+  has_err_lock: bool,
+  has_cancel: bool,
   // When <= 0, flush after each output line. Otherwise flush once the buffer
   // reaches this many bytes.
   out_flush_threshold: i64,
 }
 
-fn io_none () -> IO {
-  return IO{ out_lock: None, err_lock: None, cancel: None, out_flush_threshold: STDOUT_BUF_CAP };
+fn stdout_flush_threshold () -> i64 {
+  if isatty(FD_STDOUT) {
+    return STDOUT_TTY_FLUSH_THRESHOLD;
+  }
+
+  return STDOUT_BUF_CAP;
 }
 
-fn lock_maybe (lock: std::sync::MutexBorrow?) -> void {
-  if lock == None {
+fn io_unlocked () -> IO {
+  return IO{
+    out_lock_handle: 0,
+    err_lock_handle: 0,
+    cancel_handle: 0,
+    has_out_lock: false,
+    has_err_lock: false,
+    has_cancel: false,
+    out_flush_threshold: stdout_flush_threshold(),
+  };
+}
+
+fn io_with_shared_lock (lock: MutexBorrow, cancel: CancellationTokenBorrow, has_cancel: bool) -> IO {
+  return IO{
+    out_lock_handle: lock.handle,
+    err_lock_handle: lock.handle,
+    cancel_handle: cancel.handle,
+    has_out_lock: true,
+    has_err_lock: true,
+    has_cancel: has_cancel,
+    out_flush_threshold: stdout_flush_threshold(),
+  };
+}
+
+fn lock_maybe (lock_handle: u64, enabled: bool) -> void {
+  if !enabled {
     return;
   }
 
-  let m: std::sync::MutexBorrow = lock ?? std::sync::Mutex.invalid().borrow();
-  let _ = m.lock();
+  let lock: MutexBorrow = MutexBorrow{ handle: lock_handle };
+  let _ = lock.lock();
 }
 
-fn unlock_maybe (lock: std::sync::MutexBorrow?) -> void {
-  if lock == None {
+fn unlock_maybe (lock_handle: u64, enabled: bool) -> void {
+  if !enabled {
     return;
   }
 
-  let m: std::sync::MutexBorrow = lock ?? std::sync::Mutex.invalid().borrow();
-  let _ = m.unlock();
+  let lock: MutexBorrow = MutexBorrow{ handle: lock_handle };
+  let _ = lock.unlock();
 }
 
-fn flush_locked (mut w: &Writer, lock: std::sync::MutexBorrow?) -> bool {
-  lock_maybe(lock);
+fn flush_locked (mut w: &Writer, lock_handle: u64, enabled: bool) -> bool {
+  lock_maybe(lock_handle, enabled);
   let ok: bool = w.flush();
-  unlock_maybe(lock);
+  unlock_maybe(lock_handle, enabled);
   return ok;
 }
 
-fn flush_locked_or_cancel (mut w: &Writer, io: &IO, lock: std::sync::MutexBorrow?) -> bool {
-  let ok: bool = flush_locked(mut w, lock);
+fn flush_locked_or_cancel (mut w: &Writer, io: &IO, lock_handle: u64, enabled: bool) -> bool {
+  let ok: bool = flush_locked(mut w, lock_handle, enabled);
   if !ok {
     cancel_set(io);
   }
@@ -339,7 +363,7 @@ fn flush_locked_or_cancel (mut w: &Writer, io: &IO, lock: std::sync::MutexBorrow
 fn flush_out_if_needed (mut out: &Writer, io: &IO) -> bool {
   let threshold: i64 = io.out_flush_threshold;
   if threshold <= 0 {
-    return flush_locked_or_cancel(mut out, io, io.out_lock);
+    return flush_locked_or_cancel(mut out, io, io.out_lock_handle, io.has_out_lock);
   }
   // Flush in reasonably sized chunks to reduce syscall + mutex overhead when
   // emitting lots of output (e.g., `slg .`).
@@ -347,7 +371,7 @@ fn flush_out_if_needed (mut out: &Writer, io: &IO) -> bool {
     return true;
   }
 
-  return flush_locked_or_cancel(mut out, io, io.out_lock);
+  return flush_locked_or_cancel(mut out, io, io.out_lock_handle, io.has_out_lock);
 }
 
 fn flush_out_if_nonempty (mut out: &Writer, io: &IO) -> bool {
@@ -355,27 +379,25 @@ fn flush_out_if_nonempty (mut out: &Writer, io: &IO) -> bool {
     return true;
   }
 
-  return flush_locked_or_cancel(mut out, io, io.out_lock);
+  return flush_locked_or_cancel(mut out, io, io.out_lock_handle, io.has_out_lock);
 }
 
 fn cancel_is_set (io: &IO) -> bool {
-  if io.cancel == None {
+  if !io.has_cancel {
     return false;
   }
 
-  let t: std::sync::CancellationTokenBorrow =
-  io.cancel ?? std::sync::CancellationToken.invalid().borrow();
-  return t.is_cancelled();
+  let cancel: CancellationTokenBorrow = CancellationTokenBorrow{ handle: io.cancel_handle };
+  return cancel.is_cancelled();
 }
 
 fn cancel_set (io: &IO) -> void {
-  if io.cancel == None {
+  if !io.has_cancel {
     return;
   }
 
-  let t: std::sync::CancellationTokenBorrow =
-  io.cancel ?? std::sync::CancellationToken.invalid().borrow();
-  t.cancel();
+  let cancel: CancellationTokenBorrow = CancellationTokenBorrow{ handle: io.cancel_handle };
+  cancel.cancel();
 }
 
 /**
@@ -400,13 +422,13 @@ fn is_dot_or_dotdot_ptr_len (ptr: u64, len: i64) -> bool {
   }
 
   if len == 1 {
-    return std::runtime::mem::load_u8(ptr, 0) == 46; // '.'
+    return mem::load_u8(ptr, 0) == 46; // '.'
   }
 
   if len == 2 {
     return
-    std::runtime::mem::load_u8(ptr, 0) == 46 && // '.'
-    std::runtime::mem::load_u8(ptr, 1) == 46;   // '.'
+    mem::load_u8(ptr, 0) == 46 && // '.'
+    mem::load_u8(ptr, 1) == 46;   // '.'
   }
 
   return false;
@@ -417,7 +439,7 @@ fn is_hidden_name_ptr_len (ptr: u64, len: i64) -> bool {
     return false;
   }
 
-  return std::runtime::mem::load_u8(ptr, 0) == 46; // '.'
+  return mem::load_u8(ptr, 0) == 46; // '.'
 }
 
 fn is_vcs_dir_name_ptr_len (ptr: u64, len: i64) -> bool {
@@ -428,17 +450,17 @@ fn is_vcs_dir_name_ptr_len (ptr: u64, len: i64) -> bool {
   // ".hg"
   if len == 3 {
     return
-    std::runtime::mem::load_u8(ptr, 0) == 46 &&  // '.'
-    std::runtime::mem::load_u8(ptr, 1) == 104 && // 'h'
-    std::runtime::mem::load_u8(ptr, 2) == 103;   // 'g'
+    mem::load_u8(ptr, 0) == 46 &&  // '.'
+    mem::load_u8(ptr, 1) == 104 && // 'h'
+    mem::load_u8(ptr, 2) == 103;   // 'g'
   }
 
   // ".git" / ".svn"
   if len == 4 {
-    let b0: u8 = std::runtime::mem::load_u8(ptr, 0);
-    let b1: u8 = std::runtime::mem::load_u8(ptr, 1);
-    let b2: u8 = std::runtime::mem::load_u8(ptr, 2);
-    let b3: u8 = std::runtime::mem::load_u8(ptr, 3);
+    let b0: u8 = mem::load_u8(ptr, 0);
+    let b1: u8 = mem::load_u8(ptr, 1);
+    let b2: u8 = mem::load_u8(ptr, 2);
+    let b3: u8 = mem::load_u8(ptr, 3);
     if b0 != 46 {
       return false;
     }
@@ -464,136 +486,162 @@ fn is_common_dir_name_ptr_len (ptr: u64, len: i64) -> bool {
 
   if len == 3 {
     return
-    std::runtime::mem::load_u8(ptr, 0) == 116 && // 't'
-    std::runtime::mem::load_u8(ptr, 1) == 109 && // 'm'
-    std::runtime::mem::load_u8(ptr, 2) == 112;   // 'p'
+    mem::load_u8(ptr, 0) == 116 && // 't'
+    mem::load_u8(ptr, 1) == 109 && // 'm'
+    mem::load_u8(ptr, 2) == 112;   // 'p'
   }
 
   if len == 4 {
+    let is_dist: bool =
+    mem::load_u8(ptr, 0) == 100 && // 'd'
+    mem::load_u8(ptr, 1) == 105 && // 'i'
+    mem::load_u8(ptr, 2) == 115 && // 's'
+    mem::load_u8(ptr, 3) == 116;   // 't'
+    if is_dist {
+      return true;
+    }
+
     return
-    std::runtime::mem::load_u8(ptr, 0) == 100 && // 'd'
-    std::runtime::mem::load_u8(ptr, 1) == 105 && // 'i'
-    std::runtime::mem::load_u8(ptr, 2) == 115 && // 's'
-    std::runtime::mem::load_u8(ptr, 3) == 116;   // 't'
+    mem::load_u8(ptr, 0) == 116 && // 't'
+    mem::load_u8(ptr, 1) == 97  && // 'a'
+    mem::load_u8(ptr, 2) == 103 && // 'g'
+    mem::load_u8(ptr, 3) == 115;   // 's'
   }
 
   if len == 5 {
     return
-    std::runtime::mem::load_u8(ptr, 0) == 98  && // 'b'
-    std::runtime::mem::load_u8(ptr, 1) == 117 && // 'u'
-    std::runtime::mem::load_u8(ptr, 2) == 105 && // 'i'
-    std::runtime::mem::load_u8(ptr, 3) == 108 && // 'l'
-    std::runtime::mem::load_u8(ptr, 4) == 100;   // 'd'
+    mem::load_u8(ptr, 0) == 98  && // 'b'
+    mem::load_u8(ptr, 1) == 117 && // 'u'
+    mem::load_u8(ptr, 2) == 105 && // 'i'
+    mem::load_u8(ptr, 3) == 108 && // 'l'
+    mem::load_u8(ptr, 4) == 100;   // 'd'
   }
 
   if len == 6 {
     // "target"
     let is_target: bool =
-    std::runtime::mem::load_u8(ptr, 0) == 116 && // 't'
-    std::runtime::mem::load_u8(ptr, 1) == 97  && // 'a'
-    std::runtime::mem::load_u8(ptr, 2) == 114 && // 'r'
-    std::runtime::mem::load_u8(ptr, 3) == 103 && // 'g'
-    std::runtime::mem::load_u8(ptr, 4) == 101 && // 'e'
-    std::runtime::mem::load_u8(ptr, 5) == 116;   // 't'
+    mem::load_u8(ptr, 0) == 116 && // 't'
+    mem::load_u8(ptr, 1) == 97  && // 'a'
+    mem::load_u8(ptr, 2) == 114 && // 'r'
+    mem::load_u8(ptr, 3) == 103 && // 'g'
+    mem::load_u8(ptr, 4) == 101 && // 'e'
+    mem::load_u8(ptr, 5) == 116;   // 't'
     if is_target {
       return true;
     }
 
     // ".cache"
     let is_cache: bool =
-    std::runtime::mem::load_u8(ptr, 0) == 46  && // '.'
-    std::runtime::mem::load_u8(ptr, 1) == 99  && // 'c'
-    std::runtime::mem::load_u8(ptr, 2) == 97  && // 'a'
-    std::runtime::mem::load_u8(ptr, 3) == 99  && // 'c'
-    std::runtime::mem::load_u8(ptr, 4) == 104 && // 'h'
-    std::runtime::mem::load_u8(ptr, 5) == 101;   // 'e'
+    mem::load_u8(ptr, 0) == 46  && // '.'
+    mem::load_u8(ptr, 1) == 99  && // 'c'
+    mem::load_u8(ptr, 2) == 97  && // 'a'
+    mem::load_u8(ptr, 3) == 99  && // 'c'
+    mem::load_u8(ptr, 4) == 104 && // 'h'
+    mem::load_u8(ptr, 5) == 101;   // 'e'
     return is_cache;
   }
 
   if len == 12 {
     // "node_modules"
     return
-    std::runtime::mem::load_u8(ptr, 0) == 110 && // 'n'
-    std::runtime::mem::load_u8(ptr, 1) == 111 && // 'o'
-    std::runtime::mem::load_u8(ptr, 2) == 100 && // 'd'
-    std::runtime::mem::load_u8(ptr, 3) == 101 && // 'e'
-    std::runtime::mem::load_u8(ptr, 4) == 95  && // '_'
-    std::runtime::mem::load_u8(ptr, 5) == 109 && // 'm'
-    std::runtime::mem::load_u8(ptr, 6) == 111 && // 'o'
-    std::runtime::mem::load_u8(ptr, 7) == 100 && // 'd'
-    std::runtime::mem::load_u8(ptr, 8) == 117 && // 'u'
-    std::runtime::mem::load_u8(ptr, 9) == 108 && // 'l'
-    std::runtime::mem::load_u8(ptr, 10) == 101 && // 'e'
-    std::runtime::mem::load_u8(ptr, 11) == 115;   // 's'
+    mem::load_u8(ptr, 0) == 110 && // 'n'
+    mem::load_u8(ptr, 1) == 111 && // 'o'
+    mem::load_u8(ptr, 2) == 100 && // 'd'
+    mem::load_u8(ptr, 3) == 101 && // 'e'
+    mem::load_u8(ptr, 4) == 95  && // '_'
+    mem::load_u8(ptr, 5) == 109 && // 'm'
+    mem::load_u8(ptr, 6) == 111 && // 'o'
+    mem::load_u8(ptr, 7) == 100 && // 'd'
+    mem::load_u8(ptr, 8) == 117 && // 'u'
+    mem::load_u8(ptr, 9) == 108 && // 'l'
+    mem::load_u8(ptr, 10) == 101 && // 'e'
+    mem::load_u8(ptr, 11) == 115;   // 's'
   }
 
   return false;
 }
 
-fn cstr_len (cstr: u64, max: i64) -> i64 {
-  if cstr == 0 || max <= 0 {
-    return 0;
-  }
-
-  let p: u64 = memchr(cstr, 0, max);
-  if p == 0 {
-    return max;
-  }
-
-  return (p - cstr) as i64;
-}
-
-// `struct dirent` layout varies across libc/platforms. `slg` currently needs
-// only two fields from `readdir(3)` results:
-// - `d_type`
-// - `d_name`
-//
-// Supported hosted layouts:
-// - Linux/glibc: `d_type` at 18, `d_name` at 19
-// - Darwin/BSD:  `d_type` at 20, `d_name` at 21
-//
-// Prefer the Linux layout when both offsets look plausible so existing Linux
-// behavior stays unchanged.
-fn dirent_name_looks_valid (ptr: u64, len: i64) -> bool {
-  if ptr == 0 || len <= 0 {
+fn is_common_file_name_ptr_len (ptr: u64, len: i64) -> bool {
+  if ptr == 0 {
     return false;
   }
 
-  let b0: u8 = std::runtime::mem::load_u8(ptr, 0);
-  if b0 == 0 || b0 == 47 { // NUL or '/'
-    return false;
+  if len == 4 {
+    return
+    mem::load_u8(ptr, 0) == 116 && // 't'
+    mem::load_u8(ptr, 1) == 97  && // 'a'
+    mem::load_u8(ptr, 2) == 103 && // 'g'
+    mem::load_u8(ptr, 3) == 115;   // 's'
   }
 
-  return true;
+  return false;
 }
 
-fn dirent_name_offset (dent: u64) -> i64 {
-  let linux_name_ptr: u64 = dent + 19;
-  let linux_name_len: i64 = cstr_len(linux_name_ptr, 255);
-  if dirent_name_looks_valid(linux_name_ptr, linux_name_len) {
-    return 19;
-  }
-
-  let bsd_name_ptr: u64 = dent + 21;
-  let bsd_name_len: i64 = cstr_len(bsd_name_ptr, 255);
-  if dirent_name_looks_valid(bsd_name_ptr, bsd_name_len) {
-    return 21;
-  }
-
-  return 19;
+enum ChildKind {
+  Other,
+  Directory,
+  RegularFile,
 }
 
-fn dirent_d_type (dent: u64) -> u8 {
-  let name_off: i64 = dirent_name_offset(dent);
-  if name_off == 21 {
-    return std::runtime::mem::load_u8(dent, 20);
-  }
-
-  return std::runtime::mem::load_u8(dent, 18);
+struct WalkEntry {
+  done: bool,
+  kind: DirEntryType,
+  name_ptr: u64,
+  name_len: i64,
 }
 
-fn dirent_name_ptr (dent: u64) -> u64 {
-  return dent + (dirent_name_offset(dent) as u64);
+fn next_dir_entry (mut dir: &Dir, io: &IO, path: PathView, mut err: &Writer, mut stats: &Stats) -> WalkEntry {
+  match (dir.next_view()) {
+    None => {
+      return WalkEntry{ done: true, kind: DirEntryType::Unknown, name_ptr: 0, name_len: 0 };
+    },
+    Some(r) => {
+      match (r) {
+        Ok(entry) => {
+          let name = entry.name_slice();
+          return WalkEntry{ done: false, kind: entry.file_type(), name_ptr: name.ptr, name_len: name.len };
+        },
+        Err(_) => {
+          stats.errors = stats.errors + 1;
+          write_error(mut err, io, path, "failed to read directory");
+          return WalkEntry{ done: true, kind: DirEntryType::Unknown, name_ptr: 0, name_len: 0 };
+        },
+      };
+    },
+  }
+}
+
+fn classify_child_path (cfg: &Config, kind: DirEntryType, path: &PathBuf, io: &IO, mut err: &Writer, mut stats: &Stats) -> ChildKind {
+  if kind == DirEntryType::Directory {
+    return ChildKind::Directory;
+  }
+
+  if kind == DirEntryType::RegularFile {
+    return ChildKind::RegularFile;
+  }
+
+  if kind == DirEntryType::SymbolicLink && !cfg.follow {
+    return ChildKind::Other;
+  }
+
+  if kind != DirEntryType::Unknown && kind != DirEntryType::SymbolicLink {
+    return ChildKind::Other;
+  }
+
+  match (path_kind(path_view_string(path_view(path)))) {
+    Ok(kind) => {
+      return match (kind) {
+        PathKind::Directory => ChildKind::Directory,
+        PathKind::RegularFile => ChildKind::RegularFile,
+        PathKind::Other => ChildKind::Other,
+      };
+    },
+    Err(_) => {
+      stats.errors = stats.errors + 1;
+      write_error(mut err, io, path_view(path), "failed to inspect path");
+      return ChildKind::Other;
+    },
+  };
 }
 
 fn detect_binary (ptr: u64, len: i64) -> bool {
@@ -616,7 +664,7 @@ fn complete_line_prefix_len (ptr: u64, len: i64) -> i64 {
 
   var i: i64 = len - 1;
   while i >= 0 {
-    if std::runtime::mem::load_u8(ptr, i) == 10 {
+    if mem::load_u8(ptr, i) == 10 {
       // Include the trailing '\n' so callers can safely split lines.
       return i + 1;
     }
@@ -626,6 +674,56 @@ fn complete_line_prefix_len (ptr: u64, len: i64) -> i64 {
 
   // No complete line in this prefix (only a partial line).
   return 0;
+}
+
+fn fixed_anchor_score (b: u8) -> int {
+  // Lower scores are better anchors for typical source text.
+  if b == 120 || b == 122 || b == 113 || b == 106 { // x z q j
+    return 1;
+  }
+
+  if b == 107 || b == 118 || b == 98 || b == 112 || b == 121 { // k v b p y
+    return 2;
+  }
+
+  if b == 103 || b == 102 || b == 119 || b == 109 || b == 99 { // g f w m c
+    return 3;
+  }
+
+  if b == 117 || b == 100 || b == 108 || b == 114 || b == 115 { // u d l r s
+    return 5;
+  }
+
+  if b == 110 || b == 105 || b == 111 || b == 97 || b == 116 || b == 101 { // n i o a t e
+    return 9;
+  }
+
+  if b == 32 || b == 9 || b == 10 || b == 95 || b == 45 { // whitespace, _, -
+    return 10;
+  }
+
+  return 4;
+}
+
+fn fixed_anchor_offset (needle_ptr: u64, needle_len: i64) -> i64 {
+  var best_off: i64 = 0;
+  var best_score: int = 1000;
+  var i: i64 = 0;
+  while i < needle_len {
+    let b: u8 = mem::load_u8(needle_ptr, i);
+    let score: int = fixed_anchor_score(b);
+    if score < best_score {
+      best_score = score;
+      best_off = i;
+      if score == 1 {
+        return best_off;
+      }
+    }
+
+    i = i + 1;
+  }
+
+  return best_off;
 }
 
 fn find_fixed_case_sensitive (hay_ptr: u64, hay_len: i64, needle_ptr: u64, needle_len: i64) -> u64 {
@@ -642,11 +740,77 @@ fn find_fixed_case_sensitive (hay_ptr: u64, hay_len: i64, needle_ptr: u64, needl
   }
 
   if needle_len == 1 {
-    let b: u8 = std::runtime::mem::load_u8(needle_ptr, 0);
+    let b: u8 = mem::load_u8(needle_ptr, 0);
     return memchr(hay_ptr, b as int, hay_len);
   }
 
+  if needle_len >= 3 {
+    let anchor_off: i64 = fixed_anchor_offset(needle_ptr, needle_len);
+    let anchor: u8 = mem::load_u8(needle_ptr, anchor_off);
+    let first: u8 = mem::load_u8(needle_ptr, 0);
+    let last: u8 = mem::load_u8(needle_ptr, needle_len - 1);
+    let last_start: i64 = hay_len - needle_len;
+    var search_off: i64 = anchor_off;
+    while search_off < hay_len {
+      let tail_ptr: u64 = hay_ptr + (search_off as u64);
+      let tail_len: i64 = hay_len - search_off;
+      let p: u64 = memchr(tail_ptr, anchor as int, tail_len);
+      if p == 0 {
+        return 0;
+      }
+
+      let anchor_at: i64 = (p - hay_ptr) as i64;
+      if anchor_at >= anchor_off {
+        let cand: i64 = anchor_at - anchor_off;
+        if cand <= last_start {
+          let cand_ptr: u64 = hay_ptr + (cand as u64);
+          if mem::load_u8(cand_ptr, 0) == first && mem::load_u8(cand_ptr, needle_len - 1) == last {
+            var equal: bool = true;
+            if needle_len <= 8 {
+              // Avoid a libc call for the common short-needle path.
+              var i: i64 = 1;
+              while i < needle_len - 1 && equal {
+                if mem::load_u8(cand_ptr, i) != mem::load_u8(needle_ptr, i) {
+                  equal = false;
+                } else {
+                  i = i + 1;
+                }
+              }
+            } else {
+              equal = memcmp(cand_ptr, needle_ptr, needle_len as u64) == 0;
+            }
+
+            if equal {
+              return cand_ptr;
+            }
+          }
+        }
+      }
+
+      search_off = anchor_at + 1;
+    }
+
+    return 0;
+  }
+
   return memmem(hay_ptr, hay_len, needle_ptr, needle_len);
+}
+
+fn fixed_tail_scan_start (needle_len: i64, prefix_checked_len: i64, total_len: i64) -> i64 {
+  if needle_len <= 0 || prefix_checked_len <= 0 || prefix_checked_len >= total_len {
+    return 0;
+  }
+
+  var scan_start: i64 = prefix_checked_len - needle_len + 1;
+  if scan_start < 0 {
+    scan_start = 0;
+  }
+
+  if scan_start >= total_len {
+    return 0;
+  }
+
+  return scan_start;
 }
 
 fn write_error (mut err: &Writer, io: &IO, path: PathView, msg: string) -> void {
@@ -666,7 +830,7 @@ fn write_error (mut err: &Writer, io: &IO, path: PathView, msg: string) -> void 
   }
 
   let _ = err.push_u8(10);
-  let _ = flush_locked_or_cancel(mut err, io, io.err_lock);
+  let _ = flush_locked_or_cancel(mut err, io, io.err_lock_handle, io.has_err_lock);
 }
 
 fn print_heading (mut out: &Writer, io: &IO, path: PathView) -> bool {
@@ -691,6 +855,57 @@ fn append_path_line (mut out: &Writer, io: &IO, path: PathView) -> bool {
   let _ = out.push_ptr_len(path.ptr, path.len);
   let _ = out.push_u8(10);
   return flush_out_if_needed(mut out, io);
+}
+
+fn search_fixed_l_bytes (
+  cfg: &Config,
+  path: PathView,
+  ptr: u64,
+  size: i64,
+  needle_ptr: u64,
+  needle_len: i64,
+  io: &IO,
+  mut out: &Writer,
+  mut stats: &Stats
+) -> Outcome {
+  if io.has_cancel && cancel_is_set(io) {
+    return Outcome{ found: true, stop: true };
+  }
+
+  if ptr == 0 || size <= 0 || needle_ptr == 0 || needle_len <= 0 {
+    return outcome_none();
+  }
+
+  // Preserve line-based semantics: a fixed-string needle containing '\n'
+  // cannot match any single line.
+  if memchr(needle_ptr, 10, needle_len) != 0 {
+    return outcome_none();
+  }
+
+  if find_fixed_case_sensitive(ptr, size, needle_ptr, needle_len) == 0 {
+    return outcome_none();
+  }
+
+  stats.match_lines = stats.match_lines + 1;
+  stats.files_matched = stats.files_matched + 1;
+
+  let ok: bool = append_path_line(mut out, io, path);
+  if !ok {
+    stats.errors = stats.errors + 1;
+    return Outcome{ found: true, stop: true };
+  }
+
+  if cfg.quiet {
+    let ok_flush: bool = flush_out_if_nonempty(mut out, io);
+    if !ok_flush {
+      stats.errors = stats.errors + 1;
+      return Outcome{ found: true, stop: true };
+    }
+
+    return outcome_found(true);
+  }
+
+  return Outcome{ found: true, stop: false };
 }
 
 fn append_match_line (
@@ -772,7 +987,7 @@ fn append_match_line (
     let use_ptr_len: bool = p.kind == PatternKind::Fixed;
     var line: string = "";
     if !use_ptr_len {
-      line = std::runtime::mem::string_from_ptr_len(line_ptr, line_len as int);
+      line = line_ptr as string(line_len);
     }
     // Use the already-computed first match and then scan forward for
     // additional matches. This avoids an extra `next_match(p, line, 0)` call.
@@ -915,7 +1130,7 @@ fn print_stats (mut err: &Writer, io: &IO, cfg: &Config, stats: &Stats, elapsed_
   }
 
   let _ = err.push_u8(10);
-  let _ = flush_locked_or_cancel(mut err, io, io.err_lock);
+  let _ = flush_locked_or_cancel(mut err, io, io.err_lock_handle, io.has_err_lock);
 }
 
 fn pattern_compile_error (mut err: &Writer, io: &IO, mut stats: &Stats, e: PatternFailed) -> Pattern? {
@@ -938,7 +1153,7 @@ fn pattern_compile_error (mut err: &Writer, io: &IO, mut stats: &Stats, e: Patte
   }
 
   let _ = err.push_u8(10);
-  let _ = flush_locked_or_cancel(mut err, io, io.err_lock);
+  let _ = flush_locked_or_cancel(mut err, io, io.err_lock_handle, io.has_err_lock);
 
   return None;
 }
@@ -962,8 +1177,9 @@ fn search_file_bytes (
   var fixed_needle_ptr: u64 = 0;
   var fixed_needle_len: i64 = 0;
   if p.kind == PatternKind::Fixed {
-    fixed_needle_ptr = std::runtime::mem::string_ptr(p.needle);
-    fixed_needle_len = std::runtime::mem::string_len(p.needle);
+    let needle: string = p.needle;
+    fixed_needle_ptr = needle as raw u64;
+    fixed_needle_len = sizeof(needle) as i64;
 
     // Preserve line-based semantics: a fixed-string needle must not include
     // `\n`, otherwise a whole-file substring search could "match" across line
@@ -994,13 +1210,13 @@ fn search_file_bytes (
       var i: i64 = 0;
       var found_byte: bool = false;
       while i < size && !found_byte {
-        if io.cancel != None && (i & 8191) == 0 {
+        if io.has_cancel && (i & 8191) == 0 {
           if cancel_is_set(io) {
             return Outcome{ found: true, stop: true };
           }
         }
 
-        if std::runtime::mem::load_u8(ptr, i) != 10 {
+        if mem::load_u8(ptr, i) != 10 {
           found_byte = true;
         } else {
           i = i + 1;
@@ -1041,7 +1257,7 @@ fn search_file_bytes (
     var off: i64 = 0;
     var done_scan: bool = false;
     while off < size && !done_scan {
-      if io.cancel != None && (tick & 127) == 0 {
+      if io.has_cancel && (tick & 127) == 0 {
         if cancel_is_set(io) {
           let ok_flush: bool = flush_out_if_nonempty(mut out, io);
           if !ok_flush {
@@ -1131,43 +1347,38 @@ fn search_file_bytes (
   // Fast path: `-l`/`--files-with-matches` with a fixed needle
   // does not need line splitting or match location.
   if cfg.files_with_matches && p.kind == PatternKind::Fixed {
-    if io.cancel != None && cancel_is_set(io) {
+    if !p.ignore_case {
+      return search_fixed_l_bytes(cfg, path, ptr, size, fixed_needle_ptr, fixed_needle_len, io, mut out, mut stats);
+    }
+
+    if io.has_cancel && cancel_is_set(io) {
       return Outcome{ found: true, stop: true };
     }
 
-    let found: bool =
-    if fixed_needle_len <= 0 {
-      false
-    } else if p.ignore_case {
-      next_match_ptr_len(p, ptr, size, 0) != None
-    } else {
-      find_fixed_case_sensitive(ptr, size, fixed_needle_ptr, fixed_needle_len) != 0
-    };
+    if next_match_ptr_len(p, ptr, size, 0) == None {
+      return outcome_none();
+    }
 
-    if found {
-      stats.match_lines = stats.match_lines + 1;
-      stats.files_matched = stats.files_matched + 1;
+    stats.match_lines = stats.match_lines + 1;
+    stats.files_matched = stats.files_matched + 1;
 
-      let ok: bool = append_path_line(mut out, io, path);
-      if !ok {
+    let ok: bool = append_path_line(mut out, io, path);
+    if !ok {
+      stats.errors = stats.errors + 1;
+      return Outcome{ found: true, stop: true };
+    }
+
+    if cfg.quiet {
+      let ok_flush: bool = flush_out_if_nonempty(mut out, io);
+      if !ok_flush {
         stats.errors = stats.errors + 1;
         return Outcome{ found: true, stop: true };
       }
 
-      if cfg.quiet {
-        let ok_flush: bool = flush_out_if_nonempty(mut out, io);
-        if !ok_flush {
-          stats.errors = stats.errors + 1;
-          return Outcome{ found: true, stop: true };
-        }
-
-        return outcome_found(true);
-      }
-
-      return Outcome{ found: true, stop: false };
+      return outcome_found(true);
     }
 
-    return outcome_none();
+    return Outcome{ found: true, stop: false };
   }
 
   if p.kind == PatternKind::Fixed {
@@ -1195,7 +1406,7 @@ fn search_file_bytes (
 
       var match_ptr: u64 = first_ptr;
       while match_ptr != 0 {
-        if io.cancel != None && cancel_is_set(io) {
+        if io.has_cancel && cancel_is_set(io) {
           let ok_flush: bool = flush_out_if_nonempty(mut out, io);
           if !ok_flush {
             stats.errors = stats.errors + 1;
@@ -1314,10 +1525,9 @@ fn search_file_bytes (
 
     // Fixed, ASCII ignore-case: use the fixed matcher on raw bytes to avoid
     // allocating a `string` per line in the common no-match case.
-    let first_opt: Match? = next_match_ptr_len(p, ptr, size, 0);
-    if first_opt == None {
+    let Some(first) = next_match_ptr_len(p, ptr, size, 0) else {
       return outcome_none();
-    }
+    };
 
     var matched_in_file: bool = false;
     var match_lines_in_file: i64 = 0;
@@ -1326,10 +1536,11 @@ fn search_file_bytes (
     var counted_off: i64 = 0;
     var search_off: i64 = 0;
 
-    var match_opt: Match? = first_opt;
+    var current_match: Match = first;
+    var have_match: bool = true;
     var done_matches: bool = false;
-    while match_opt != None && !done_matches {
-      if io.cancel != None && cancel_is_set(io) {
+    while have_match && !done_matches {
+      if io.has_cancel && cancel_is_set(io) {
         let ok_flush: bool = flush_out_if_nonempty(mut out, io);
         if !ok_flush {
           stats.errors = stats.errors + 1;
@@ -1338,8 +1549,7 @@ fn search_file_bytes (
         return Outcome{ found: true, stop: true };
       }
 
-      let m: Match = match_opt ?? Match{ start: 0, end: 0 };
-      let match_off: i64 = m.start;
+      let match_off: i64 = current_match.start;
 
       // Advance `counted_off` to the start of the containing line while
       // updating `line_no` (scan forward for '\n' boundaries).
@@ -1382,7 +1592,10 @@ fn search_file_bytes (
       } else {
         let line_ptr: u64 = ptr + (line_start as u64);
         let line_len: i64 = line_end - line_start;
-        let first: Match = Match{ start: match_off - line_start, end: m.end - line_start };
+        let first: Match = Match{
+          start: match_off - line_start,
+          end: current_match.end - line_start,
+        };
 
         matched_in_file = true;
         stats.match_lines = stats.match_lines + 1;
@@ -1428,7 +1641,14 @@ fn search_file_bytes (
           search_off = next_line_off;
           counted_off = next_line_off;
           line_no = line_no + 1;
-          match_opt = next_match_ptr_len(p, ptr, size, search_off);
+          match (next_match_ptr_len(p, ptr, size, search_off)) {
+            Some(next) => {
+              current_match = next;
+            },
+            None => {
+              have_match = false;
+            },
+          };
         }
       }
     }
@@ -1449,7 +1669,7 @@ fn search_file_bytes (
   var off: i64 = 0;
   var done_scan: bool = false;
   while off < size && !done_scan {
-    if io.cancel != None && (tick & 127) == 0 {
+    if io.has_cancel && (tick & 127) == 0 {
       if cancel_is_set(io) {
         let ok_flush: bool = flush_out_if_nonempty(mut out, io);
         if !ok_flush {
@@ -1483,10 +1703,8 @@ fn search_file_bytes (
       let line_len: i64 = line_end - off;
       let line_ptr: u64 = ptr + (off as u64);
 
-      let line: string = std::runtime::mem::string_from_ptr_len(line_ptr, line_len as int);
-      let first_opt: Match? = next_match(p, line, 0);
-      if first_opt != None {
-        let first: Match = first_opt ?? Match{ start: 0, end: 0 };
+      let line: string = line_ptr as string(line_len);
+      if let Some(first) = next_match(p, line, 0) {
         matched_in_file = true;
         stats.match_lines = stats.match_lines + 1;
         match_lines_in_file = match_lines_in_file + 1;
@@ -1565,7 +1783,7 @@ enum ScratchReadResult {
   Err,
 }
 
-fn read_more_into_scratch_limit (fd: int, mut scratch: &BufferU8, limit: i64) -> ScratchReadResult {
+fn read_more_into_scratch_limit (file: &File, mut scratch: &BufferU8, limit: i64) -> ScratchReadResult {
   if scratch.ptr == 0 || scratch.cap <= 0 {
     return ScratchReadResult::Err;
   }
@@ -1593,18 +1811,19 @@ fn read_more_into_scratch_limit (fd: int, mut scratch: &BufferU8, limit: i64) ->
   var done: bool = false;
   while off < lim && !done {
     let want: i64 = lim - off;
-    let n = std::runtime::posix::io::read(fd as i32, scratch.ptr + (off as u64), want);
-    if n < 0 {
-      let e: int = errno();
-      if e != EINTR {
+    match (file.read(bytes_from_raw(scratch.ptr + (off as u64), want))) {
+      Ok(n) => {
+        if n == 0 {
+          done = true;
+        } else {
+          off = off + (n as i64);
+        }
+      },
+      Err(_) => {
         scratch.len = 0;
         return ScratchReadResult::Err;
-      }
-    } else if n == 0 {
-      done = true;
-    } else {
-      off = off + (n as i64);
-    }
+      },
+    };
   }
 
   scratch.len = off;
@@ -1615,9 +1834,9 @@ fn read_more_into_scratch_limit (fd: int, mut scratch: &BufferU8, limit: i64) ->
   return ScratchReadResult::Filled;
 }
 
-fn read_into_scratch_limit (fd: int, mut scratch: &BufferU8, limit: i64) -> ScratchReadResult {
+fn read_into_scratch_limit (file: &File, mut scratch: &BufferU8, limit: i64) -> ScratchReadResult {
   scratch.len = 0;
-  return read_more_into_scratch_limit(fd, mut scratch, limit);
+  return read_more_into_scratch_limit(file, mut scratch, limit);
 }
 
 fn search_file (
@@ -1633,15 +1852,16 @@ fn search_file (
 ) -> Outcome {
   stats.files_searched = stats.files_searched + 1;
 
-  let fd: i32 = std::runtime::posix::fs::open(path_view_string(path), std::runtime::posix::fs::O_RDONLY, 0);
-  if fd < 0 {
+  let path_s: string = path_view_string(path);
+  let mut move Ok(file) = File.open_read(path_s) else {
     stats.errors = stats.errors + 1;
     write_error(mut err, io, path, "failed to open");
     return outcome_none();
-  }
+  };
 
   var size: i64 = -1;
   var binary_checked: bool = false;
+  var prefix_checked_len: i64 = 0;
 
   if known_regular && scratch.ptr != 0 && scratch.cap > 0 {
     let checked_binary: bool = !cfg.text;
@@ -1654,30 +1874,30 @@ fn search_file (
     } else {
       scratch.cap
     };
-    let r: ScratchReadResult = read_into_scratch_limit(fd as int, mut scratch, probe);
+    let r: ScratchReadResult = read_into_scratch_limit(&file, mut scratch, probe);
     if r == ScratchReadResult::Eof {
       // Binary detection for the whole file (small-file case).
       if !cfg.text && detect_binary(scratch.ptr, scratch.len) {
-        let _ = std::runtime::posix::fs::close(fd);
+        file.close();
         return outcome_none();
       }
 
       binary_checked = checked_binary;
 
-      let _ = std::runtime::posix::fs::close(fd);
+      file.close();
       return search_file_bytes(cfg, p, path, scratch.ptr, scratch.len, checked_binary, io, mut out, mut err, mut stats);
     }
 
     if r == ScratchReadResult::Err {
       stats.errors = stats.errors + 1;
       write_error(mut err, io, path, "failed to read");
-      let _ = std::runtime::posix::fs::close(fd);
+      file.close();
       return outcome_none();
     }
 
     // Early skip for binary files when `--text` is not set.
     if !cfg.text && detect_binary(scratch.ptr, scratch.len) {
-      let _ = std::runtime::posix::fs::close(fd);
+      file.close();
       return outcome_none();
     }
 
@@ -1704,11 +1924,23 @@ fn search_file (
       }
 
       if scan_len > 0 {
-        let o: Outcome =
-        search_file_bytes(cfg, p, path, scratch.ptr, scan_len, checked_binary, io, mut out, mut err, mut stats);
+        var o: Outcome = outcome_none();
+        if p.kind == PatternKind::Fixed && !p.ignore_case {
+          let needle: string = p.needle;
+          let needle_ptr: u64 = needle as raw u64;
+          let needle_len: i64 = sizeof(needle) as i64;
+          o = search_fixed_l_bytes(cfg, path, scratch.ptr, scan_len, needle_ptr, needle_len, io, mut out, mut stats);
+        } else {
+          o = search_file_bytes(cfg, p, path, scratch.ptr, scan_len, checked_binary, io, mut out, mut err, mut stats);
+        }
+
         if o.found {
-          let _ = std::runtime::posix::fs::close(fd);
+          file.close();
           return o;
+        }
+
+        if p.kind == PatternKind::Fixed {
+          prefix_checked_len = scan_len;
         }
       }
     }
@@ -1717,60 +1949,80 @@ fn search_file (
     // - If the file is <= `scratch.cap`, read it fully into `scratch` and scan.
     // - Otherwise, fall through to the `mmap` path without wasting extra reads.
     //
-    // We use `lseek(SEEK_END)` + restore here instead of `fstat` so we can avoid
-    // a per-call `struct stat` allocation. This keeps parallel search robust in
-    // the hosted runtime.
-    //
-    // Note: we've already read a prefix, so we must restore the file offset
-    // before attempting to read the remainder into `scratch`.
-    let cur_off: i64 = scratch.len;
-    let sz: i64 = std::runtime::posix::fs::lseek(fd, 0, std::runtime::posix::fs::SEEK_END);
     var size_is_known: bool = false;
     var needs_restore: bool = false;
-    var offset_restored: bool = false;
-    if sz > 0 {
-      size = sz;
-      size_is_known = true;
-      needs_restore = size <= scratch.cap;
+    if let Ok(sz) = file.metadata_size() {
+      if sz > 0 {
+        size = sz;
+        size_is_known = true;
+        needs_restore = size <= scratch.cap;
+      }
     }
 
-    if size_is_known && needs_restore {
-      let back: i64 = std::runtime::posix::fs::lseek(fd, cur_off, std::runtime::posix::fs::SEEK_SET);
-      if back >= 0 {
-        offset_restored = true;
-      }
+    if !size_is_known {
+      match (file.size()) {
+        Ok(lsz) => {
+          if lsz > 0 {
+            size = lsz;
+            size_is_known = true;
+            needs_restore = size <= scratch.cap;
+          }
+        },
+        Err(_) => {
+          // Fall back to reading up to scratch capacity; if this reaches EOF,
+          // the file is small enough to scan without mapping.
+          let rr: ScratchReadResult = read_more_into_scratch_limit(&file, mut scratch, scratch.cap);
+          if rr == ScratchReadResult::Err {
+            stats.errors = stats.errors + 1;
+            write_error(mut err, io, path, "failed to read");
+            file.close();
+            return outcome_none();
+          }
+
+          if rr == ScratchReadResult::Eof {
+            file.close();
+            var scan_ptr: u64 = scratch.ptr;
+            var scan_len: i64 = scratch.len;
+            if cfg.files_with_matches && p.kind == PatternKind::Fixed {
+              let needle: string = p.needle;
+              let needle_len: i64 = sizeof(needle) as i64;
+              let scan_start: i64 = fixed_tail_scan_start(needle_len, prefix_checked_len, scratch.len);
+              if scan_start > 0 {
+                scan_ptr = scratch.ptr + (scan_start as u64);
+                scan_len = scratch.len - scan_start;
+              }
+            }
+
+            return search_file_bytes(cfg, p, path, scan_ptr, scan_len, checked_binary, io, mut out, mut err, mut stats);
+          }
+        },
+      };
     }
 
     if size_is_known {
-      if needs_restore && offset_restored {
-        let rr: ScratchReadResult = read_more_into_scratch_limit(fd as int, mut scratch, size);
+      if needs_restore {
+        let rr: ScratchReadResult = read_more_into_scratch_limit(&file, mut scratch, size);
         if rr == ScratchReadResult::Err {
           stats.errors = stats.errors + 1;
           write_error(mut err, io, path, "failed to read");
-          let _ = std::runtime::posix::fs::close(fd);
+          file.close();
           return outcome_none();
         }
 
-        let _ = std::runtime::posix::fs::close(fd);
-        return search_file_bytes(cfg, p, path, scratch.ptr, scratch.len, checked_binary, io, mut out, mut err, mut stats);
-      }
+        file.close();
+        var scan_ptr: u64 = scratch.ptr;
+        var scan_len: i64 = scratch.len;
+        if cfg.files_with_matches && p.kind == PatternKind::Fixed {
+          let needle: string = p.needle;
+          let needle_len: i64 = sizeof(needle) as i64;
+          let scan_start: i64 = fixed_tail_scan_start(needle_len, prefix_checked_len, scratch.len);
+          if scan_start > 0 {
+            scan_ptr = scratch.ptr + (scan_start as u64);
+            scan_len = scratch.len - scan_start;
+          }
+        }
 
-      // Fall through to the `mmap` path for large files (we've already read a
-      // small prefix and performed binary detection).
-    } else {
-      // Fallback when `fstat` fails: try to read the remainder into the scratch
-      // buffer. If we reach EOF, we can scan without `mmap`.
-      let rr: ScratchReadResult = read_more_into_scratch_limit(fd as int, mut scratch, scratch.cap);
-      if rr == ScratchReadResult::Err {
-        stats.errors = stats.errors + 1;
-        write_error(mut err, io, path, "failed to read");
-        let _ = std::runtime::posix::fs::close(fd);
-        return outcome_none();
-      }
-
-      if rr == ScratchReadResult::Eof {
-        let _ = std::runtime::posix::fs::close(fd);
-        return search_file_bytes(cfg, p, path, scratch.ptr, scratch.len, checked_binary, io, mut out, mut err, mut stats);
+        return search_file_bytes(cfg, p, path, scan_ptr, scan_len, checked_binary, io, mut out, mut err, mut stats);
       }
 
       // Fall through to the `mmap` path for large files (we've already read a
@@ -1779,36 +2031,46 @@ fn search_file (
   }
 
   if size < 0 {
-    size = std::runtime::posix::fs::lseek(fd, 0, std::runtime::posix::fs::SEEK_END);
-    if size < 0 {
+    let Ok(sz) = file.metadata_size() else {
       stats.errors = stats.errors + 1;
       write_error(mut err, io, path, "failed to read file size");
-      let _ = std::runtime::posix::fs::close(fd);
+      file.close();
       return outcome_none();
-    }
+    };
+
+    size = sz;
 
     if size <= 0 {
-      let _ = std::runtime::posix::fs::close(fd);
+      file.close();
       return outcome_none();
     }
   }
 
-  // Map read-only.
-  let map_len: u64 = size as u64;
-  let ptr: u64 = mmap(0, map_len, PROT_READ, MAP_PRIVATE, fd, 0);
-  if ptr == MAP_FAILED {
+  let mut move Ok(map) = file.mmap_readonly_range(0, size) else {
     stats.errors = stats.errors + 1;
     write_error(mut err, io, path, "failed to mmap");
-    let _ = std::runtime::posix::fs::close(fd);
+    file.close();
     return outcome_none();
-  }
+  };
 
   // The mapping remains valid after closing the file descriptor. Close it
   // early to keep FD usage low in parallel mode.
-  let _ = std::runtime::posix::fs::close(fd);
+  file.close();
 
-  let o: Outcome = search_file_bytes(cfg, p, path, ptr, size, binary_checked, io, mut out, mut err, mut stats);
-  let _ = munmap(ptr, map_len);
+  var scan_ptr: u64 = map.ptr;
+  var scan_len: i64 = size;
+  if cfg.files_with_matches && p.kind == PatternKind::Fixed && prefix_checked_len > 0 && prefix_checked_len < size {
+    let needle: string = p.needle;
+    let needle_len: i64 = sizeof(needle) as i64;
+    let scan_start: i64 = fixed_tail_scan_start(needle_len, prefix_checked_len, size);
+    if scan_start > 0 {
+      scan_ptr = map.ptr + (scan_start as u64);
+      scan_len = size - scan_start;
+    }
+  }
+
+  let o: Outcome = search_file_bytes(cfg, p, path, scan_ptr, scan_len, binary_checked, io, mut out, mut err, mut stats);
+  map.drop();
   return o;
 }
 
@@ -1821,26 +2083,29 @@ fn walk_dir_files (cfg: &Config, mut ignore: &IgnoreStack, io: &IO, mut path: &P
     return outcome_none();
   }
 
-  let open_path: string = path_open_path(path);
   let open_path_view: PathView = path_view(path);
-  let dir: u64 = opendir(open_path);
-  if dir == 0 {
-    let e: int = errno();
-    if e == ENOTDIR {
-      stats.files_total = stats.files_total + 1;
-      let ok: bool = list_file(open_path_view, io, mut out);
-      if !ok {
-        stats.errors = stats.errors + 1;
-        return Outcome{ found: true, stop: true };
+  let mut dir: Dir = Dir.invalid();
+  match (Dir.open(path_view_string(open_path_view))) {
+    Ok(v) => {
+      dir = move v;
+    },
+    Err(e) => {
+      if e.kind() == FSErrorKind::NotADirectory {
+        stats.files_total = stats.files_total + 1;
+        let ok: bool = list_file(open_path_view, io, mut out);
+        if !ok {
+          stats.errors = stats.errors + 1;
+          return Outcome{ found: true, stop: true };
+        }
+
+        return outcome_none();
       }
 
+      stats.errors = stats.errors + 1;
+      write_error(mut err, io, open_path_view, "failed to open directory");
       return outcome_none();
-    }
-
-    stats.errors = stats.errors + 1;
-    write_error(mut err, io, open_path_view, "failed to open directory");
-    return outcome_none();
-  }
+    },
+  };
 
   var ignore_checkpoint: i64 = 0;
   if cfg.ignore_files {
@@ -1851,9 +2116,9 @@ fn walk_dir_files (cfg: &Config, mut ignore: &IgnoreStack, io: &IO, mut path: &P
   var tick: i64 = 0;
   var done: bool = false;
   while !done {
-    if io.cancel != None && (tick & 255) == 0 {
+    if io.has_cancel && (tick & 255) == 0 {
       if cancel_is_set(io) {
-        let _ = closedir(dir);
+        dir.close();
         if cfg.ignore_files {
           ignore_pop_to(mut ignore, ignore_checkpoint);
         }
@@ -1864,13 +2129,13 @@ fn walk_dir_files (cfg: &Config, mut ignore: &IgnoreStack, io: &IO, mut path: &P
 
     tick = tick + 1;
 
-    let dent: u64 = readdir(dir);
-    if dent == 0 {
+    let entry: WalkEntry = next_dir_entry(mut dir, io, open_path_view, mut err, mut stats);
+    if entry.done {
       done = true;
     } else {
-      let dtype: u8 = dirent_d_type(dent);
-      let name_ptr: u64 = dirent_name_ptr(dent);
-      let name_len: i64 = cstr_len(name_ptr, 255);
+      let kind: DirEntryType = entry.kind;
+      let name_ptr: u64 = entry.name_ptr;
+      let name_len: i64 = entry.name_len;
 
       var skip_entry: bool = false;
       if name_ptr == 0 || name_len <= 0 {
@@ -1888,7 +2153,7 @@ fn walk_dir_files (cfg: &Config, mut ignore: &IgnoreStack, io: &IO, mut path: &P
           skip_entry = true;
         }
 
-        if !skip_entry && cfg.ignore_common && dtype == DT_DIR && is_common_dir_name_ptr_len(name_ptr, name_len) {
+        if !skip_entry && cfg.ignore_common && kind == DirEntryType::Directory && is_common_dir_name_ptr_len(name_ptr, name_len) {
           skip_entry = true;
         }
       }
@@ -1905,49 +2170,16 @@ fn walk_dir_files (cfg: &Config, mut ignore: &IgnoreStack, io: &IO, mut path: &P
           let full_ptr: u64 = path.ptr;
           let full_len: i64 = path.len;
 
-          var is_dir: bool = false;
-          var is_file: bool = false;
-
-          if dtype == DT_DIR {
-            is_dir = true;
-          } else if dtype == DT_REG {
-            is_file = true;
-          } else if dtype == DT_LNK {
-            if cfg.follow {
-              let child_path: string = path.as_string();
-              let tmp: u64 = opendir(child_path);
-              if tmp != 0 {
-                let _ = closedir(tmp);
-                is_dir = true;
-              } else {
-                let e: int = errno();
-                if e == ENOTDIR {
-                  is_file = true;
-                } else {
-                  stats.errors = stats.errors + 1;
-                  write_error(mut err, io, path_view(path), "failed to open directory");
-                }
-              }
-            }
-          } else if dtype == DT_UNKNOWN {
-            let child_path: string = path.as_string();
-            let tmp: u64 = opendir(child_path);
-            if tmp != 0 {
-              let _ = closedir(tmp);
-              is_dir = true;
-            } else {
-              let e: int = errno();
-              if e == ENOTDIR {
-                is_file = true;
-              } else {
-                stats.errors = stats.errors + 1;
-                write_error(mut err, io, path_view(path), "failed to open directory");
-              }
-            }
-          }
+          let child_kind: ChildKind = classify_child_path(cfg, kind, path, io, mut err, mut stats);
+          let is_dir: bool = child_kind == ChildKind::Directory;
+          let is_file: bool = child_kind == ChildKind::RegularFile;
 
           var skip_child: bool = false;
           if is_dir && cfg.ignore_common && is_common_dir_name_ptr_len(name_ptr, name_len) {
+            skip_child = true;
+          }
+
+          if !skip_child && is_file && cfg.ignore_common && is_common_file_name_ptr_len(name_ptr, name_len) {
             skip_child = true;
           }
 
@@ -1965,7 +2197,7 @@ fn walk_dir_files (cfg: &Config, mut ignore: &IgnoreStack, io: &IO, mut path: &P
                 } else {
                   let o: Outcome = walk_dir_files(cfg, mut ignore, io, mut path, next_depth, mut out, mut err, mut stats);
                   if o.stop {
-                    let _ = closedir(dir);
+                    dir.close();
                     path_truncate(mut path, saved_len);
                     if cfg.ignore_files {
                       ignore_pop_to(mut ignore, ignore_checkpoint);
@@ -1987,7 +2219,7 @@ fn walk_dir_files (cfg: &Config, mut ignore: &IgnoreStack, io: &IO, mut path: &P
                 let ok: bool = list_file(child_path, io, mut out);
                 if !ok {
                   stats.errors = stats.errors + 1;
-                  let _ = closedir(dir);
+                  dir.close();
                   path_truncate(mut path, saved_len);
                   if cfg.ignore_files {
                     ignore_pop_to(mut ignore, ignore_checkpoint);
@@ -2005,7 +2237,7 @@ fn walk_dir_files (cfg: &Config, mut ignore: &IgnoreStack, io: &IO, mut path: &P
     }
   }
 
-  let _ = closedir(dir);
+  dir.close();
   if cfg.ignore_files {
     ignore_pop_to(mut ignore, ignore_checkpoint);
   }
@@ -2018,20 +2250,23 @@ fn walk_dir_search (cfg: &Config, mut ignore: &IgnoreStack, p: &Pattern, mut scr
     return outcome_none();
   }
 
-  let open_path: string = path_open_path(path);
   let open_path_view: PathView = path_view(path);
-  let dir: u64 = opendir(open_path);
-  if dir == 0 {
-    let e: int = errno();
-    if e == ENOTDIR {
-      stats.files_total = stats.files_total + 1;
-      return search_file(cfg, p, open_path_view, false, mut scratch, io, mut out, mut err, mut stats);
-    }
+  let mut dir: Dir = Dir.invalid();
+  match (Dir.open(path_view_string(open_path_view))) {
+    Ok(v) => {
+      dir = move v;
+    },
+    Err(e) => {
+      if e.kind() == FSErrorKind::NotADirectory {
+        stats.files_total = stats.files_total + 1;
+        return search_file(cfg, p, open_path_view, false, mut scratch, io, mut out, mut err, mut stats);
+      }
 
-    stats.errors = stats.errors + 1;
-    write_error(mut err, io, open_path_view, "failed to open directory");
-    return outcome_none();
-  }
+      stats.errors = stats.errors + 1;
+      write_error(mut err, io, open_path_view, "failed to open directory");
+      return outcome_none();
+    },
+  };
 
   var ignore_checkpoint: i64 = 0;
   if cfg.ignore_files {
@@ -2044,9 +2279,9 @@ fn walk_dir_search (cfg: &Config, mut ignore: &IgnoreStack, p: &Pattern, mut scr
   var tick: i64 = 0;
   var done: bool = false;
   while !done {
-    if io.cancel != None && (tick & 255) == 0 {
+    if io.has_cancel && (tick & 255) == 0 {
       if cancel_is_set(io) {
-        let _ = closedir(dir);
+        dir.close();
         if cfg.ignore_files {
           ignore_pop_to(mut ignore, ignore_checkpoint);
         }
@@ -2057,13 +2292,13 @@ fn walk_dir_search (cfg: &Config, mut ignore: &IgnoreStack, p: &Pattern, mut scr
 
     tick = tick + 1;
 
-    let dent: u64 = readdir(dir);
-    if dent == 0 {
+    let entry: WalkEntry = next_dir_entry(mut dir, io, open_path_view, mut err, mut stats);
+    if entry.done {
       done = true;
     } else {
-      let dtype: u8 = dirent_d_type(dent);
-      let name_ptr: u64 = dirent_name_ptr(dent);
-      let name_len: i64 = cstr_len(name_ptr, 255);
+      let kind: DirEntryType = entry.kind;
+      let name_ptr: u64 = entry.name_ptr;
+      let name_len: i64 = entry.name_len;
 
       var skip_entry: bool = false;
       if name_ptr == 0 || name_len <= 0 {
@@ -2081,7 +2316,7 @@ fn walk_dir_search (cfg: &Config, mut ignore: &IgnoreStack, p: &Pattern, mut scr
           skip_entry = true;
         }
 
-        if !skip_entry && cfg.ignore_common && dtype == DT_DIR && is_common_dir_name_ptr_len(name_ptr, name_len) {
+        if !skip_entry && cfg.ignore_common && kind == DirEntryType::Directory && is_common_dir_name_ptr_len(name_ptr, name_len) {
           skip_entry = true;
         }
       }
@@ -2098,49 +2333,16 @@ fn walk_dir_search (cfg: &Config, mut ignore: &IgnoreStack, p: &Pattern, mut scr
           let full_ptr: u64 = path.ptr;
           let full_len: i64 = path.len;
 
-          var is_dir: bool = false;
-          var is_file: bool = false;
-
-          if dtype == DT_DIR {
-            is_dir = true;
-          } else if dtype == DT_REG {
-            is_file = true;
-          } else if dtype == DT_LNK {
-            if cfg.follow {
-              let child_path: string = path.as_string();
-              let tmp: u64 = opendir(child_path);
-              if tmp != 0 {
-                let _ = closedir(tmp);
-                is_dir = true;
-              } else {
-                let e: int = errno();
-                if e == ENOTDIR {
-                  is_file = true;
-                } else {
-                  stats.errors = stats.errors + 1;
-                  write_error(mut err, io, path_view(path), "failed to open directory");
-                }
-              }
-            }
-          } else if dtype == DT_UNKNOWN {
-            let child_path: string = path.as_string();
-            let tmp: u64 = opendir(child_path);
-            if tmp != 0 {
-              let _ = closedir(tmp);
-              is_dir = true;
-            } else {
-              let e: int = errno();
-              if e == ENOTDIR {
-                is_file = true;
-              } else {
-                stats.errors = stats.errors + 1;
-                write_error(mut err, io, path_view(path), "failed to open directory");
-              }
-            }
-          }
+          let child_kind: ChildKind = classify_child_path(cfg, kind, path, io, mut err, mut stats);
+          let is_dir: bool = child_kind == ChildKind::Directory;
+          let is_file: bool = child_kind == ChildKind::RegularFile;
 
           var skip_child: bool = false;
           if is_dir && cfg.ignore_common && is_common_dir_name_ptr_len(name_ptr, name_len) {
+            skip_child = true;
+          }
+
+          if !skip_child && is_file && cfg.ignore_common && is_common_file_name_ptr_len(name_ptr, name_len) {
             skip_child = true;
           }
 
@@ -2162,7 +2364,7 @@ fn walk_dir_search (cfg: &Config, mut ignore: &IgnoreStack, p: &Pattern, mut scr
                   }
 
                   if o.stop {
-                    let _ = closedir(dir);
+                    dir.close();
                     path_truncate(mut path, saved_len);
                     if cfg.ignore_files {
                       ignore_pop_to(mut ignore, ignore_checkpoint);
@@ -2180,7 +2382,7 @@ fn walk_dir_search (cfg: &Config, mut ignore: &IgnoreStack, p: &Pattern, mut scr
 
               if search_this {
                 stats.files_total = stats.files_total + 1;
-                let known_regular: bool = dtype == DT_REG;
+                let known_regular: bool = kind == DirEntryType::RegularFile;
                 let child_path: PathView = path_view(path);
                 let o: Outcome = search_file(cfg, p, child_path, known_regular, mut scratch, io, mut out, mut err, mut stats);
                 if o.found {
@@ -2188,7 +2390,7 @@ fn walk_dir_search (cfg: &Config, mut ignore: &IgnoreStack, p: &Pattern, mut scr
                 }
 
                 if o.stop {
-                  let _ = closedir(dir);
+                  dir.close();
                   path_truncate(mut path, saved_len);
                   if cfg.ignore_files {
                     ignore_pop_to(mut ignore, ignore_checkpoint);
@@ -2206,7 +2408,7 @@ fn walk_dir_search (cfg: &Config, mut ignore: &IgnoreStack, p: &Pattern, mut scr
     }
   }
 
-  let _ = closedir(dir);
+  dir.close();
   if cfg.ignore_files {
     ignore_pop_to(mut ignore, ignore_checkpoint);
   }
@@ -2221,42 +2423,15 @@ fn handle_root_files (cfg: &Config, root: string, io: &IO, mut out: &Writer, mut
   }
 
   let open_root_view: PathView = path_view_str(open_root);
-  let dir: u64 = opendir(open_root);
-  if dir == 0 {
-    let e: int = errno();
-    if e == ENOTDIR {
-      stats.files_total = stats.files_total + 1;
-      let ok: bool = list_file(open_root_view, io, mut out);
-      if !ok {
-        stats.errors = stats.errors + 1;
-        return Outcome{ found: true, stop: true };
-      }
-
-      return outcome_none();
-    }
-
-    stats.errors = stats.errors + 1;
-    write_error(mut err, io, open_root_view, "failed to open directory");
-    return outcome_none();
-  }
-
-  let _ = closedir(dir);
-
   let base: string = if root == "." {
     ""
   } else {
     open_root
   };
-  let pb_r: PathBufResult = std::path::PathBuf.from_string(base);
-  if pb_r.is_err() {
+  let mut move Ok(path) = PathBuf.from_string(base) else {
     stats.errors = stats.errors + 1;
     write_error(mut err, io, open_root_view, "out of memory");
     return outcome_none();
-  }
-
-  let mut path: PathBuf = match (pb_r) {
-    PathBufResult::Ok(v) => v,
-    PathBufResult::Err(_) => PathBuf{ ptr: 0, cap: 0, len: 0 },
   };
 
   let mut ignore: IgnoreStack = ignore_init();
@@ -2273,36 +2448,15 @@ fn handle_root_search (cfg: &Config, p: &Pattern, root: string, mut scratch: &Bu
   }
 
   let open_root_view: PathView = path_view_str(open_root);
-  let dir: u64 = opendir(open_root);
-  if dir == 0 {
-    let e: int = errno();
-    if e == ENOTDIR {
-      stats.files_total = stats.files_total + 1;
-      return search_file(cfg, p, open_root_view, false, mut scratch, io, mut out, mut err, mut stats);
-    }
-
-    stats.errors = stats.errors + 1;
-    write_error(mut err, io, open_root_view, "failed to open directory");
-    return outcome_none();
-  }
-
-  let _ = closedir(dir);
-
   let base: string = if root == "." {
     ""
   } else {
     open_root
   };
-  let pb_r: PathBufResult = std::path::PathBuf.from_string(base);
-  if pb_r.is_err() {
+  let mut move Ok(path) = PathBuf.from_string(base) else {
     stats.errors = stats.errors + 1;
     write_error(mut err, io, open_root_view, "out of memory");
     return outcome_none();
-  }
-
-  let mut path: PathBuf = match (pb_r) {
-    PathBufResult::Ok(v) => v,
-    PathBufResult::Err(_) => PathBuf{ ptr: 0, cap: 0, len: 0 },
   };
 
   let mut ignore: IgnoreStack = ignore_init();
@@ -2315,52 +2469,32 @@ fn handle_root_search (cfg: &Config, p: &Pattern, root: string, mut scratch: &Bu
 /**
  * Per-worker summary returned from parallel tasks.
  */
-// NOTE: worker tasks return a pointer (`u64`) to an owned result record instead
-// of returning a `struct` directly. This works around a hosted-backend
-// limitation where `yield` of tasks returning structs is not supported in
-// loops (the parallel runner joins worker tasks in a loop).
-type WorkerResultPtr = u64;
-
-type WorkerTaskVec = std::vector::Vector(Task(WorkerResultPtr));
-
-// Packed worker result record (8-byte slots).
-let WORKER_RES_BYTES: i64 = 56;
-let WORKER_RES_OFF_FILES_TOTAL: i64 = 0;
-let WORKER_RES_OFF_FILES_SEARCHED: i64 = 8;
-let WORKER_RES_OFF_FILES_MATCHED: i64 = 16;
-let WORKER_RES_OFF_MATCH_LINES: i64 = 24;
-let WORKER_RES_OFF_ERRORS: i64 = 32;
-let WORKER_RES_OFF_FOUND_ANY: i64 = 40;
-let WORKER_RES_OFF_STOP: i64 = 48;
-
-fn worker_result_alloc (stats: &Stats, found_any: bool, stop: bool) -> WorkerResultPtr {
-  let ptr: u64 = std::runtime::mem::alloc(WORKER_RES_BYTES);
-  if ptr == 0 {
-    return 0;
-  }
-
-  std::runtime::mem::store_u64(ptr, WORKER_RES_OFF_FILES_TOTAL, stats.files_total as u64);
-  std::runtime::mem::store_u64(ptr, WORKER_RES_OFF_FILES_SEARCHED, stats.files_searched as u64);
-  std::runtime::mem::store_u64(ptr, WORKER_RES_OFF_FILES_MATCHED, stats.files_matched as u64);
-  std::runtime::mem::store_u64(ptr, WORKER_RES_OFF_MATCH_LINES, stats.match_lines as u64);
-  std::runtime::mem::store_u64(ptr, WORKER_RES_OFF_ERRORS, stats.errors as u64);
-  std::runtime::mem::store_u64(ptr, WORKER_RES_OFF_FOUND_ANY, if found_any {
-      1
-    } else {
-      0
-    });
-  std::runtime::mem::store_u64(ptr, WORKER_RES_OFF_STOP, if stop {
-      1
-    } else {
-      0
-    });
-  return ptr;
+struct WorkerResult {
+  files_total: i64,
+  files_searched: i64,
+  files_matched: i64,
+  match_lines: i64,
+  errors: i64,
+  found_any: bool,
+  stop: bool,
 }
 
-fn worker_result_free (ptr: WorkerResultPtr) -> void {
-  if ptr != 0 {
-    std::runtime::mem::free(ptr);
-  }
+type WorkerTaskVec = Vector(Task(WorkerResult));
+
+fn worker_result (stats: &Stats, found_any: bool, stop: bool) -> WorkerResult {
+  return WorkerResult{
+    files_total: stats.files_total,
+    files_searched: stats.files_searched,
+    files_matched: stats.files_matched,
+    match_lines: stats.match_lines,
+    errors: stats.errors,
+    found_any: found_any,
+    stop: stop,
+  };
+}
+
+async fn join_worker_result (h: Task(WorkerResult)) -> WorkerResult {
+  return await std::task::join(h);
 }
 
 struct WorkerMerge {
@@ -2368,23 +2502,14 @@ struct WorkerMerge {
   stop: bool,
 }
 
-fn worker_result_merge_and_free (mut totals: &Stats, res_ptr: WorkerResultPtr) -> WorkerMerge {
-  if res_ptr == 0 {
-    totals.errors = totals.errors + 1;
-    return WorkerMerge{ found_any: true, stop: true };
-  }
+fn worker_result_merge (mut totals: &Stats, res: &WorkerResult) -> WorkerMerge {
+  totals.files_total = totals.files_total + res.files_total;
+  totals.files_searched = totals.files_searched + res.files_searched;
+  totals.files_matched = totals.files_matched + res.files_matched;
+  totals.match_lines = totals.match_lines + res.match_lines;
+  totals.errors = totals.errors + res.errors;
 
-  totals.files_total = totals.files_total + (std::runtime::mem::load_u64(res_ptr, WORKER_RES_OFF_FILES_TOTAL) as i64);
-  totals.files_searched = totals.files_searched + (std::runtime::mem::load_u64(res_ptr, WORKER_RES_OFF_FILES_SEARCHED) as i64);
-  totals.files_matched = totals.files_matched + (std::runtime::mem::load_u64(res_ptr, WORKER_RES_OFF_FILES_MATCHED) as i64);
-  totals.match_lines = totals.match_lines + (std::runtime::mem::load_u64(res_ptr, WORKER_RES_OFF_MATCH_LINES) as i64);
-  totals.errors = totals.errors + (std::runtime::mem::load_u64(res_ptr, WORKER_RES_OFF_ERRORS) as i64);
-
-  let found_any: bool = std::runtime::mem::load_u64(res_ptr, WORKER_RES_OFF_FOUND_ANY) != 0;
-  let stop: bool = std::runtime::mem::load_u64(res_ptr, WORKER_RES_OFF_STOP) != 0;
-
-  worker_result_free(res_ptr);
-  return WorkerMerge{ found_any: found_any, stop: stop };
+  return WorkerMerge{ found_any: res.found_any, stop: res.stop };
 }
 
 // Keep total ignore-cache table memory roughly bounded across high concurrency.
@@ -2459,13 +2584,13 @@ fn pathbuf_alloc_from_ptr_len (ptr: u64, len: i64) -> PathBuf? {
     return None;
   }
 
-  let dst: u64 = std::runtime::mem::alloc(cap);
+  let dst: u64 = mem::alloc(cap);
   if dst == 0 {
     return None;
   }
 
   let _ = memcpy(dst, ptr, len);
-  std::runtime::mem::store_u8(dst, len, 0);
+  mem::store_u8(dst, len, 0);
   return Some(PathBuf{ ptr: dst, cap: cap, len: len });
 }
 
@@ -2489,11 +2614,11 @@ let JOB_OFF_PB_LEN: i64 = 40;
 let JOB_OFF_NAMES_LEN: i64 = 48;
 
 fn job_get_u64 (job: u64, off: i64) -> u64 {
-  return std::runtime::mem::load_u64(job, off);
+  return mem::load_u64(job, off);
 }
 
 fn job_set_u64 (job: u64, off: i64, value: u64) -> void {
-  std::runtime::mem::store_u64(job, off, value);
+  mem::store_u64(job, off, value);
 }
 
 fn job_start_depth (job: u64) -> int {
@@ -2530,11 +2655,11 @@ fn job_free (job: u64) -> void {
 
   let mut pb: PathBuf = job_pathbuf(job);
   pb.drop();
-  std::runtime::mem::free(job);
+  mem::free(job);
 }
 
 fn job_make_subtree (start_depth: int, root_len: i64, mut pb: PathBuf) -> u64? {
-  let rec: u64 = std::runtime::mem::alloc(JOB_REC_BYTES);
+  let rec: u64 = mem::alloc(JOB_REC_BYTES);
   if rec == 0 {
     pb.drop();
     return None;
@@ -2562,7 +2687,7 @@ fn job_make_file_batch (start_depth: int, root_len: i64, mut pb: PathBuf, names_
     nlen = 0;
   }
 
-  let rec: u64 = std::runtime::mem::alloc(JOB_REC_BYTES + nlen);
+  let rec: u64 = mem::alloc(JOB_REC_BYTES + nlen);
   if rec == 0 {
     pb.drop();
     return None;
@@ -2653,7 +2778,7 @@ fn run_search_file_batch (
   var off: i64 = 0;
   var done: bool = false;
   while off < names_len && !done {
-    if io.cancel != None && (tick & 255) == 0 {
+    if io.has_cancel && (tick & 255) == 0 {
       if cancel_is_set(io) {
         let ok_flush: bool = flush_out_if_nonempty(mut out, io);
         if !ok_flush {
@@ -2671,9 +2796,9 @@ fn run_search_file_batch (
     if off + 2 > names_len {
       done = true;
     } else {
-      let n_u8: u8 = std::runtime::mem::load_u8(names_ptr, off);
+      let n_u8: u8 = mem::load_u8(names_ptr, off);
       off = off + 1;
-      let flags: u8 = std::runtime::mem::load_u8(names_ptr, off);
+      let flags: u8 = mem::load_u8(names_ptr, off);
       off = off + 1;
 
       let n: i64 = n_u8 as i64;
@@ -2733,7 +2858,7 @@ fn run_list_file_batch (
   var off: i64 = 0;
   var done: bool = false;
   while off < names_len && !done {
-    if io.cancel != None && (tick & 255) == 0 {
+    if io.has_cancel && (tick & 255) == 0 {
       if cancel_is_set(io) {
         let ok_flush: bool = flush_out_if_nonempty(mut out, io);
         if !ok_flush {
@@ -2750,9 +2875,9 @@ fn run_list_file_batch (
     if off + 2 > names_len {
       done = true;
     } else {
-      let n_u8: u8 = std::runtime::mem::load_u8(names_ptr, off);
+      let n_u8: u8 = mem::load_u8(names_ptr, off);
       off = off + 1;
-      let _flags: u8 = std::runtime::mem::load_u8(names_ptr, off);
+      let _flags: u8 = mem::load_u8(names_ptr, off);
       off = off + 1;
 
       let n: i64 = n_u8 as i64;
@@ -2810,22 +2935,13 @@ fn enqueue_file_batch_job (
     return true;
   }
 
-  let base_opt: PathBuf? = pathbuf_alloc_from_ptr_len(base_ptr, base_len);
-  if base_opt == None {
+  let move Some(base_pb) = pathbuf_alloc_from_ptr_len(base_ptr, base_len) else {
     return false;
-  }
-
-  let base_pb: PathBuf = match (base_opt) {
-    Some(v) => move v,
-    None => PathBuf{ ptr: 0, cap: 0, len: 0 },
   };
 
-  let job_opt: u64? = job_make_file_batch(start_depth, root_len, base_pb, names_ptr, names_len);
-  if job_opt == None {
+  let Some(job) = job_make_file_batch(start_depth, root_len, base_pb, names_ptr, names_len) else {
     return false;
-  }
-
-  let job: u64 = job_opt ?? 0;
+  };
   if job == 0 {
     return false;
   }
@@ -2841,9 +2957,9 @@ fn enqueue_file_batch_job (
 }
 
 fn job_recv (chan_handle: u64) -> u64? {
-  let mut ch: JobChannel = std::sync::__ChannelU64.invalid();
+  let mut ch: JobChannel = JobChannel.invalid();
   ch.handle = chan_handle;
-  let v: u64? = ch.recv();
+  let v = ch.recv();
   // `ch` is a borrowed view: disarm `Drop`.
   ch.handle = 0;
   return v;
@@ -2865,14 +2981,8 @@ fn ignore_rebuild_for_job (cfg: &Config, root_len: i64, start_depth: int, path: 
   }
 
   // Start at the root prefix for this traversal (not necessarily `.`).
-  let root_opt: PathBuf? = pathbuf_alloc_from_ptr_len(path.ptr, rlen);
-  if root_opt == None {
+  let mut move Some(prefix) = pathbuf_alloc_from_ptr_len(path.ptr, rlen) else {
     return ignore;
-  }
-
-  let mut prefix: PathBuf = match (root_opt) {
-    Some(v) => move v,
-    None => PathBuf{ ptr: 0, cap: 0, len: 0 },
   };
   ignore_push_dir_cached(true, mut ignore, mut prefix, mut cache);
 
@@ -2885,7 +2995,7 @@ fn ignore_rebuild_for_job (cfg: &Config, root_len: i64, start_depth: int, path: 
   let ptr: u64 = path.ptr;
   let len: i64 = path.len;
   var off: i64 = rlen;
-  if off < len && ptr != 0 && std::runtime::mem::load_u8(ptr, off) == 47 {
+  if off < len && ptr != 0 && mem::load_u8(ptr, off) == 47 {
     off = off + 1;
   }
 
@@ -2896,7 +3006,7 @@ fn ignore_rebuild_for_job (cfg: &Config, root_len: i64, start_depth: int, path: 
       done = true;
     } else {
       var end: i64 = off;
-      while end < len && std::runtime::mem::load_u8(ptr, end) != 47 {
+      while end < len && mem::load_u8(ptr, end) != 47 {
         end = end + 1;
       }
 
@@ -2933,7 +3043,7 @@ fn run_search_job (cfg: &Config, p: &Pattern, job: u64, mut scratch: &BufferU8, 
 
     let o: Outcome = run_search_file_batch(cfg, p, names_ptr, names_len, mut scratch, io, mut path, mut out, mut err, mut stats);
     path.drop();
-    std::runtime::mem::free(job);
+    mem::free(job);
     return o;
   }
 
@@ -2946,7 +3056,7 @@ fn run_search_job (cfg: &Config, p: &Pattern, job: u64, mut scratch: &BufferU8, 
 
   ignore_drop_stack(mut ignore);
   path.drop();
-  std::runtime::mem::free(job);
+  mem::free(job);
   return o;
 }
 
@@ -2959,7 +3069,7 @@ fn run_list_job (cfg: &Config, job: u64, io: &IO, mut out: &Writer, mut err: &Wr
 
     let o: Outcome = run_list_file_batch(names_ptr, names_len, io, mut path, mut out, mut err, mut stats);
     path.drop();
-    std::runtime::mem::free(job);
+    mem::free(job);
     return o;
   }
 
@@ -2972,64 +3082,48 @@ fn run_list_job (cfg: &Config, job: u64, io: &IO, mut out: &Writer, mut err: &Wr
 
   ignore_drop_stack(mut ignore);
   path.drop();
-  std::runtime::mem::free(job);
+  mem::free(job);
   return o;
 }
 
-fn worker_search_queue_run (cfg: Config, pat_s: string, job_chan_handle: u64, io: IO) -> WorkerResultPtr {
+fn worker_search_queue_run (cfg: Config, pat_s: string, job_chan_handle: u64, io: IO) -> WorkerResult {
   let mut stats: Stats = stats_init();
 
   let cm: ColorMode = cfg.color_mode;
   let stdout_color: bool = color_enabled(cm, FD_STDOUT);
   let stderr_color: bool = color_enabled(cm, FD_STDERR);
 
-  let out_opt: Writer? = Writer.stdout(stdout_color, STDOUT_BUF_CAP);
-  if out_opt == None {
+  let mut move Some(out) = Writer.stdout(stdout_color, STDOUT_BUF_CAP) else {
     stats.errors = stats.errors + 1;
     cancel_set(&io);
-    return worker_result_alloc(&stats, false, true);
-  }
-
-  let mut out: Writer = match (out_opt) {
-    Some(v) => move v,
-    None => Writer{ fd: -1, color: false, buf: BufferU8.empty() },
+    return worker_result(&stats, false, true);
   };
 
-  let err_opt: Writer? = Writer.stderr(stderr_color, STDERR_BUF_CAP);
-  if err_opt == None {
+  let mut move Some(err) = Writer.stderr(stderr_color, STDERR_BUF_CAP) else {
     stats.errors = stats.errors + 1;
     out.drop();
     cancel_set(&io);
-    return worker_result_alloc(&stats, false, true);
+    return worker_result(&stats, false, true);
+  };
+
+  var pat: Pattern = Pattern{ kind: PatternKind::Fixed, needle: "", ignore_case: false, regex: RegExp.empty() };
+  match (compile_pattern(pat_s, cfg.fixed_string, cfg.ignore_case)) {
+    Ok(v) => {
+      pat = move v;
+    },
+    Err(e) => {
+      let _ = pattern_compile_error(mut err, &io, mut stats, e);
+      out.drop();
+      err.drop();
+      cancel_set(&io);
+      return worker_result(&stats, false, true);
+    },
   }
 
-  let mut err: Writer = match (err_opt) {
-    Some(v) => move v,
-    None => Writer{ fd: -1, color: false, buf: BufferU8.empty() },
-  };
-
-  let pr: PatternResult = compile_pattern(pat_s, cfg.fixed_string, cfg.ignore_case);
-  let pat_opt: Pattern? = match pr {
-    Ok(v) => Some(move v),
-    Err(e) => pattern_compile_error(mut err, &io, mut stats, e),
-  };
-  if pat_opt == None {
-    out.drop();
-    err.drop();
-    cancel_set(&io);
-    return worker_result_alloc(&stats, false, true);
+  let mut scratch: BufferU8 = BufferU8.empty();
+  if let mut move Some(buf) = BufferU8.init(READ_SCRATCH_CAP) {
+    scratch = move buf;
   }
-
-  let mut pat: Pattern = match (pat_opt) {
-    Some(v) => move v,
-    None => Pattern{ kind: PatternKind::Fixed, needle: "", ignore_case: false, regex: std::regex::RegExp.empty() },
-  };
-
-  let scratch_opt: BufferU8? = BufferU8.init(READ_SCRATCH_CAP);
-  let mut scratch: BufferU8 = match (scratch_opt) {
-    Some(v) => move v,
-    None => BufferU8.empty(),
-  };
 
   let worker_budget: int = clamp_workers(&cfg, resolve_jobs(&cfg));
   let ignore_cache_slots: int = parallel_ignore_cache_slots(worker_budget);
@@ -3040,25 +3134,24 @@ fn worker_search_queue_run (cfg: Config, pat_s: string, job_chan_handle: u64, io
 
   var done: bool = false;
   while !done {
-    let job_opt: u64? = job_recv(job_chan_handle);
-    if job_opt == None {
+    let Some(job) = job_recv(job_chan_handle) else {
       done = true;
-    } else {
-      let job: u64 = job_opt ?? 0;
-      if job != 0 {
-        if cancel_is_set(&io) {
-          job_free(job);
-        } else {
-          let o: Outcome = run_search_job(&cfg, &pat, job, mut scratch, &io, mut out, mut err, mut stats, mut ignore_cache);
-          if o.found {
-            found_any = true;
-          }
+      continue;
+    };
 
-          if o.stop {
-            found_any = true;
-            stop = true;
-            cancel_set(&io);
-          }
+    if job != 0 {
+      if cancel_is_set(&io) {
+        job_free(job);
+      } else {
+        let o: Outcome = run_search_job(&cfg, &pat, job, mut scratch, &io, mut out, mut err, mut stats, mut ignore_cache);
+        if o.found {
+          found_any = true;
+        }
+
+        if o.stop {
+          found_any = true;
+          stop = true;
+          cancel_set(&io);
         }
       }
     }
@@ -3077,43 +3170,31 @@ fn worker_search_queue_run (cfg: Config, pat_s: string, job_chan_handle: u64, io
   out.drop();
   err.drop();
 
-  return worker_result_alloc(&stats, found_any, stop);
+  return worker_result(&stats, found_any, stop);
 }
 
-task fn worker_search_queue (cfg: Config, pat_s: string, job_chan_handle: u64, io: IO) -> WorkerResultPtr {
+task fn worker_search_queue (cfg: Config, pat_s: string, job_chan_handle: u64, io: IO) -> WorkerResult {
   return worker_search_queue_run(cfg, pat_s, job_chan_handle, io);
 }
 
-fn worker_list_queue_run (cfg: Config, job_chan_handle: u64, io: IO) -> WorkerResultPtr {
+fn worker_list_queue_run (cfg: Config, job_chan_handle: u64, io: IO) -> WorkerResult {
   let mut stats: Stats = stats_init();
 
   let cm: ColorMode = cfg.color_mode;
   let stdout_color: bool = color_enabled(cm, FD_STDOUT);
   let stderr_color: bool = color_enabled(cm, FD_STDERR);
 
-  let out_opt: Writer? = Writer.stdout(stdout_color, STDOUT_BUF_CAP);
-  if out_opt == None {
+  let mut move Some(out) = Writer.stdout(stdout_color, STDOUT_BUF_CAP) else {
     stats.errors = stats.errors + 1;
     cancel_set(&io);
-    return worker_result_alloc(&stats, false, true);
-  }
-
-  let mut out: Writer = match (out_opt) {
-    Some(v) => move v,
-    None => Writer{ fd: -1, color: false, buf: BufferU8.empty() },
+    return worker_result(&stats, false, true);
   };
 
-  let err_opt: Writer? = Writer.stderr(stderr_color, STDERR_BUF_CAP);
-  if err_opt == None {
+  let mut move Some(err) = Writer.stderr(stderr_color, STDERR_BUF_CAP) else {
     stats.errors = stats.errors + 1;
     out.drop();
     cancel_set(&io);
-    return worker_result_alloc(&stats, false, true);
-  }
-
-  let mut err: Writer = match (err_opt) {
-    Some(v) => move v,
-    None => Writer{ fd: -1, color: false, buf: BufferU8.empty() },
+    return worker_result(&stats, false, true);
   };
 
   let worker_budget: int = clamp_workers(&cfg, resolve_jobs(&cfg));
@@ -3124,20 +3205,19 @@ fn worker_list_queue_run (cfg: Config, job_chan_handle: u64, io: IO) -> WorkerRe
 
   var done: bool = false;
   while !done {
-    let job_opt: u64? = job_recv(job_chan_handle);
-    if job_opt == None {
+    let Some(job) = job_recv(job_chan_handle) else {
       done = true;
-    } else {
-      let job: u64 = job_opt ?? 0;
-      if job != 0 {
-        if cancel_is_set(&io) {
-          job_free(job);
-        } else {
-          let o: Outcome = run_list_job(&cfg, job, &io, mut out, mut err, mut stats, mut ignore_cache);
-          if o.stop {
-            stop = true;
-            cancel_set(&io);
-          }
+      continue;
+    };
+
+    if job != 0 {
+      if cancel_is_set(&io) {
+        job_free(job);
+      } else {
+        let o: Outcome = run_list_job(&cfg, job, &io, mut out, mut err, mut stats, mut ignore_cache);
+        if o.stop {
+          stop = true;
+          cancel_set(&io);
         }
       }
     }
@@ -3153,10 +3233,10 @@ fn worker_list_queue_run (cfg: Config, job_chan_handle: u64, io: IO) -> WorkerRe
   out.drop();
   err.drop();
 
-  return worker_result_alloc(&stats, false, stop);
+  return worker_result(&stats, false, stop);
 }
 
-task fn worker_list_queue (cfg: Config, job_chan_handle: u64, io: IO) -> WorkerResultPtr {
+task fn worker_list_queue (cfg: Config, job_chan_handle: u64, io: IO) -> WorkerResult {
   return worker_list_queue_run(cfg, job_chan_handle, io);
 }
 
@@ -3173,22 +3253,13 @@ fn enqueue_subtree_job (
     return false;
   }
 
-  let child_opt: PathBuf? = pathbuf_alloc_from_ptr_len(child_ptr, child_len);
-  if child_opt == None {
+  let Some(child_pb) = pathbuf_alloc_from_ptr_len(child_ptr, child_len) else {
     return false;
-  }
-
-  let child_pb: PathBuf = match (child_opt) {
-    Some(v) => move v,
-    None => PathBuf{ ptr: 0, cap: 0, len: 0 },
   };
 
-  let job_opt: u64? = job_make_subtree(start_depth, root_len, child_pb);
-  if job_opt == None {
+  let Some(job) = job_make_subtree(start_depth, root_len, child_pb) else {
     return false;
-  }
-
-  let job: u64 = job_opt ?? 0;
+  };
   if job == 0 {
     return false;
   }
@@ -3227,20 +3298,23 @@ fn split_dir_search_jobs (
     return outcome_none();
   }
 
-  let open_path: string = path_open_path(path);
   let open_path_view: PathView = path_view(path);
-  let dir: u64 = opendir(open_path);
-  if dir == 0 {
-    let e: int = errno();
-    if e == ENOTDIR {
-      stats.files_total = stats.files_total + 1;
-      return search_file(cfg, p, open_path_view, false, mut scratch, io, mut out, mut err, mut stats);
-    }
+  let mut dir: Dir = Dir.invalid();
+  match (Dir.open(path_view_string(open_path_view))) {
+    Ok(v) => {
+      dir = move v;
+    },
+    Err(e) => {
+      if e.kind() == FSErrorKind::NotADirectory {
+        stats.files_total = stats.files_total + 1;
+        return search_file(cfg, p, open_path_view, false, mut scratch, io, mut out, mut err, mut stats);
+      }
 
-    stats.errors = stats.errors + 1;
-    write_error(mut err, io, open_path_view, "failed to open directory");
-    return outcome_none();
-  }
+      stats.errors = stats.errors + 1;
+      write_error(mut err, io, open_path_view, "failed to open directory");
+      return outcome_none();
+    },
+  };
 
   var ignore_checkpoint: i64 = 0;
   if cfg.ignore_files {
@@ -3255,7 +3329,7 @@ fn split_dir_search_jobs (
   var use_file_jobs: bool = cfg.file_jobs;
   var file_batch_size: int = cfg.file_batch;
   if file_batch_size <= 0 {
-    file_batch_size = 256;
+    file_batch_size = 512;
   }
 
   if file_batch_size < 1 {
@@ -3278,9 +3352,9 @@ fn split_dir_search_jobs (
   var tick: i64 = 0;
   var done: bool = false;
   while !done {
-    if io.cancel != None && (tick & 255) == 0 {
+    if io.has_cancel && (tick & 255) == 0 {
       if cancel_is_set(io) {
-        let _ = closedir(dir);
+        dir.close();
         if cfg.ignore_files {
           ignore_pop_to(mut ignore, ignore_checkpoint);
         }
@@ -3292,13 +3366,13 @@ fn split_dir_search_jobs (
 
     tick = tick + 1;
 
-    let dent: u64 = readdir(dir);
-    if dent == 0 {
+    let entry: WalkEntry = next_dir_entry(mut dir, io, open_path_view, mut err, mut stats);
+    if entry.done {
       done = true;
     } else {
-      let dtype: u8 = dirent_d_type(dent);
-      let name_ptr: u64 = dirent_name_ptr(dent);
-      let name_len: i64 = cstr_len(name_ptr, 255);
+      let kind: DirEntryType = entry.kind;
+      let name_ptr: u64 = entry.name_ptr;
+      let name_len: i64 = entry.name_len;
 
       var skip_entry: bool = false;
       if name_ptr == 0 || name_len <= 0 {
@@ -3316,7 +3390,7 @@ fn split_dir_search_jobs (
           skip_entry = true;
         }
 
-        if !skip_entry && cfg.ignore_common && dtype == DT_DIR && is_common_dir_name_ptr_len(name_ptr, name_len) {
+        if !skip_entry && cfg.ignore_common && kind == DirEntryType::Directory && is_common_dir_name_ptr_len(name_ptr, name_len) {
           skip_entry = true;
         }
       }
@@ -3333,49 +3407,16 @@ fn split_dir_search_jobs (
           let full_ptr: u64 = path.ptr;
           let full_len: i64 = path.len;
 
-          var is_dir: bool = false;
-          var is_file: bool = false;
-
-          if dtype == DT_DIR {
-            is_dir = true;
-          } else if dtype == DT_REG {
-            is_file = true;
-          } else if dtype == DT_LNK {
-            if cfg.follow {
-              let child_path: string = path.as_string();
-              let tmp: u64 = opendir(child_path);
-              if tmp != 0 {
-                let _ = closedir(tmp);
-                is_dir = true;
-              } else {
-                let e: int = errno();
-                if e == ENOTDIR {
-                  is_file = true;
-                } else {
-                  stats.errors = stats.errors + 1;
-                  write_error(mut err, io, path_view(path), "failed to open directory");
-                }
-              }
-            }
-          } else if dtype == DT_UNKNOWN {
-            let child_path: string = path.as_string();
-            let tmp: u64 = opendir(child_path);
-            if tmp != 0 {
-              let _ = closedir(tmp);
-              is_dir = true;
-            } else {
-              let e: int = errno();
-              if e == ENOTDIR {
-                is_file = true;
-              } else {
-                stats.errors = stats.errors + 1;
-                write_error(mut err, io, path_view(path), "failed to open directory");
-              }
-            }
-          }
+          let child_kind: ChildKind = classify_child_path(cfg, kind, path, io, mut err, mut stats);
+          let is_dir: bool = child_kind == ChildKind::Directory;
+          let is_file: bool = child_kind == ChildKind::RegularFile;
 
           var skip_child: bool = false;
           if is_dir && cfg.ignore_common && is_common_dir_name_ptr_len(name_ptr, name_len) {
+            skip_child = true;
+          }
+
+          if !skip_child && is_file && cfg.ignore_common && is_common_file_name_ptr_len(name_ptr, name_len) {
             skip_child = true;
           }
 
@@ -3400,7 +3441,7 @@ fn split_dir_search_jobs (
                     }
 
                     if o.stop {
-                      let _ = closedir(dir);
+                      dir.close();
                       path_truncate(mut path, saved_len);
                       if cfg.ignore_files {
                         ignore_pop_to(mut ignore, ignore_checkpoint);
@@ -3418,7 +3459,7 @@ fn split_dir_search_jobs (
                       }
 
                       if o.stop {
-                        let _ = closedir(dir);
+                        dir.close();
                         path_truncate(mut path, saved_len);
                         if cfg.ignore_files {
                           ignore_pop_to(mut ignore, ignore_checkpoint);
@@ -3438,7 +3479,7 @@ fn split_dir_search_jobs (
               }
 
               if search_this {
-                let known_regular: bool = dtype == DT_REG;
+                let known_regular: bool = kind == DirEntryType::RegularFile;
 
                 if use_file_jobs {
                   let packed_ok: bool = file_batch_push_entry(mut file_names, name_ptr, name_len, known_regular);
@@ -3452,7 +3493,7 @@ fn split_dir_search_jobs (
                     }
 
                     if o.stop {
-                      let _ = closedir(dir);
+                      dir.close();
                       path_truncate(mut path, saved_len);
                       if cfg.ignore_files {
                         ignore_pop_to(mut ignore, ignore_checkpoint);
@@ -3489,7 +3530,7 @@ fn split_dir_search_jobs (
                         }
 
                         if o.stop {
-                          let _ = closedir(dir);
+                          dir.close();
                           path_truncate(mut path, saved_len);
                           if cfg.ignore_files {
                             ignore_pop_to(mut ignore, ignore_checkpoint);
@@ -3513,7 +3554,7 @@ fn split_dir_search_jobs (
                   }
 
                   if o.stop {
-                    let _ = closedir(dir);
+                    dir.close();
                     path_truncate(mut path, saved_len);
                     if cfg.ignore_files {
                       ignore_pop_to(mut ignore, ignore_checkpoint);
@@ -3560,7 +3601,7 @@ fn split_dir_search_jobs (
         }
 
         if o.stop {
-          let _ = closedir(dir);
+          dir.close();
           if cfg.ignore_files {
             ignore_pop_to(mut ignore, ignore_checkpoint);
           }
@@ -3577,7 +3618,7 @@ fn split_dir_search_jobs (
       }
 
       if o.stop {
-        let _ = closedir(dir);
+        dir.close();
         if cfg.ignore_files {
           ignore_pop_to(mut ignore, ignore_checkpoint);
         }
@@ -3591,7 +3632,7 @@ fn split_dir_search_jobs (
     file_batch_count = 0;
   }
 
-  let _ = closedir(dir);
+  dir.close();
   if cfg.ignore_files {
     ignore_pop_to(mut ignore, ignore_checkpoint);
   }
@@ -3620,26 +3661,29 @@ fn split_dir_files_jobs (
     return outcome_none();
   }
 
-  let open_path: string = path_open_path(path);
   let open_path_view: PathView = path_view(path);
-  let dir: u64 = opendir(open_path);
-  if dir == 0 {
-    let e: int = errno();
-    if e == ENOTDIR {
-      stats.files_total = stats.files_total + 1;
-      let ok: bool = list_file(open_path_view, io, mut out);
-      if !ok {
-        stats.errors = stats.errors + 1;
-        return Outcome{ found: true, stop: true };
+  let mut dir: Dir = Dir.invalid();
+  match (Dir.open(path_view_string(open_path_view))) {
+    Ok(v) => {
+      dir = move v;
+    },
+    Err(e) => {
+      if e.kind() == FSErrorKind::NotADirectory {
+        stats.files_total = stats.files_total + 1;
+        let ok: bool = list_file(open_path_view, io, mut out);
+        if !ok {
+          stats.errors = stats.errors + 1;
+          return Outcome{ found: true, stop: true };
+        }
+
+        return outcome_none();
       }
 
+      stats.errors = stats.errors + 1;
+      write_error(mut err, io, open_path_view, "failed to open directory");
       return outcome_none();
-    }
-
-    stats.errors = stats.errors + 1;
-    write_error(mut err, io, open_path_view, "failed to open directory");
-    return outcome_none();
-  }
+    },
+  };
 
   var ignore_checkpoint: i64 = 0;
   if cfg.ignore_files {
@@ -3652,7 +3696,7 @@ fn split_dir_files_jobs (
   var use_file_jobs: bool = cfg.file_jobs;
   var file_batch_size: int = cfg.file_batch;
   if file_batch_size <= 0 {
-    file_batch_size = 256;
+    file_batch_size = 512;
   }
 
   if file_batch_size < 1 {
@@ -3675,9 +3719,9 @@ fn split_dir_files_jobs (
   var tick: i64 = 0;
   var done: bool = false;
   while !done {
-    if io.cancel != None && (tick & 255) == 0 {
+    if io.has_cancel && (tick & 255) == 0 {
       if cancel_is_set(io) {
-        let _ = closedir(dir);
+        dir.close();
         if cfg.ignore_files {
           ignore_pop_to(mut ignore, ignore_checkpoint);
         }
@@ -3689,13 +3733,13 @@ fn split_dir_files_jobs (
 
     tick = tick + 1;
 
-    let dent: u64 = readdir(dir);
-    if dent == 0 {
+    let entry: WalkEntry = next_dir_entry(mut dir, io, open_path_view, mut err, mut stats);
+    if entry.done {
       done = true;
     } else {
-      let dtype: u8 = dirent_d_type(dent);
-      let name_ptr: u64 = dirent_name_ptr(dent);
-      let name_len: i64 = cstr_len(name_ptr, 255);
+      let kind: DirEntryType = entry.kind;
+      let name_ptr: u64 = entry.name_ptr;
+      let name_len: i64 = entry.name_len;
 
       var skip_entry: bool = false;
       if name_ptr == 0 || name_len <= 0 {
@@ -3713,7 +3757,7 @@ fn split_dir_files_jobs (
           skip_entry = true;
         }
 
-        if !skip_entry && cfg.ignore_common && dtype == DT_DIR && is_common_dir_name_ptr_len(name_ptr, name_len) {
+        if !skip_entry && cfg.ignore_common && kind == DirEntryType::Directory && is_common_dir_name_ptr_len(name_ptr, name_len) {
           skip_entry = true;
         }
       }
@@ -3730,49 +3774,16 @@ fn split_dir_files_jobs (
           let full_ptr: u64 = path.ptr;
           let full_len: i64 = path.len;
 
-          var is_dir: bool = false;
-          var is_file: bool = false;
-
-          if dtype == DT_DIR {
-            is_dir = true;
-          } else if dtype == DT_REG {
-            is_file = true;
-          } else if dtype == DT_LNK {
-            if cfg.follow {
-              let child_path: string = path.as_string();
-              let tmp: u64 = opendir(child_path);
-              if tmp != 0 {
-                let _ = closedir(tmp);
-                is_dir = true;
-              } else {
-                let e: int = errno();
-                if e == ENOTDIR {
-                  is_file = true;
-                } else {
-                  stats.errors = stats.errors + 1;
-                  write_error(mut err, io, path_view(path), "failed to open directory");
-                }
-              }
-            }
-          } else if dtype == DT_UNKNOWN {
-            let child_path: string = path.as_string();
-            let tmp: u64 = opendir(child_path);
-            if tmp != 0 {
-              let _ = closedir(tmp);
-              is_dir = true;
-            } else {
-              let e: int = errno();
-              if e == ENOTDIR {
-                is_file = true;
-              } else {
-                stats.errors = stats.errors + 1;
-                write_error(mut err, io, path_view(path), "failed to open directory");
-              }
-            }
-          }
+          let child_kind: ChildKind = classify_child_path(cfg, kind, path, io, mut err, mut stats);
+          let is_dir: bool = child_kind == ChildKind::Directory;
+          let is_file: bool = child_kind == ChildKind::RegularFile;
 
           var skip_child: bool = false;
           if is_dir && cfg.ignore_common && is_common_dir_name_ptr_len(name_ptr, name_len) {
+            skip_child = true;
+          }
+
+          if !skip_child && is_file && cfg.ignore_common && is_common_file_name_ptr_len(name_ptr, name_len) {
             skip_child = true;
           }
 
@@ -3793,7 +3804,7 @@ fn split_dir_files_jobs (
                     sched.scheduled_units = sched.scheduled_units + 1;
                     let o: Outcome = split_dir_files_jobs(cfg, root_len, next_depth, split_depth, target_jobs, max_jobs_total, jobs, mut sched, mut ignore, io, mut path, mut out, mut err, mut stats);
                     if o.stop {
-                      let _ = closedir(dir);
+                      dir.close();
                       path_truncate(mut path, saved_len);
                       if cfg.ignore_files {
                         ignore_pop_to(mut ignore, ignore_checkpoint);
@@ -3807,7 +3818,7 @@ fn split_dir_files_jobs (
                     if !enq_ok {
                       let o: Outcome = walk_dir_files(cfg, mut ignore, io, mut path, next_depth, mut out, mut err, mut stats);
                       if o.stop {
-                        let _ = closedir(dir);
+                        dir.close();
                         path_truncate(mut path, saved_len);
                         if cfg.ignore_files {
                           ignore_pop_to(mut ignore, ignore_checkpoint);
@@ -3827,7 +3838,7 @@ fn split_dir_files_jobs (
               }
 
               if list_this {
-                let known_regular: bool = dtype == DT_REG;
+                let known_regular: bool = kind == DirEntryType::RegularFile;
 
                 if use_file_jobs {
                   let packed_ok: bool = file_batch_push_entry(mut file_names, name_ptr, name_len, known_regular);
@@ -3837,7 +3848,7 @@ fn split_dir_files_jobs (
                     let ok: bool = list_file(child_path, io, mut out);
                     if !ok {
                       stats.errors = stats.errors + 1;
-                      let _ = closedir(dir);
+                      dir.close();
                       path_truncate(mut path, saved_len);
                       if cfg.ignore_files {
                         ignore_pop_to(mut ignore, ignore_checkpoint);
@@ -3870,7 +3881,7 @@ fn split_dir_files_jobs (
                         sched.scheduled_units = sched.scheduled_units + 1;
                         let o: Outcome = run_list_file_batch(file_names.ptr, file_names.len, io, mut path, mut out, mut err, mut stats);
                         if o.stop {
-                          let _ = closedir(dir);
+                          dir.close();
                           path_truncate(mut path, saved_len);
                           if cfg.ignore_files {
                             ignore_pop_to(mut ignore, ignore_checkpoint);
@@ -3891,7 +3902,7 @@ fn split_dir_files_jobs (
                   let ok: bool = list_file(child_path, io, mut out);
                   if !ok {
                     stats.errors = stats.errors + 1;
-                    let _ = closedir(dir);
+                    dir.close();
                     path_truncate(mut path, saved_len);
                     if cfg.ignore_files {
                       ignore_pop_to(mut ignore, ignore_checkpoint);
@@ -3934,7 +3945,7 @@ fn split_dir_files_jobs (
         sched.scheduled_units = sched.scheduled_units + 1;
         let o: Outcome = run_list_file_batch(file_names.ptr, file_names.len, io, mut path, mut out, mut err, mut stats);
         if o.stop {
-          let _ = closedir(dir);
+          dir.close();
           if cfg.ignore_files {
             ignore_pop_to(mut ignore, ignore_checkpoint);
           }
@@ -3947,7 +3958,7 @@ fn split_dir_files_jobs (
       sched.scheduled_units = sched.scheduled_units + 1;
       let o: Outcome = run_list_file_batch(file_names.ptr, file_names.len, io, mut path, mut out, mut err, mut stats);
       if o.stop {
-        let _ = closedir(dir);
+        dir.close();
         if cfg.ignore_files {
           ignore_pop_to(mut ignore, ignore_checkpoint);
         }
@@ -3961,7 +3972,7 @@ fn split_dir_files_jobs (
     file_batch_count = 0;
   }
 
-  let _ = closedir(dir);
+  dir.close();
   if cfg.ignore_files {
     ignore_pop_to(mut ignore, ignore_checkpoint);
   }
@@ -3983,12 +3994,20 @@ fn resolve_jobs (cfg: &Config) -> int {
   //
   // Heuristic:
   // - Cap auto parallelism to keep overhead reasonable on very high core-count
-  //   machines (this is I/O heavy work; too many threads can be slower).
-  // - Large trees still benefit from more than the previous 8-worker ceiling,
-  //   especially on 16+ core hosts.
+  //   machines.
+  // - Search mode benefits from some worker concurrency because file opens and
+  //   prefix reads are I/O-heavy, but too many workers can still lose to task
+  //   scheduling and filesystem contention.
+  // - File-list mode stays conservative because it is mostly traversal +
+  //   output and defaults to single-threaded unless `--parallel-files` is set.
   // - Users can always override via `--jobs N`.
-  let auto_jobs_cap: int = 16; // 15 workers + 1 orchestrator
-  let n: int = std::task::available_parallelism();
+  let auto_jobs_cap: int =
+  if cfg.mode == Mode::Search {
+    8 // 7 workers + 1 orchestrator
+  } else {
+    9 // 8 workers + 1 orchestrator
+  };
+  let n: int = available_parallelism();
   if n <= 0 {
     return 1;
   }
@@ -4009,10 +4028,7 @@ fn clamp_workers (cfg: &Config, jobs: int) -> int {
   // `jobs` counts the orchestrator + worker tasks.
   //
   // Notes:
-  // - `task fn` calls currently spawn OS threads in the hosted subset (no
-  //   global work-stealing pool yet).
-  // - `cfg.max_workers == 0` means “no cap” (within current implementation
-  //   limits).
+  // - `cfg.max_workers == 0` means “no extra cap” within `slg`'s hard limits.
   var max_workers: int = cfg.max_workers;
   if jobs <= 1 {
     return 0;
@@ -4038,9 +4054,9 @@ fn clamp_workers (cfg: &Config, jobs: int) -> int {
  * Parallel runner (task-based).
  *
  * Notes:
- * - This currently parallelizes at the root-directory level by spawning up to
- *   `--jobs-1` worker tasks for top-level subdirectories. Remaining work is
- *   handled in the orchestrator thread.
+ * - The orchestrator walks each root just far enough to enqueue subtree jobs.
+ * - Long-lived workers drain those jobs while the orchestrator handles any
+ *   remaining work after the queue closes.
  * - Output is serialized with a mutex to avoid interleaving.
  */
 export async fn run_parallel (cfg: Config) -> int {
@@ -4060,9 +4076,14 @@ export async fn run_parallel (cfg: Config) -> int {
   var split_depth: int = cfg.split_depth;
   if split_depth <= 0 {
     // Auto mode: split shallowly until we have enough jobs to keep workers
-    // busy, but avoid deep splitting (it increases per-job ignore
-    // reconstruction work).
-    split_depth = 2;
+    // busy. Search benefits from deeper splitting on large repo forests
+    // because otherwise one worker can inherit a large subtree and dominate
+    // the tail of the run while the other workers sit idle.
+    split_depth = if mode == Mode::Search {
+      4
+    } else {
+      2
+    };
   }
 
   if split_depth < 1 {
@@ -4077,7 +4098,12 @@ export async fn run_parallel (cfg: Config) -> int {
   if target_jobs <= 0 {
     // Auto mode: keep the orchestrator’s splitting work bounded while still
     // creating enough parallel work to keep workers busy.
-    target_jobs = worker_budget * 4;
+    if mode == Mode::Search {
+      target_jobs = 512;
+    } else {
+      // File-list mode is output-heavy and remains more conservative.
+      target_jobs = worker_budget * 4;
+    }
   }
 
   if target_jobs < 1 {
@@ -4085,107 +4111,68 @@ export async fn run_parallel (cfg: Config) -> int {
   }
 
   // Shared output lock for stdout/stderr.
-  let m_r: std::sync::MutexResult = std::sync::Mutex.init();
-  if m_r.is_err() {
+  let mut move Ok(out_mutex) = sync::Mutex.init() else {
     return run(cfg);
-  }
-
-  let mut out_mutex: std::sync::Mutex = match (m_r) {
-    Ok(v) => move v,
-    Err(_) => std::sync::Mutex.invalid(),
   };
-  let lock: std::sync::MutexBorrow = out_mutex.borrow();
+  let lock: sync::MutexBorrow = out_mutex.borrow();
 
   // Shared cancellation token for early-stop coordination:
   // - `--quiet` (search mode) cancels after the first match.
   // - Output write/flush failures cancel other tasks to avoid wasted work.
-  let t_r: std::sync::CancellationTokenResult = std::sync::CancellationToken.init();
-  let cancel_ok: bool = !t_r.is_err();
-  let mut cancel_tok: std::sync::CancellationToken = match (t_r) {
-    Ok(v) => move v,
-    Err(_) => std::sync::CancellationToken.invalid(),
-  };
-  var cancel_borrow: std::sync::CancellationTokenBorrow? = None;
-  if cancel_ok {
-    cancel_borrow = Some(cancel_tok.borrow());
+  let mut cancel_tok: sync::CancellationToken = sync::CancellationToken.invalid();
+  if let mut move Ok(tok) = sync::CancellationToken.init() {
+    cancel_tok = move tok;
   }
 
-  let out_flush_threshold: i64 =
-  if isatty(FD_STDOUT as i32) == 1 {
-    STDOUT_TTY_FLUSH_THRESHOLD
-  } else {
-    STDOUT_BUF_CAP
-  };
-  let io: IO = IO{
-    out_lock: Some(lock),
-    err_lock: Some(lock),
-    cancel: cancel_borrow,
-    out_flush_threshold: out_flush_threshold,
-  };
+  let cancel_ok: bool = cancel_tok.handle != 0;
+  var cancel_borrow: CancellationTokenBorrow = CancellationTokenBorrow{ handle: 0 };
+  if cancel_ok {
+    cancel_borrow = cancel_tok.borrow();
+  }
+
+  let io: IO = io_with_shared_lock(lock, cancel_borrow, cancel_ok);
 
   let cm: ColorMode = cfg.color_mode;
   let stdout_color: bool = color_enabled(cm, FD_STDOUT);
   let stderr_color: bool = color_enabled(cm, FD_STDERR);
 
-  let out_opt: Writer? = Writer.stdout(stdout_color, STDOUT_BUF_CAP);
-  if out_opt == None {
+  let mut move Some(out) = Writer.stdout(stdout_color, STDOUT_BUF_CAP) else {
     return 2;
-  }
-
-  let mut out: Writer = match (out_opt) {
-    Some(v) => move v,
-    None => Writer{ fd: -1, color: false, buf: BufferU8.empty() },
   };
 
-  let err_opt: Writer? = Writer.stderr(stderr_color, STDERR_BUF_CAP);
-  if err_opt == None {
+  let mut move Some(err) = Writer.stderr(stderr_color, STDERR_BUF_CAP) else {
     out.drop();
     return 2;
-  }
-
-  let mut err: Writer = match (err_opt) {
-    Some(v) => move v,
-    None => Writer{ fd: -1, color: false, buf: BufferU8.empty() },
   };
 
   // Stats + task handles.
-  let start_ns_opt: i64? = std::runtime::posix::time::monotonic_now_ns();
-  let start_ns: i64 = start_ns_opt ?? 0;
+  let start_ns: i64 = now_monotonic_ns_or(0);
 
   let mut stats: Stats = stats_init();
   var found_any: bool = false;
 
   let pat_s: string = cfg.pattern ?? "";
-  var pat_opt: Pattern? = None;
+  var pat: Pattern = Pattern{ kind: PatternKind::Fixed, needle: "", ignore_case: false, regex: RegExp.empty() };
   if mode == Mode::Search {
-    // Pattern compilation for the orchestrator thread.
-    let pr: PatternResult = compile_pattern(pat_s, cfg.fixed_string, cfg.ignore_case);
-    pat_opt = match pr {
-      Ok(v) => Some(move v),
-      Err(e) => pattern_compile_error(mut err, &io, mut stats, e),
-    };
-    if pat_opt == None {
-      out.drop();
-      err.drop();
-      return 2;
+    match (compile_pattern(pat_s, cfg.fixed_string, cfg.ignore_case)) {
+      Ok(v) => {
+        pat = move v;
+      },
+      Err(e) => {
+        let _ = pattern_compile_error(mut err, &io, mut stats, e);
+        out.drop();
+        err.drop();
+        return 2;
+      },
     }
   }
 
-  let mut pat: Pattern = match (pat_opt) {
-    Some(v) => move v,
-    None => Pattern{ kind: PatternKind::Fixed, needle: "", ignore_case: false, regex: std::regex::RegExp.empty() },
-  };
-
-  let scratch_opt: BufferU8? =
+  var scratch: BufferU8 = BufferU8.empty();
   if mode == Mode::Search {
-    BufferU8.init(READ_SCRATCH_CAP)
-  } else {
-    Some(BufferU8.empty())
-  };
-  let mut scratch: BufferU8 = match (scratch_opt) {
-    Some(v) => move v,
-    None => BufferU8.empty(),
-  };
+    if let move Some(buf) = BufferU8.init(READ_SCRATCH_CAP) {
+      scratch = move buf;
+    }
+  }
 
   // Bounded job queue.
   var queue_cap: int = cfg.queue_cap;
@@ -4224,22 +4211,15 @@ export async fn run_parallel (cfg: Config) -> int {
     max_jobs_total = 1;
   }
 
-  let q_r: JobChannelResult = std::sync::__ChannelU64.init(queue_cap);
-  if q_r.is_err() {
+  let mut move Ok(job_chan) = JobChannel.init(queue_cap) else {
     pat.drop();
     out.drop();
     err.drop();
     return run(cfg);
-  }
-
-  let mut job_chan: JobChannel = match (q_r) {
-    Ok(v) => move v,
-    Err(_) => std::sync::__ChannelU64.invalid(),
   };
   let job_chan_handle: u64 = job_chan.handle;
 
-  let worker_tasks_opt: WorkerTaskVec? = WorkerTaskVec.try_init(worker_budget as i64);
-  if worker_tasks_opt == None {
+  let mut move Some(worker_tasks) = WorkerTaskVec.try_init(worker_budget as i64) else {
     // Best-effort fallback: the parallel engine isn't essential, so on OOM
     // just run the single-threaded engine.
     scratch.drop();
@@ -4247,14 +4227,12 @@ export async fn run_parallel (cfg: Config) -> int {
     out.drop();
     err.drop();
     return run(cfg);
-  }
-
-  let mut worker_tasks: WorkerTaskVec = worker_tasks_opt ?? WorkerTaskVec.empty();
+  };
 
   // Spawn long-lived worker tasks that drain the job queue.
   var remaining: int = worker_budget;
   while remaining > 0 {
-    let h: Task(WorkerResultPtr) = match (mode) {
+    let h: Task(WorkerResult) = match (mode) {
       Mode::Files => worker_list_queue(cfg, job_chan_handle, io),
       Mode::Search => worker_search_queue(cfg, pat_s, job_chan_handle, io),
     };
@@ -4267,16 +4245,10 @@ export async fn run_parallel (cfg: Config) -> int {
 
   // Walk roots, enqueueing subtree jobs.
   let mut roots: PathIter = cfg.paths();
-  let first_root_opt: string? = roots.next();
   var stop_roots: bool = false;
-  var root_opt: string? = first_root_opt;
-  if root_opt == None {
-    root_opt = Some(".");
-  }
-
-  while root_opt != None && !stop_roots {
-    let root: string = root_opt ?? ".";
-
+  var root: string = roots.next() ?? ".";
+  var have_root: bool = true;
+  while have_root && !stop_roots {
     var open_root: string = root;
     if open_root == "" {
       open_root = ".";
@@ -4289,43 +4261,50 @@ export async fn run_parallel (cfg: Config) -> int {
     } else {
       open_root
     };
-    let pb_r: PathBufResult = std::path::PathBuf.from_string(base);
-    if pb_r.is_err() {
-      stats.errors = stats.errors + 1;
-      write_error(mut err, &io, open_root_view, "out of memory");
-    } else {
-      let mut path: PathBuf = match (pb_r) {
-        PathBufResult::Ok(v) => v,
-        PathBufResult::Err(_) => PathBuf{ ptr: 0, cap: 0, len: 0 },
-      };
-      let root_len: i64 = path.len;
+    match (PathBuf.from_string(base)) {
+      Err(_) => {
+        stats.errors = stats.errors + 1;
+        write_error(mut err, &io, open_root_view, "out of memory");
+      },
+      Ok(v) => {
+        let mut move path = v;
+        let root_len: i64 = path.len;
 
-      let mut ignore: IgnoreStack = ignore_init();
-      let o: Outcome = match (mode) {
-        Mode::Files =>
-        split_dir_files_jobs(cfg, root_len, 0, split_depth, target_jobs, max_jobs_total, &job_chan, mut sched, mut ignore, &io, mut path, mut out, mut err, mut stats),
-        Mode::Search =>
-        split_dir_search_jobs(cfg, &pat, root_len, 0, split_depth, target_jobs, max_jobs_total, &job_chan, mut sched, mut ignore, mut scratch, &io, mut path, mut out, mut err, mut stats),
-      };
+        let mut ignore: IgnoreStack = ignore_init();
+        let root_split_depth: int = split_depth;
+        let o: Outcome = match (mode) {
+          Mode::Files =>
+          split_dir_files_jobs(cfg, root_len, 0, root_split_depth, target_jobs, max_jobs_total, &job_chan, mut sched, mut ignore, &io, mut path, mut out, mut err, mut stats),
+          Mode::Search =>
+          split_dir_search_jobs(cfg, &pat, root_len, 0, root_split_depth, target_jobs, max_jobs_total, &job_chan, mut sched, mut ignore, mut scratch, &io, mut path, mut out, mut err, mut stats),
+        };
 
-      ignore_drop_stack(mut ignore);
-      path.drop();
+        ignore_drop_stack(mut ignore);
+        path.drop();
 
-      if o.found {
-        found_any = true;
-      }
+        if o.found {
+          found_any = true;
+        }
 
-      if o.stop {
-        found_any = true;
-        cancel_set(&io);
-        stop_roots = true;
-      } else if cancel_is_set(&io) {
-        found_any = true;
-        stop_roots = true;
-      }
-    }
+        if o.stop {
+          found_any = true;
+          cancel_set(&io);
+          stop_roots = true;
+        } else if cancel_is_set(&io) {
+          found_any = true;
+          stop_roots = true;
+        }
+      },
+    };
 
-    root_opt = roots.next();
+    match (roots.next()) {
+      Some(v) => {
+        root = v;
+      },
+      None => {
+        have_root = false;
+      },
+    };
   }
 
   // No more jobs will be produced.
@@ -4337,30 +4316,29 @@ export async fn run_parallel (cfg: Config) -> int {
 
   var done_drain: bool = false;
   while !done_drain {
-    let job_opt: u64? = job_chan.recv();
-    if job_opt == None {
+    let Some(job) = job_chan.recv() else {
       done_drain = true;
-    } else {
-      let job: u64 = job_opt ?? 0;
-      if job != 0 {
-        if cancel_is_set(&io) {
-          job_free(job);
-        } else if mode == Mode::Files {
-          let o: Outcome = run_list_job(&cfg, job, &io, mut out, mut err, mut stats, mut ignore_cache);
-          if o.stop {
-            found_any = true;
-            cancel_set(&io);
-          }
-        } else {
-          let o: Outcome = run_search_job(&cfg, &pat, job, mut scratch, &io, mut out, mut err, mut stats, mut ignore_cache);
-          if o.found {
-            found_any = true;
-          }
+      continue;
+    };
 
-          if o.stop {
-            found_any = true;
-            cancel_set(&io);
-          }
+    if job != 0 {
+      if cancel_is_set(&io) {
+        job_free(job);
+      } else if mode == Mode::Files {
+        let o: Outcome = run_list_job(&cfg, job, &io, mut out, mut err, mut stats, mut ignore_cache);
+        if o.stop {
+          found_any = true;
+          cancel_set(&io);
+        }
+      } else {
+        let o: Outcome = run_search_job(&cfg, &pat, job, mut scratch, &io, mut out, mut err, mut stats, mut ignore_cache);
+        if o.found {
+          found_any = true;
+        }
+
+        if o.stop {
+          found_any = true;
+          cancel_set(&io);
         }
       }
     }
@@ -4372,15 +4350,13 @@ export async fn run_parallel (cfg: Config) -> int {
   task {
     var done_join: bool = false;
     while !done_join {
-      let h_opt: Task(WorkerResultPtr)? = worker_tasks.pop();
-      let Some(v) = h_opt else {
+      let move Some(h) = worker_tasks.pop() else {
         done_join = true;
         continue;
       };
 
-      let h: Task(WorkerResultPtr) = move v;
-      let res_ptr: WorkerResultPtr = yield h;
-      let m: WorkerMerge = worker_result_merge_and_free(mut stats, res_ptr);
+      let res: WorkerResult = await join_worker_result(h);
+      let m: WorkerMerge = worker_result_merge(mut stats, &res);
       if m.found_any {
         found_any = true;
       }
@@ -4393,8 +4369,7 @@ export async fn run_parallel (cfg: Config) -> int {
 
   worker_tasks.drop();
 
-  let end_ns_opt: i64? = std::runtime::posix::time::monotonic_now_ns();
-  let end_ns: i64 = end_ns_opt ?? start_ns;
+  let end_ns: i64 = now_monotonic_ns_or(start_ns);
   let elapsed_ns: i64 = end_ns - start_ns;
   print_stats(mut err, &io, cfg, stats, elapsed_ns);
 
@@ -4442,127 +4417,96 @@ export async fn run_auto (cfg: Config) -> int {
  */
 export fn run (cfg: Config) -> int {
   let mode: Mode = cfg.mode;
-  let out_flush_threshold: i64 =
-  if isatty(FD_STDOUT as i32) == 1 {
-    STDOUT_TTY_FLUSH_THRESHOLD
-  } else {
-    STDOUT_BUF_CAP
-  };
-  let io: IO = IO{
-    out_lock: None,
-    err_lock: None,
-    cancel: None,
-    out_flush_threshold: out_flush_threshold,
-  };
+  let io: IO = io_unlocked();
 
   let cm: ColorMode = cfg.color_mode;
   let stdout_color: bool = color_enabled(cm, FD_STDOUT);
   let stderr_color: bool = color_enabled(cm, FD_STDERR);
 
-  let out_opt: Writer? = Writer.stdout(stdout_color, STDOUT_BUF_CAP);
-  if out_opt == None {
+  let mut move Some(out) = Writer.stdout(stdout_color, STDOUT_BUF_CAP) else {
     return 2;
-  }
-
-  let mut out: Writer = match (out_opt) {
-    Some(v) => move v,
-    None => Writer{ fd: -1, color: false, buf: BufferU8.empty() },
   };
 
-  let err_opt: Writer? = Writer.stderr(stderr_color, STDERR_BUF_CAP);
-  if err_opt == None {
+  let mut move Some(err) = Writer.stderr(stderr_color, STDERR_BUF_CAP) else {
     out.drop();
     return 2;
-  }
-
-  let mut err: Writer = match (err_opt) {
-    Some(v) => move v,
-    None => Writer{ fd: -1, color: false, buf: BufferU8.empty() },
   };
 
-  let start_ns_opt: i64? = std::runtime::posix::time::monotonic_now_ns();
-  let start_ns: i64 = start_ns_opt ?? 0;
+  let start_ns: i64 = now_monotonic_ns_or(0);
   let mut stats: Stats = stats_init();
   var found_any: bool = false;
 
   if mode == Mode::Files {
     let mut roots: PathIter = cfg.paths();
-    let first_root_opt: string? = roots.next();
-    if first_root_opt == None {
-      let o: Outcome = handle_root_files(cfg, ".", &io, mut out, mut err, mut stats);
+    var stop_roots: bool = false;
+    var root: string = roots.next() ?? ".";
+    var have_root: bool = true;
+    while have_root && !stop_roots {
+      let o: Outcome = handle_root_files(cfg, root, &io, mut out, mut err, mut stats);
       if o.stop {
         found_any = true;
+        stop_roots = true;
       }
-    } else {
-      var stop_roots: bool = false;
-      var root_opt: string? = first_root_opt;
-      while root_opt != None && !stop_roots {
-        let root: string = root_opt ?? ".";
-        let o: Outcome = handle_root_files(cfg, root, &io, mut out, mut err, mut stats);
-        if o.stop {
-          found_any = true;
-          stop_roots = true;
-        }
 
-        root_opt = roots.next();
-      }
+      match (roots.next()) {
+        Some(v) => {
+          root = v;
+        },
+        None => {
+          have_root = false;
+        },
+      };
     }
   } else {
     let pat_s: string = cfg.pattern ?? "";
-    let pr: PatternResult = compile_pattern(pat_s, cfg.fixed_string, cfg.ignore_case);
-    let pat_opt: Pattern? = match pr {
-      Ok(v) => Some(move v),
-      Err(e) => pattern_compile_error(mut err, &io, mut stats, e),
-    };
-    if pat_opt == None {
-      out.drop();
-      err.drop();
-      return 2;
+    var pat: Pattern = Pattern{ kind: PatternKind::Fixed, needle: "", ignore_case: false, regex: RegExp.empty() };
+    match (compile_pattern(pat_s, cfg.fixed_string, cfg.ignore_case)) {
+      Ok(v) => {
+        pat = move v;
+      },
+      Err(e) => {
+        let _ = pattern_compile_error(mut err, &io, mut stats, e);
+        out.drop();
+        err.drop();
+        return 2;
+      },
     }
 
-    let mut pat: Pattern = match (pat_opt) {
-      Some(v) => move v,
-      None => Pattern{ kind: PatternKind::Fixed, needle: "", ignore_case: false, regex: std::regex::RegExp.empty() },
-    };
-
-    let scratch_opt: BufferU8? = BufferU8.init(READ_SCRATCH_CAP);
-    let mut scratch: BufferU8 = match (scratch_opt) {
-      Some(v) => move v,
-      None => BufferU8.empty(),
-    };
+    let mut scratch: BufferU8 = BufferU8.empty();
+    if let mut move Some(buf) = BufferU8.init(READ_SCRATCH_CAP) {
+      scratch = move buf;
+    }
 
     let mut roots: PathIter = cfg.paths();
-    let first_root_opt: string? = roots.next();
-    if first_root_opt == None {
-      let o: Outcome = handle_root_search(cfg, &pat, ".", mut scratch, &io, mut out, mut err, mut stats);
+    var stop_roots: bool = false;
+    var root: string = roots.next() ?? ".";
+    var have_root: bool = true;
+    while have_root && !stop_roots {
+      let o: Outcome = handle_root_search(cfg, &pat, root, mut scratch, &io, mut out, mut err, mut stats);
       if o.found {
         found_any = true;
       }
-    } else {
-      var stop_roots: bool = false;
-      var root_opt: string? = first_root_opt;
-      while root_opt != None && !stop_roots {
-        let root: string = root_opt ?? ".";
-        let o: Outcome = handle_root_search(cfg, &pat, root, mut scratch, &io, mut out, mut err, mut stats);
-        if o.found {
-          found_any = true;
-        }
 
-        if o.stop {
-          found_any = true;
-          stop_roots = true;
-        }
-
-        root_opt = roots.next();
+      if o.stop {
+        found_any = true;
+        stop_roots = true;
       }
+
+      match (roots.next()) {
+        Some(v) => {
+          root = v;
+        },
+        None => {
+          have_root = false;
+        },
+      };
     }
 
     scratch.drop();
     pat.drop();
   }
 
-  let end_ns_opt: i64? = std::runtime::posix::time::monotonic_now_ns();
-  let end_ns: i64 = end_ns_opt ?? start_ns;
+  let end_ns: i64 = now_monotonic_ns_or(start_ns);
   let elapsed_ns: i64 = end_ns - start_ns;
   print_stats(mut err, &io, cfg, stats, elapsed_ns);
 

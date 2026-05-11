@@ -1,150 +1,34 @@
 module slg::os;
 
-import std::runtime::posix::fs;
+import bytes from "std/bytes";
 
-// ---------------------------------------------------------------------------
-// POSIX/libc bindings used by `slg`.
+// Fast byte helpers used by `slg` hot paths.
 //
-// NOTE: These are intentionally kept in a single module so:
-// - platform assumptions are centralized,
-// - tests and diagnostics can reference one place,
-// - future ports can swap the implementation behind a stable interface.
+// `std/bytes` owns the runtime-specific implementation details. This module
+// preserves the pointer-returning shape that the search engine uses heavily.
 
-/**
- * `opendir(3)` — open a directory stream.
- *
- * @param path: string Directory path.
- * @returns u64 DIR* pointer, or 0 on failure.
- */
-export ext opendir = fn (string) -> u64;
+export fn memchr (hay: u64, needle: int, len: i64) -> u64 {
+  let Some(off) = bytes::memchr(bytes::from_raw(hay, len), needle as u8) else {
+    return 0;
+  };
 
-/**
- * `readdir(3)` — read the next directory entry.
- *
- * @param dir: u64 DIR*.
- * @returns u64 `struct dirent*`, or 0 on end-of-directory (or error).
- */
-export ext readdir = fn (u64) -> u64;
+  return hay + (off as u64);
+}
 
-/**
- * `closedir(3)` — close a directory stream.
- *
- * @param dir: u64 DIR*.
- * @returns int 0 on success, otherwise -1.
- */
-export ext closedir = fn (u64) -> int;
+export fn memmem (hay_ptr: u64, hay_len: i64, needle_ptr: u64, needle_len: i64) -> u64 {
+  let Some(off) = bytes::memmem(bytes::from_raw(hay_ptr, hay_len), bytes::from_raw(needle_ptr, needle_len)) else {
+    return 0;
+  };
 
-/**
- * `isatty(3)` — test whether a file descriptor refers to a terminal.
- *
- * @param fd: int File descriptor.
- * @returns int 1 for yes, 0 for no, -1 for error.
- */
-export ext isatty = fn (i32) -> i32;
+  return hay_ptr + (off as u64);
+}
 
-/**
- * `dup(2)` — duplicate a file descriptor.
- *
- * This is used by end-to-end tests to temporarily redirect stdout/stderr.
- *
- * @param fd: int Existing file descriptor.
- * @returns int New file descriptor on success, otherwise -1.
- */
-export ext dup = fn (i32) -> i32;
+export fn memcpy (dst: u64, src: u64, len: i64) -> u64 {
+  let _ = bytes::copy_nonoverlapping(bytes::from_raw(dst, len), bytes::from_raw(src, len));
+  return dst;
+}
 
-/**
- * `fstat(2)` — get file metadata by file descriptor.
- *
- * Notes:
- * - This is used in `slg` as a fast way to get file size for the small-file
- *   scratch-buffer fast path without disturbing the file offset (unlike
- *   `lseek(fd, 0, SEEK_END)`).
- *
- * @param fd: int Open file descriptor.
- * @param out: u64 Pointer to a writable `struct stat` buffer.
- * @returns i32 0 on success, otherwise -1.
- */
-export ext fstat = fn (int, u64) -> i32;
-
-/**
- * `memchr(3)` — find the first byte in a memory region.
- *
- * @param hay: u64 Pointer to bytes.
- * @param needle: int Byte value (0..255).
- * @param len: i64 Byte length.
- * @returns u64 Pointer to the match, or 0.
- */
-export ext memchr = fn (u64, int, i64) -> u64;
-
-/**
- * `memmem(3)` — find a byte substring in a memory region (glibc).
- *
- * @param hay_ptr: u64 Haystack pointer.
- * @param hay_len: i64 Haystack length.
- * @param needle_ptr: u64 Needle pointer.
- * @param needle_len: i64 Needle length.
- * @returns u64 Pointer to the first match, or 0.
- */
-export ext memmem = fn (u64, i64, u64, i64) -> u64;
-
-/**
- * `memcpy(3)` — copy bytes from `src` to `dst` (glibc).
- *
- * Notes:
- * - This does not support overlapping ranges (use `memmove` for that).
- *
- * @param dst: u64 Destination pointer.
- * @param src: u64 Source pointer.
- * @param len: i64 Byte length.
- * @returns u64 `dst`.
- */
-export ext memcpy = fn (u64, u64, i64) -> u64;
-
-/**
- * `memcmp(3)` — compare two byte sequences (glibc).
- *
- * @param a: u64 Pointer to bytes.
- * @param b: u64 Pointer to bytes.
- * @param len: u64 Byte length.
- * @returns int 0 if equal, otherwise non-zero.
- */
-export ext memcmp = fn (u64, u64, u64) -> int;
-
-/**
- * `mmap(2)` — map a file into memory (POSIX hosted baseline).
- */
-export ext mmap = fn (u64, u64, int, int, i32, i64) -> u64;
-
-/**
- * `munmap(2)` — unmap a memory mapping.
- */
-export ext munmap = fn (u64, u64) -> int;
-
-// `mmap` constants (linux hosted baseline).
-export const PROT_READ: int = 1;
-export const MAP_PRIVATE: int = 2;
-export const MAP_FAILED: u64 = 18446744073709551615;
-
-// `errno` values (linux hosted baseline).
-export const EINTR: int = 4;
-export const ENOTDIR: int = 20;
-
-// `dirent.d_type` constants (linux hosted baseline).
-export const DT_UNKNOWN: u8 = 0;
-export const DT_FIFO: u8 = 1;
-export const DT_CHR: u8 = 2;
-export const DT_DIR: u8 = 4;
-export const DT_BLK: u8 = 6;
-export const DT_REG: u8 = 8;
-export const DT_LNK: u8 = 10;
-export const DT_SOCK: u8 = 12;
-export const DT_WHT: u8 = 14;
-
-/**
- * Read `errno` via the hosted POSIX backend.
- *
- * @returns int errno value (0 when unavailable).
- */
-export fn errno () -> int {
-  return std::runtime::posix::fs::errno();
+export fn memcmp (a: u64, b: u64, len: u64) -> int {
+  let n: i64 = len as i64;
+  return bytes::memcmp(bytes::from_raw(a, n), bytes::from_raw(b, n));
 }

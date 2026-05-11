@@ -1,10 +1,25 @@
 package slg;
 
 import { Args } from "std/args";
-import std::interfaces;
-import std::runtime::mem;
-import std::runtime::posix::fs;
-import std::runtime::posix::io;
+import { Dir } from "std/fs";
+import { Drop } from "std/interfaces";
+import mem from "std/runtime/mem";
+import {
+  O_CREAT,
+  O_TRUNC,
+  O_WRONLY,
+  close,
+  mkdir,
+  open,
+  unlink,
+} from "std/runtime/posix/fs";
+import {
+  dup,
+  dup2,
+  pipe,
+  read,
+  write,
+} from "std/runtime/posix/io";
 
 import { BufferU8 } from "./slg/buf.slk";
 import {
@@ -15,13 +30,7 @@ import {
   print_version,
 } from "./slg/cli.slk";
 import { run_auto } from "./slg/engine.slk";
-import {
-  closedir,
-  dup,
-  memcpy,
-  memmem,
-  opendir,
-} from "./slg/os.slk";
+import { memcpy, memmem } from "./slg/os.slk";
 
 async fn run_cfg (cfg: Config) -> int {
   if cfg.help {
@@ -49,12 +58,10 @@ async fn run_cfg (cfg: Config) -> int {
  */
 export async fn main (argc: int, argv: u64) -> int {
   let args: Args = Args.init(argc, argv);
-  let cfg_opt: Config? = parse_cli(args);
-  let code: int = match (cfg_opt) {
-    Some(cfg) => await run_cfg(cfg),
-    None => 2,
+  let Some(cfg) = parse_cli(args) else {
+    return 2;
   };
-  return code;
+  return await run_cfg(cfg);
 }
 
 /**
@@ -73,10 +80,10 @@ struct ArgvOwned {
  * Load a little-endian 32-bit integer from `ptr + offset`.
  */
 fn load_i32_le (ptr: u64, offset: i64) -> int {
-  let b0: u64 = std::runtime::mem::load_u8(ptr, offset + 0) as u64;
-  let b1: u64 = std::runtime::mem::load_u8(ptr, offset + 1) as u64;
-  let b2: u64 = std::runtime::mem::load_u8(ptr, offset + 2) as u64;
-  let b3: u64 = std::runtime::mem::load_u8(ptr, offset + 3) as u64;
+  let b0: u64 = mem::load_u8(ptr, offset + 0) as u64;
+  let b1: u64 = mem::load_u8(ptr, offset + 1) as u64;
+  let b2: u64 = mem::load_u8(ptr, offset + 2) as u64;
+  let b3: u64 = mem::load_u8(ptr, offset + 3) as u64;
   let v: u64 = b0 | (b1 << 8) | (b2 << 16) | (b3 << 24);
   return v as int;
 }
@@ -87,19 +94,19 @@ fn load_i32_le (ptr: u64, offset: i64) -> int {
  * @returns u64 Pointer on success, otherwise 0 on OOM.
  */
 fn cstr_alloc (s: string) -> u64 {
-  let len: i64 = std::runtime::mem::string_len(s);
+  let len: i64 = sizeof(s) as i64;
   if len < 0 {
     return 0;
   }
 
-  let ptr: u64 = std::runtime::mem::alloc(len + 1);
+  let ptr: u64 = mem::alloc(len + 1);
   if ptr == 0 {
     return 0;
   }
 
-  let src: u64 = std::runtime::mem::string_ptr(s);
+  let src: u64 = s as raw u64;
   let _ = memcpy(ptr, src, len);
-  std::runtime::mem::store_u8(ptr, len, 0);
+  mem::store_u8(ptr, len, 0);
   return ptr;
 }
 
@@ -113,8 +120,8 @@ fn argv_free_partial (argv: u64, count: int) -> void {
 
   var i: int = 0;
   while i < count {
-    let p: u64 = std::runtime::mem::load_u64(argv, (i * 8) as i64);
-    std::runtime::mem::free(p);
+    let p: u64 = mem::load_u64(argv, (i * 8) as i64);
+    mem::free(p);
     i = i + 1;
   }
 }
@@ -137,12 +144,12 @@ fn argv_alloc (...args: string) -> ArgvOwned? {
 
   let argc: int = args.len;
   // Allocate a `char**` pointer list with a conventional trailing NULL slot.
-  let argv: u64 = std::runtime::mem::alloc(((argc + 1) * 8) as i64);
+  let argv: u64 = mem::alloc(((argc + 1) * 8) as i64);
   if argv == 0 {
     return None;
   }
 
-  std::runtime::mem::store_u64(argv, (argc * 8) as i64, 0);
+  mem::store_u64(argv, (argc * 8) as i64, 0);
 
   var i: int = 0;
   while i < argc {
@@ -151,21 +158,21 @@ fn argv_alloc (...args: string) -> ArgvOwned? {
     let p: u64 = cstr_alloc(s);
     if p == 0 {
       argv_free_partial(argv, i);
-      std::runtime::mem::free(argv);
+      mem::free(argv);
       return None;
     }
 
-    std::runtime::mem::store_u64(argv, (i * 8) as i64, p);
+    mem::store_u64(argv, (i * 8) as i64, p);
     i = i + 1;
   }
 
   return Some(ArgvOwned{ argc: argc, argv: argv });
 }
 
-impl ArgvOwned as std::interfaces::Drop {
+impl ArgvOwned as Drop {
   public fn drop (mut self: &ArgvOwned) -> void {
     argv_free_partial(self.argv, self.argc);
-    std::runtime::mem::free(self.argv);
+    mem::free(self.argv);
     self.argc = 0;
     self.argv = 0;
   }
@@ -175,35 +182,29 @@ impl ArgvOwned as std::interfaces::Drop {
  * Read all bytes from `fd` into a growable buffer.
  */
 fn read_all_fd (fd: int) -> BufferU8? {
-  let b_opt: BufferU8? = BufferU8.init(4096);
-  if b_opt == None {
+  let mut move Some(b) = BufferU8.init(4096) else {
     return None;
-  }
-
-  let mut b: BufferU8 = b_opt ?? BufferU8.empty();
+  };
 
   let chunk_size: i64 = 4096;
-  let chunk: u64 = std::runtime::mem::alloc(chunk_size);
+  let chunk: u64 = mem::alloc(chunk_size);
   if chunk == 0 {
-    b.drop();
     return None;
   }
 
   while true {
-    let n = std::runtime::posix::io::read(fd as i32, chunk, chunk_size);
+    let n = read(fd as i32, chunk, chunk_size);
     if n <= 0 {
       break;
     }
 
-    let err = b.push_ptr_len(chunk, n as i64);
-    if err != None {
-      std::runtime::mem::free(chunk);
-      b.drop();
+    if b.push_ptr_len(chunk, n as i64) != None {
+      mem::free(chunk);
       return None;
     }
   }
 
-  std::runtime::mem::free(chunk);
+  mem::free(chunk);
   return Some(b);
 }
 
@@ -229,7 +230,7 @@ fn write_all_fd (fd: int, ptr: u64, len: i64) -> bool {
 
   var off: i64 = 0;
   while off < len {
-    let n = std::runtime::posix::io::write(fd as i32, ptr + (off as u64), len - off);
+    let n = write(fd as i32, ptr + (off as u64), len - off);
     if n <= 0 {
       return false;
     }
@@ -241,9 +242,9 @@ fn write_all_fd (fd: int, ptr: u64, len: i64) -> bool {
 }
 
 fn write_text_file (path: string, content: string) -> bool {
-  let fd = std::runtime::posix::fs::open(
+  let fd = open(
     path,
-    std::runtime::posix::fs::O_WRONLY | std::runtime::posix::fs::O_CREAT | std::runtime::posix::fs::O_TRUNC,
+    O_WRONLY | O_CREAT | O_TRUNC,
     420 // 0644
   );
 
@@ -251,25 +252,24 @@ fn write_text_file (path: string, content: string) -> bool {
     return false;
   }
 
-  let ptr: u64 = std::runtime::mem::string_ptr(content);
-  let len: i64 = std::runtime::mem::string_len(content);
+  let ptr: u64 = content as raw u64;
+  let len: i64 = sizeof(content) as i64;
   let ok: bool = write_all_fd(fd as int, ptr, len);
-  let _ = std::runtime::posix::fs::close(fd);
+  let _ = close(fd);
   return ok;
 }
 
 fn ensure_dir_exists (path: string) -> bool {
-  let rc: int = std::runtime::posix::fs::mkdir(path, 493) as int; // 0755
+  let rc: int = mkdir(path, 493) as int; // 0755
   if rc == 0 {
     return true;
   }
 
-  let dir: u64 = opendir(path);
-  if dir == 0 {
+  let mut move Ok(dir) = Dir.open(path) else {
     return false;
-  }
+  };
 
-  let _ = closedir(dir);
+  dir.close();
   return true;
 }
 
@@ -314,28 +314,21 @@ fn buffer_as_string (b: &BufferU8) -> string {
     return "";
   }
 
-  let len_i64: i64 = bytes.len;
-  let max_i32: i64 = 2147483647 as i64;
-  let len: int = if len_i64 > max_i32 {
-    max_i32 as int
-  } else {
-    len_i64 as int
-  };
-  return std::runtime::mem::string_from_ptr_len(bytes.ptr, len);
+  return bytes.ptr as string(bytes.len);
 }
 
 /**
  * Return whether `hay` contains `needle` as a byte substring.
  */
 fn contains (hay: string, needle: string) -> bool {
-  let n_len: i64 = std::runtime::mem::string_len(needle);
+  let n_len: i64 = sizeof(needle) as i64;
   if n_len <= 0 {
     return true;
   }
 
-  let h_ptr: u64 = std::runtime::mem::string_ptr(hay);
-  let h_len: i64 = std::runtime::mem::string_len(hay);
-  let n_ptr: u64 = std::runtime::mem::string_ptr(needle);
+  let h_ptr: u64 = hay as raw u64;
+  let h_len: i64 = sizeof(hay) as i64;
+  let n_ptr: u64 = needle as raw u64;
   return memmem(h_ptr, h_len, n_ptr, n_len) != 0;
 }
 
@@ -347,18 +340,12 @@ struct Capture {
   out: BufferU8,
 }
 
-impl Capture as std::interfaces::Drop {
+impl Capture as Drop {
   /**
    * Release captured output.
-   *
-   * Note: we avoid calling methods on `mut` field-access receivers in the
-   * current subset by moving the field into a local, dropping it, then
-   * resetting the field to an inert value.
    */
   public fn drop (mut self: &Capture) -> void {
-    let mut out: BufferU8 = self.out;
-    self.out = BufferU8.empty();
-    out.drop();
+    self.out.drop();
     self.code = 0;
   }
 }
@@ -368,47 +355,46 @@ impl Capture as std::interfaces::Drop {
  */
 async fn capture_stdout_run_cfg (cfg: Config) -> Capture? {
   // Create a pipe for capturing stdout.
-  let fds_ptr: u64 = std::runtime::mem::alloc(8);
+  let fds_ptr: u64 = mem::alloc(8);
   if fds_ptr == 0 {
     return None;
   }
 
-  let prc: int = std::runtime::posix::io::pipe(fds_ptr) as int;
+  let prc: int = pipe(fds_ptr) as int;
   if prc != 0 {
-    std::runtime::mem::free(fds_ptr);
+    mem::free(fds_ptr);
     return None;
   }
 
   let rfd: int = load_i32_le(fds_ptr, 0);
   let wfd: int = load_i32_le(fds_ptr, 4);
-  std::runtime::mem::free(fds_ptr);
+  mem::free(fds_ptr);
 
   // Save stdout, then redirect fd=1 into the pipe.
   let saved = dup(1);
   if saved < 0 {
-    let _ = std::runtime::posix::fs::close(rfd as i32);
-    let _ = std::runtime::posix::fs::close(wfd as i32);
+    let _ = close(rfd as i32);
+    let _ = close(wfd as i32);
     return None;
   }
 
-  let _ = std::runtime::posix::io::dup2(wfd as i32, 1);
-  let _ = std::runtime::posix::fs::close(wfd as i32);
+  let _ = dup2(wfd as i32, 1);
+  let _ = close(wfd as i32);
 
   // Run.
   let code: int = await run_cfg(cfg);
 
   // Restore stdout (closes the pipe write end).
-  let _ = std::runtime::posix::io::dup2(saved, 1);
-  let _ = std::runtime::posix::fs::close(saved);
+  let _ = dup2(saved, 1);
+  let _ = close(saved);
 
   // Drain captured output.
-  let out_opt: BufferU8? = read_all_fd(rfd);
-  let _ = std::runtime::posix::fs::close(rfd as i32);
-  if out_opt == None {
+  let out = read_all_fd(rfd);
+  let _ = close(rfd as i32);
+  let move Some(out) = out else {
     return None;
-  }
+  };
 
-  let out: BufferU8 = out_opt ?? BufferU8.empty();
   return Some(Capture{ code: code, out: out });
 }
 
@@ -420,39 +406,39 @@ async fn capture_stdout_run_cfg (cfg: Config) -> Capture? {
  */
 async fn broken_stdout_run_cfg (cfg: Config) -> int? {
   // Create a pipe, then (intentionally) dup the read end onto stdout.
-  let fds_ptr: u64 = std::runtime::mem::alloc(8);
+  let fds_ptr: u64 = mem::alloc(8);
   if fds_ptr == 0 {
     return None;
   }
 
-  let prc: int = std::runtime::posix::io::pipe(fds_ptr) as int;
+  let prc: int = pipe(fds_ptr) as int;
   if prc != 0 {
-    std::runtime::mem::free(fds_ptr);
+    mem::free(fds_ptr);
     return None;
   }
 
   let rfd: int = load_i32_le(fds_ptr, 0);
   let wfd: int = load_i32_le(fds_ptr, 4);
-  std::runtime::mem::free(fds_ptr);
+  mem::free(fds_ptr);
 
   // Save stdout, then redirect fd=1 to the read end (writes will fail).
   let saved = dup(1);
   if saved < 0 {
-    let _ = std::runtime::posix::fs::close(rfd as i32);
-    let _ = std::runtime::posix::fs::close(wfd as i32);
+    let _ = close(rfd as i32);
+    let _ = close(wfd as i32);
     return None;
   }
 
-  let _ = std::runtime::posix::io::dup2(rfd as i32, 1);
-  let _ = std::runtime::posix::fs::close(rfd as i32);
-  let _ = std::runtime::posix::fs::close(wfd as i32);
+  let _ = dup2(rfd as i32, 1);
+  let _ = close(rfd as i32);
+  let _ = close(wfd as i32);
 
   // Run.
   let code: int = await run_cfg(cfg);
 
   // Restore stdout.
-  let _ = std::runtime::posix::io::dup2(saved, 1);
-  let _ = std::runtime::posix::fs::close(saved);
+  let _ = dup2(saved, 1);
+  let _ = close(saved);
   return Some(code);
 }
 
@@ -489,9 +475,6 @@ test "slg e2e - help is descriptive" {
   assert(contains(out_s, "--no-ignore"), "help output should include --no-ignore");
   assert(contains(out_s, "--ignore-files"), "help output should include --ignore-files");
   assert(contains(out_s, "end option parsing"), "help output should mention `--`");
-
-  cap.drop();
-  av.drop();
 }
 
 test "slg e2e - --files can run in parallel" {
@@ -515,13 +498,10 @@ test "slg e2e - --files can run in parallel" {
   assert(contains(out_s, "testdata/basic/a.txt"), "expected a file path in output");
   assert(contains(out_s, "testdata/basic/sub/b.txt"), "expected a file path in output");
   assert(!contains(out_s, ".hidden.txt"), "should not include hidden files by default");
-
-  cap.drop();
-  av.drop();
 }
 
 test "slg e2e - file-batch jobs can run in parallel search" {
-  let av_opt: ArgvOwned? = argv_alloc("slg", "--jobs=4", "--file-batch=1", "-F", "TODO", "testdata/basic");
+  let av_opt: ArgvOwned? = argv_alloc("slg", "--jobs=4", "--file-jobs", "--file-batch=1", "-F", "TODO", "testdata/basic");
   assert(av_opt != None, "argv alloc failed");
   let mut av: ArgvOwned = av_opt ?? ArgvOwned{ argc: 0, argv: 0 };
 
@@ -540,9 +520,6 @@ test "slg e2e - file-batch jobs can run in parallel search" {
   let out_s: string = buffer_as_string(cap.out);
   assert(contains(out_s, "testdata/basic/a.txt"), "expected matched file path in output");
   assert(contains(out_s, "TODO"), "expected match text in output");
-
-  cap.drop();
-  av.drop();
 }
 
 test "slg e2e - output failure is an error" {
@@ -561,8 +538,6 @@ test "slg e2e - output failure is an error" {
   assert(code_opt != None, "run should return a code");
   let code: int = code_opt ?? 0;
   assert(code == 2, "expected exit code 2 when stdout is not writable");
-
-  av.drop();
 }
 
 test "slg e2e - fixed search finds a match" {
@@ -585,9 +560,6 @@ test "slg e2e - fixed search finds a match" {
   let out_s: string = buffer_as_string(cap.out);
   assert(contains(out_s, "testdata/basic/a.txt"), "expected matched file path in output");
   assert(contains(out_s, "TODO"), "expected match text in output");
-
-  cap.drop();
-  av.drop();
 }
 
 test "slg e2e - -Q is an alias for -F" {
@@ -610,9 +582,6 @@ test "slg e2e - -Q is an alias for -F" {
   let out_s: string = buffer_as_string(cap.out);
   assert(contains(out_s, "testdata/basic/a.txt"), "expected matched file path in output");
   assert(contains(out_s, "TODO"), "expected match text in output");
-
-  cap.drop();
-  av.drop();
 }
 
 test "slg e2e - smart-case enables ignore-case for lowercase patterns" {
@@ -635,9 +604,6 @@ test "slg e2e - smart-case enables ignore-case for lowercase patterns" {
   let out_s: string = buffer_as_string(cap.out);
   assert(contains(out_s, "testdata/basic/a.txt"), "expected matched file path in output");
   assert(contains(out_s, "TODO: visible match"), "expected smart-case to match TODO");
-
-  cap.drop();
-  av.drop();
 }
 
 test "slg e2e - smart-case keeps uppercase patterns case-sensitive" {
@@ -657,9 +623,6 @@ test "slg e2e - smart-case keeps uppercase patterns case-sensitive" {
   let mut cap: Capture = cap_opt ?? Capture{ code: 2, out: BufferU8.empty() };
 
   assert(cap.code == 1, "expected exit code 1 (no match)");
-
-  cap.drop();
-  av.drop();
 }
 
 test "slg e2e - --no-line-number suppresses numbers" {
@@ -683,9 +646,6 @@ test "slg e2e - --no-line-number suppresses numbers" {
   assert(contains(out_s, "testdata/basic/a.txt:"), "expected matched file path in output");
   assert(contains(out_s, "TODO"), "expected match text in output");
   assert(!contains(out_s, "testdata/basic/a.txt:2:"), "expected line numbers to be suppressed");
-
-  cap.drop();
-  av.drop();
 }
 
 test "slg e2e - --column requires line numbers" {
@@ -696,8 +656,6 @@ test "slg e2e - --column requires line numbers" {
   let args: Args = Args.init(av.argc, av.argv);
   let cfg_opt: Config? = parse_cli(args);
   assert(cfg_opt == None, "expected parse_cli to fail when --column is used without line numbers");
-
-  av.drop();
 }
 
 test "slg e2e - `--` allows patterns starting with '-'" {
@@ -711,15 +669,12 @@ test "slg e2e - `--` allows patterns starting with '-'" {
 
   let Some(cfg) = cfg_opt else {
     assert(false, "config should exist");
-    av.drop();
     return;
   };
 
   assert(cfg.fixed_string, "expected -F to be set");
   let pat: string = cfg.pattern ?? "";
   assert(pat == "--no-ignore-files", "expected pattern to be parsed after `--`");
-
-  av.drop();
 }
 
 test "slg cli - flags may appear after the pattern" {
@@ -733,7 +688,6 @@ test "slg cli - flags may appear after the pattern" {
 
   let Some(cfg) = cfg_opt else {
     assert(false, "config should exist");
-    av.drop();
     return;
   };
 
@@ -741,8 +695,6 @@ test "slg cli - flags may appear after the pattern" {
   assert(pat == "foo", "expected the first positional to stay the pattern");
   assert(cfg.files_with_matches, "expected trailing -l to be parsed as a flag");
   assert(cfg.path_count() == 0, "expected no explicit root paths");
-
-  av.drop();
 }
 
 test "slg e2e - trailing flags after paths preserve explicit roots" {
@@ -756,7 +708,6 @@ test "slg e2e - trailing flags after paths preserve explicit roots" {
 
   let Some(cfg) = cfg_opt else {
     assert(false, "config should exist");
-    av.drop();
     return;
   };
 
@@ -772,9 +723,6 @@ test "slg e2e - trailing flags after paths preserve explicit roots" {
   assert(contains(out_s, "testdata/basic/a.txt"), "expected the matching file path in output");
   assert(!contains(out_s, "TODO: visible match"), "expected -l to suppress matched line content");
   assert(!contains(out_s, "testdata/basic/sub/b.txt"), "expected only matching files to be printed");
-
-  cap.drop();
-  av.drop();
 }
 
 test "slg e2e - --files may appear after a path" {
@@ -788,7 +736,6 @@ test "slg e2e - --files may appear after a path" {
 
   let Some(cfg) = cfg_opt else {
     assert(false, "config should exist");
-    av.drop();
     return;
   };
 
@@ -804,9 +751,6 @@ test "slg e2e - --files may appear after a path" {
   assert(contains(out_s, "testdata/basic/a.txt"), "expected a.txt in file listing");
   assert(contains(out_s, "testdata/basic/sub/b.txt"), "expected b.txt in file listing");
   assert(!contains(out_s, "TODO: visible match"), "expected --files mode to list paths only");
-
-  cap.drop();
-  av.drop();
 }
 
 test "slg e2e - implicit root search recurses into directories" {
@@ -829,9 +773,6 @@ test "slg e2e - implicit root search recurses into directories" {
   let out_s: string = buffer_as_string(cap.out);
   assert(contains(out_s, "src/main.slk:37:export async fn main"), "expected a recursive search hit in src/main.slk");
   assert(contains(out_s, "src/slg/cli.slk"), "expected recursive search to reach nested files");
-
-  cap.drop();
-  av.drop();
 }
 
 test "slg e2e - --files recurses into explicit directories" {
@@ -854,9 +795,6 @@ test "slg e2e - --files recurses into explicit directories" {
   let out_s: string = buffer_as_string(cap.out);
   assert(contains(out_s, "src/main.slk"), "expected --files to list files from the explicit root");
   assert(contains(out_s, "src/slg/engine.slk"), "expected --files to recurse into nested directories");
-
-  cap.drop();
-  av.drop();
 }
 
 test "slg e2e - --jobs 1 forces single-threaded" {
@@ -879,9 +817,6 @@ test "slg e2e - --jobs 1 forces single-threaded" {
   let out_s: string = buffer_as_string(cap.out);
   assert(contains(out_s, "testdata/basic/a.txt"), "expected matched file path in output");
   assert(contains(out_s, "TODO"), "expected match text in output");
-
-  cap.drop();
-  av.drop();
 }
 
 test "slg e2e - --threads is an alias for --jobs" {
@@ -895,7 +830,6 @@ test "slg e2e - --threads is an alias for --jobs" {
 
   let Some(cfg) = cfg_opt else {
     assert(false, "config should exist");
-    av.drop();
     return;
   };
   assert(cfg.jobs == 1, "expected --threads to configure jobs");
@@ -908,9 +842,6 @@ test "slg e2e - --threads is an alias for --jobs" {
   let out_s: string = buffer_as_string(cap.out);
   assert(contains(out_s, "testdata/basic/a.txt"), "expected matched file path in output");
   assert(contains(out_s, "TODO"), "expected match text in output");
-
-  cap.drop();
-  av.drop();
 }
 
 test "slg e2e - concurrency options accept auto keyword" {
@@ -936,7 +867,6 @@ test "slg e2e - concurrency options accept auto keyword" {
 
   let Some(cfg) = cfg_opt else {
     assert(false, "config should exist");
-    av.drop();
     return;
   };
 
@@ -955,9 +885,6 @@ test "slg e2e - concurrency options accept auto keyword" {
   let out_s: string = buffer_as_string(cap.out);
   assert(contains(out_s, "testdata/basic/a.txt"), "expected matched file path in output");
   assert(contains(out_s, "TODO"), "expected match text in output");
-
-  cap.drop();
-  av.drop();
 }
 
 test "slg e2e - concurrency values are clamped" {
@@ -984,7 +911,6 @@ test "slg e2e - concurrency values are clamped" {
 
   let Some(cfg) = cfg_opt else {
     assert(false, "config should exist");
-    av.drop();
     return;
   };
 
@@ -995,8 +921,6 @@ test "slg e2e - concurrency values are clamped" {
   assert(cfg.target_jobs == 1048576, "expected --target-jobs to clamp to 1048576");
   assert(cfg.max_jobs_total == 1048576, "expected --max-jobs-total to clamp to 1048576");
   assert(cfg.file_batch == 4096, "expected --file-batch to clamp to 4096");
-
-  av.drop();
 }
 
 test "slg e2e - hidden files require --hidden" {
@@ -1020,9 +944,6 @@ test "slg e2e - hidden files require --hidden" {
   assert(!contains(out1, ".hidden.txt"), "should not search hidden files by default");
   assert(!contains(out1, "needle_hidden"), "should not match hidden content by default");
 
-  cap1.drop();
-  av1.drop();
-
   // With --hidden: match appears.
   let av2_opt: ArgvOwned? = argv_alloc("slg", "-F", "--hidden", "needle_hidden", "testdata/basic");
   assert(av2_opt != None, "argv alloc failed");
@@ -1042,9 +963,6 @@ test "slg e2e - hidden files require --hidden" {
   let out2: string = buffer_as_string(cap2.out);
   assert(contains(out2, ".hidden.txt"), "expected hidden file path in output");
   assert(contains(out2, "needle_hidden"), "expected hidden match text in output");
-
-  cap2.drop();
-  av2.drop();
 }
 
 test "slg e2e - search options may follow pattern and paths" {
@@ -1067,9 +985,6 @@ test "slg e2e - search options may follow pattern and paths" {
   let out_s: string = buffer_as_string(cap.out);
   assert(contains(out_s, ".hidden.txt"), "expected hidden file path in output");
   assert(contains(out_s, "needle_hidden"), "expected hidden match text in output");
-
-  cap.drop();
-  av.drop();
 }
 
 test "slg e2e - --files may follow positional paths" {
@@ -1092,9 +1007,6 @@ test "slg e2e - --files may follow positional paths" {
   let out_s: string = buffer_as_string(cap.out);
   assert(contains(out_s, "testdata/basic/.hidden.txt"), "expected hidden file in file list");
   assert(contains(out_s, "testdata/basic/a.txt"), "expected a.txt in file list");
-
-  cap.drop();
-  av.drop();
 }
 
 test "slg e2e - value-taking options may follow positional paths" {
@@ -1117,9 +1029,6 @@ test "slg e2e - value-taking options may follow positional paths" {
   let out_s: string = buffer_as_string(cap.out);
   assert(contains(out_s, "testdata/basic/a.txt"), "expected a.txt in file list");
   assert(!contains(out_s, "testdata/basic/sub/b.txt"), "max-depth 0 should skip nested files");
-
-  cap.drop();
-  av.drop();
 }
 
 test "slg e2e - --files lists searchable files" {
@@ -1143,9 +1052,6 @@ test "slg e2e - --files lists searchable files" {
   assert(contains(out_s, "testdata/basic/a.txt"), "expected a.txt in file list");
   assert(contains(out_s, "testdata/basic/sub/b.txt"), "expected b.txt in file list");
   assert(!contains(out_s, ".hidden.txt"), "hidden files should be skipped unless --hidden");
-
-  cap.drop();
-  av.drop();
 }
 
 test "slg e2e - ignore files are respected" {
@@ -1180,9 +1086,6 @@ test "slg e2e - ignore files are respected" {
   assert(!contains(out1, "testdata/ignore/sub/deep.txt"), "expected globstar-ignored file to be skipped");
   assert(!contains(out1, "testdata/ignore/ignored_dir/x.txt"), "expected ignored directory to be skipped");
 
-  cap1.drop();
-  av1.drop();
-
   // With ignore files disabled: previously ignored paths should re-appear.
   let av2_opt: ArgvOwned? = argv_alloc("slg", "--files", "--no-ignore-files", "testdata/ignore");
   assert(av2_opt != None, "argv alloc failed");
@@ -1193,7 +1096,6 @@ test "slg e2e - ignore files are respected" {
   assert(cfg2_opt != None, "parse_cli should succeed");
   let Some(cfg2) = cfg2_opt else {
     assert(false, "config should exist");
-    av2.drop();
     return;
   };
   assert(!cfg2.ignore_files, "expected --no-ignore-files to disable ignore files in config");
@@ -1210,9 +1112,6 @@ test "slg e2e - ignore files are respected" {
   assert(contains(out2, "testdata/ignore/deep.txt"), "expected globstar-ignored file to re-appear with --no-ignore-files");
   assert(contains(out2, "testdata/ignore/sub/deep.txt"), "expected globstar-ignored file to re-appear with --no-ignore-files");
   assert(contains(out2, "testdata/ignore/ignored_dir/x.txt"), "expected ignored directory contents to re-appear with --no-ignore-files");
-
-  cap2.drop();
-  av2.drop();
 }
 
 test "slg e2e - --no-ignore disables ignore rules" {
@@ -1227,7 +1126,6 @@ test "slg e2e - --no-ignore disables ignore rules" {
   assert(cfg_opt != None, "parse_cli should succeed");
   let Some(cfg) = cfg_opt else {
     assert(false, "config should exist");
-    av.drop();
     return;
   };
   assert(!cfg.ignore_common, "expected --no-ignore to disable common directory ignores");
@@ -1242,9 +1140,6 @@ test "slg e2e - --no-ignore disables ignore rules" {
   let out_s: string = buffer_as_string(cap.out);
   assert(contains(out_s, "testdata/ignore/ignored.txt"), "expected ignored file to appear with --no-ignore");
   assert(contains(out_s, "testdata/ignore/ignored_dir/x.txt"), "expected ignored directory contents to appear with --no-ignore");
-
-  cap.drop();
-  av.drop();
 }
 
 test "slg e2e - --ignore re-enables ignore behavior" {
@@ -1269,9 +1164,6 @@ test "slg e2e - --ignore re-enables ignore behavior" {
   let out_s: string = buffer_as_string(cap.out);
   assert(contains(out_s, "testdata/ignore/a.txt"), "expected some files in list");
   assert(!contains(out_s, "testdata/ignore/ignored.txt"), "expected ignored file to be skipped after --ignore");
-
-  cap.drop();
-  av.drop();
 }
 
 test "slg e2e - --ignore-files re-enables ignore files after --no-ignore" {
@@ -1296,9 +1188,6 @@ test "slg e2e - --ignore-files re-enables ignore files after --no-ignore" {
   let out_s: string = buffer_as_string(cap.out);
   assert(contains(out_s, "testdata/ignore/a.txt"), "expected some files in list");
   assert(!contains(out_s, "testdata/ignore/ignored.txt"), "expected ignore files to be respected after --ignore-files");
-
-  cap.drop();
-  av.drop();
 }
 
 test "slg e2e - -l regex prefix scan avoids false positives" {
@@ -1316,44 +1205,44 @@ test "slg e2e - -l regex prefix scan avoids false positives" {
 
   let path: string = "testdata/basic/anchor_long_line.txt";
 
-  let needle_len: i64 = std::runtime::mem::string_len(needle);
+  let needle_len: i64 = sizeof(needle) as i64;
   assert(needle_len > 0, "needle should be non-empty");
   assert(needle_len < probe, "needle must fit in probe");
 
   let total_len: i64 = probe + 16;
-  let buf: u64 = std::runtime::mem::alloc(total_len);
+  let buf: u64 = mem::alloc(total_len);
   assert(buf != 0, "alloc failed");
 
   // Fill with 'a'.
   var i: i64 = 0;
   while i < total_len {
-    std::runtime::mem::store_u8(buf, i, 97); // 'a'
+    mem::store_u8(buf, i, 97); // 'a'
     i = i + 1;
   }
 
   // Place `needle` at the end of the probe.
-  let needle_ptr: u64 = std::runtime::mem::string_ptr(needle);
+  let needle_ptr: u64 = needle as raw u64;
   let start: i64 = probe - needle_len;
   var j: i64 = 0;
   while j < needle_len {
-    let b: u8 = std::runtime::mem::load_u8(needle_ptr, j);
-    std::runtime::mem::store_u8(buf, start + j, b);
+    let b: u8 = mem::load_u8(needle_ptr, j);
+    mem::store_u8(buf, start + j, b);
     j = j + 1;
   }
 
   // Ensure the file continues past the probe and does not end in `needle`.
-  std::runtime::mem::store_u8(buf, probe, 120); // 'x'
+  mem::store_u8(buf, probe, 120); // 'x'
 
-  let fd = std::runtime::posix::fs::open(
+  let fd = open(
     path,
-    std::runtime::posix::fs::O_WRONLY | std::runtime::posix::fs::O_CREAT | std::runtime::posix::fs::O_TRUNC,
+    O_WRONLY | O_CREAT | O_TRUNC,
     420 // 0644
   );
 
   assert(fd >= 0, "open failed");
   let ok_write: bool = write_all_fd(fd as int, buf, total_len);
-  let _ = std::runtime::posix::fs::close(fd);
-  std::runtime::mem::free(buf);
+  let _ = close(fd);
+  mem::free(buf);
   assert(ok_write, "write failed");
 
   // Run `slg -l`.
@@ -1373,12 +1262,9 @@ test "slg e2e - -l regex prefix scan avoids false positives" {
   let mut cap: Capture = cap_opt ?? Capture{ code: 2, out: BufferU8.empty() };
 
   // Cleanup before assertions (so failures don't leave test files behind).
-  let _ = std::runtime::posix::fs::unlink(path);
+  let _ = unlink(path);
 
   assert(cap.code == 1, "expected exit code 1 (no match)");
   let out_s: string = buffer_as_string(cap.out);
   assert(!contains(out_s, "anchor_long_line.txt"), "should not report a false match");
-
-  cap.drop();
-  av.drop();
 }

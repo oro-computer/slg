@@ -1,8 +1,8 @@
 module slg::buf;
 
+import { Drop } from "std/interfaces";
 import { OutOfMemory } from "std/memory";
-import std::interfaces;
-import std::runtime::mem;
+import mem from "std/runtime/mem";
 
 import { memcpy } from "./os.slk";
 
@@ -23,10 +23,10 @@ export struct ByteSlice {
  *
  * Design goals:
  * - Small API surface (just what `slg` needs today).
- * - No dependency on `std::buffer` / `std::strings` (both currently rely on
+ * - No dependency on `std/buffer` / `std/strings` (both currently rely on
  *   constructs outside the supported subset).
  * - Friendly to Formal Silk reasoning: the `{ptr,len,cap}` triple follows the
- *   `std::formal.vector_well_formed` theory.
+ *   `std/formal` vector well-formed theory.
  *
  * Safety:
  * - `ptr` is either 0 (empty) or points to `cap` writable bytes.
@@ -61,7 +61,7 @@ impl BufferU8 {
       return Some(BufferU8.empty());
     }
 
-    let ptr: u64 = std::runtime::mem::alloc(cap);
+    let ptr: u64 = mem::alloc(cap);
     if ptr == 0 {
       return None;
     }
@@ -119,7 +119,7 @@ impl BufferU8 {
       new_cap = new_cap * 2;
     }
 
-    let new_ptr: u64 = std::runtime::mem::realloc(self.ptr, new_cap);
+    let new_ptr: u64 = mem::realloc(self.ptr, new_cap);
     if new_ptr == 0 {
       return Some(oom(new_cap));
     }
@@ -133,12 +133,11 @@ impl BufferU8 {
    * Append one byte.
    */
   public fn push_u8 (mut self: &BufferU8, value: u8) -> OutOfMemory? {
-    let err: OutOfMemory? = self.reserve_additional(1);
-    if err != None {
-      return err;
+    if let Some(err) = self.reserve_additional(1) {
+      return Some(err);
     }
 
-    std::runtime::mem::store_u8(self.ptr, self.len, value);
+    mem::store_u8(self.ptr, self.len, value);
     self.len = self.len + 1;
     return None;
   }
@@ -151,9 +150,8 @@ impl BufferU8 {
       return None;
     }
 
-    let err: OutOfMemory? = self.reserve_additional(len);
-    if err != None {
-      return err;
+    if let Some(err) = self.reserve_additional(len) {
+      return Some(err);
     }
 
     let dst: u64 = self.ptr + (self.len as u64);
@@ -166,18 +164,18 @@ impl BufferU8 {
    * Append a `string`'s bytes.
    */
   public fn push_str (mut self: &BufferU8, s: string) -> OutOfMemory? {
-    let ptr: u64 = std::runtime::mem::string_ptr(s);
-    let len: i64 = std::runtime::mem::string_len(s);
+    let ptr: u64 = s as raw u64;
+    let len: i64 = sizeof(s) as i64;
     return self.push_ptr_len(ptr, len);
   }
 }
 
-impl BufferU8 as std::interfaces::Drop {
+impl BufferU8 as Drop {
   /**
    * Free owned memory and reset the buffer to an inert state.
    */
   public fn drop (mut self: &BufferU8) -> void {
-    std::runtime::mem::free(self.ptr);
+    mem::free(self.ptr);
     self.ptr = 0;
     self.len = 0;
     self.cap = 0;

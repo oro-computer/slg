@@ -1,8 +1,7 @@
 module slg::color;
 
-import std::runtime::env;
-
-import { isatty } from "./os.slk";
+import env from "std/env";
+import { isatty } from "std/io";
 
 /**
  * CLI color mode.
@@ -35,12 +34,11 @@ export fn enabled (mode: ColorMode, fd: int) -> bool {
   }
 
   // `NO_COLOR` convention: presence disables color.
-  if std::runtime::env::getenv("NO_COLOR") != 0 {
+  if env::get("NO_COLOR") != None {
     return false;
   }
 
-  let rc: i32 = isatty(fd as i32);
-  return rc == 1;
+  return isatty(fd);
 }
 
 /**

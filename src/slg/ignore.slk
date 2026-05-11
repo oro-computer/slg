@@ -1,22 +1,16 @@
 module slg::ignore;
 
-import std::path;
-import std::interfaces;
-import std::runtime::mem;
-import std::runtime::posix::fs;
+import { File, MMap } from "std/fs";
+import { PathBuf } from "std/path";
+import { Drop } from "std/interfaces";
+import mem from "std/runtime/mem";
 import { OutOfMemory } from "std/memory";
 
 import { BufferU8 } from "./buf.slk";
 import {
-  MAP_FAILED,
-  MAP_PRIVATE,
-  PROT_READ,
-  errno,
   memchr,
   memcmp,
   memcpy,
-  mmap,
-  munmap,
 } from "./os.slk";
 
 // ---------------------------------------------------------------------------
@@ -42,12 +36,7 @@ import {
 //   unignored" nuance. It’s good enough for common ignore files used in the
 //   workspace and materially improves performance by skipping build outputs.
 
-type PathBuf = std::path::PathBuf;
-
-// Linux hosted baseline errno values used for ignore-file opens.
-let ENOENT: int = 2;
-
-let RULE_REC_SIZE: i64 = 24;
+let RULE_REC_SIZE: i64 = 32;
 let DIR_REC_SIZE: i64 = 40;
 let MAX_SEGMENTS: i64 = 64;
 
@@ -111,7 +100,7 @@ fn hash_str_ptr_len (ptr: u64, len: i64) -> u64 {
 
   var i: i64 = 0;
   while i < len {
-    let b: u64 = std::runtime::mem::load_u8(ptr, i) as u64;
+    let b: u64 = mem::load_u8(ptr, i) as u64;
     h = h ^ b;
     h = h * prime;
     i = i + 1;
@@ -140,20 +129,20 @@ fn cache_probe (cache: &IgnoreCache, key_ptr: u64, key_len: i64, hash: u64) -> C
   while probe < cache.cap {
     let slot: i64 = (idx0 + probe) & cache.mask;
     let sp: u64 = cache_slot_ptr(cache, slot);
-    let h2: u64 = std::runtime::mem::load_u64(sp, CACHE_OFF_HASH);
+    let h2: u64 = mem::load_u64(sp, CACHE_OFF_HASH);
     if h2 == 0 {
       empty_slot = slot;
       break;
     }
 
     if h2 == hash {
-      let klen: i64 = std::runtime::mem::load_u64(sp, CACHE_OFF_KEY_LEN) as i64;
+      let klen: i64 = mem::load_u64(sp, CACHE_OFF_KEY_LEN) as i64;
       if klen == key_len {
         if key_len <= 0 {
           return CacheProbe{ hit_slot: slot, empty_slot: empty_slot };
         }
 
-        let kptr: u64 = std::runtime::mem::load_u64(sp, CACHE_OFF_KEY_PTR);
+        let kptr: u64 = mem::load_u64(sp, CACHE_OFF_KEY_PTR);
         if kptr != 0 && key_ptr != 0 && memcmp(kptr, key_ptr, key_len as u64) == 0 {
           return CacheProbe{ hit_slot: slot, empty_slot: empty_slot };
         }
@@ -171,7 +160,7 @@ fn alloc_copy (src_ptr: u64, len: i64) -> u64 {
     return 0;
   }
 
-  let dst: u64 = std::runtime::mem::alloc(len);
+  let dst: u64 = mem::alloc(len);
   if dst == 0 {
     return 0;
   }
@@ -186,26 +175,26 @@ fn cache_free_slot (cache: &IgnoreCache, slot: i64) -> void {
   }
 
   let sp: u64 = cache_slot_ptr(cache, slot);
-  let h: u64 = std::runtime::mem::load_u64(sp, CACHE_OFF_HASH);
+  let h: u64 = mem::load_u64(sp, CACHE_OFF_HASH);
   if h == 0 {
     return;
   }
 
-  let key_ptr: u64 = std::runtime::mem::load_u64(sp, CACHE_OFF_KEY_PTR);
+  let key_ptr: u64 = mem::load_u64(sp, CACHE_OFF_KEY_PTR);
   if key_ptr != 0 {
-    std::runtime::mem::free(key_ptr);
+    mem::free(key_ptr);
   }
 
-  let kind: u64 = std::runtime::mem::load_u64(sp, CACHE_OFF_KIND);
+  let kind: u64 = mem::load_u64(sp, CACHE_OFF_KIND);
   if kind == CACHE_KIND_RULES {
-    let cptr: u64 = std::runtime::mem::load_u64(sp, CACHE_OFF_CONTENT_PTR);
-    let rptr: u64 = std::runtime::mem::load_u64(sp, CACHE_OFF_RULES_PTR);
+    let cptr: u64 = mem::load_u64(sp, CACHE_OFF_CONTENT_PTR);
+    let rptr: u64 = mem::load_u64(sp, CACHE_OFF_RULES_PTR);
     if cptr != 0 {
-      std::runtime::mem::free(cptr);
+      mem::free(cptr);
     }
 
     if rptr != 0 {
-      std::runtime::mem::free(rptr);
+      mem::free(rptr);
     }
   }
 }
@@ -221,7 +210,7 @@ fn cache_choose_evict_slot (mut cache: &IgnoreCache) -> i64 {
   var attempts: i64 = 0;
   while attempts < cache.cap {
     let sp: u64 = cache_slot_ptr(cache, slot);
-    let kind: u64 = std::runtime::mem::load_u64(sp, CACHE_OFF_KIND);
+    let kind: u64 = mem::load_u64(sp, CACHE_OFF_KIND);
     if kind != CACHE_KIND_RULES {
       cache.next_evict = (slot + 1) & cache.mask;
       return slot;
@@ -262,14 +251,14 @@ fn cache_insert_entry (
   }
 
   let sp: u64 = cache_slot_ptr(cache, slot);
-  std::runtime::mem::store_u64(sp, CACHE_OFF_HASH, hash);
-  std::runtime::mem::store_u64(sp, CACHE_OFF_KIND, kind);
-  std::runtime::mem::store_u64(sp, CACHE_OFF_KEY_PTR, key_ptr);
-  std::runtime::mem::store_u64(sp, CACHE_OFF_KEY_LEN, key_len as u64);
-  std::runtime::mem::store_u64(sp, CACHE_OFF_CONTENT_PTR, content_ptr);
-  std::runtime::mem::store_u64(sp, CACHE_OFF_CONTENT_LEN, content_len as u64);
-  std::runtime::mem::store_u64(sp, CACHE_OFF_RULES_PTR, rules_ptr);
-  std::runtime::mem::store_u64(sp, CACHE_OFF_RULES_LEN, rules_len as u64);
+  mem::store_u64(sp, CACHE_OFF_HASH, hash);
+  mem::store_u64(sp, CACHE_OFF_KIND, kind);
+  mem::store_u64(sp, CACHE_OFF_KEY_PTR, key_ptr);
+  mem::store_u64(sp, CACHE_OFF_KEY_LEN, key_len as u64);
+  mem::store_u64(sp, CACHE_OFF_CONTENT_PTR, content_ptr);
+  mem::store_u64(sp, CACHE_OFF_CONTENT_LEN, content_len as u64);
+  mem::store_u64(sp, CACHE_OFF_RULES_PTR, rules_ptr);
+  mem::store_u64(sp, CACHE_OFF_RULES_LEN, rules_len as u64);
   return true;
 }
 
@@ -288,7 +277,7 @@ export fn init_cache (slots: int = 16384) -> IgnoreCache {
   cap = p;
 
   let bytes: i64 = cap * CACHE_SLOT_BYTES;
-  let ptr: u64 = std::runtime::mem::alloc(bytes);
+  let ptr: u64 = mem::alloc(bytes);
   if ptr == 0 {
     return IgnoreCache{ ptr: 0, cap: 0, mask: 0, next_evict: 0 };
   }
@@ -296,7 +285,7 @@ export fn init_cache (slots: int = 16384) -> IgnoreCache {
   // Zero initialize the table (malloc is not guaranteed to).
   var off: i64 = 0;
   while off < bytes {
-    std::runtime::mem::store_u64(ptr, off, 0);
+    mem::store_u64(ptr, off, 0);
     off = off + 8;
   }
 
@@ -313,6 +302,7 @@ struct RuleRec {
   pat_off: i64,
   pat_len: i64,
   flags: u64,
+  aux: i64,
 }
 
 struct DirRec {
@@ -355,35 +345,36 @@ fn dirs_count_len (dirs_len: i64) -> i64 {
   return dirs_len / DIR_REC_SIZE;
 }
 
-fn rules_push (mut rules: &BufferU8, pat_off: i64, pat_len: i64, flags: u64) -> bool {
-  let err: OutOfMemory? = rules.reserve_additional(RULE_REC_SIZE);
-  if err != None {
+fn rules_push (mut rules: &BufferU8, pat_off: i64, pat_len: i64, flags: u64, aux: i64) -> bool {
+  if rules.reserve_additional(RULE_REC_SIZE) != None {
     return false;
   }
 
   let off: i64 = rules.len;
-  std::runtime::mem::store_u64(rules.ptr, off + 0, pat_off as u64);
-  std::runtime::mem::store_u64(rules.ptr, off + 8, pat_len as u64);
-  std::runtime::mem::store_u64(rules.ptr, off + 16, flags);
+  mem::store_u64(rules.ptr, off + 0, pat_off as u64);
+  mem::store_u64(rules.ptr, off + 8, pat_len as u64);
+  mem::store_u64(rules.ptr, off + 16, flags);
+  mem::store_u64(rules.ptr, off + 24, aux as u64);
   rules.len = rules.len + RULE_REC_SIZE;
   return true;
 }
 
 fn rules_get (rules_ptr: u64, index: i64) -> RuleRec {
   let off: i64 = index * RULE_REC_SIZE;
-  let pat_off: i64 = std::runtime::mem::load_u64(rules_ptr, off + 0) as i64;
-  let pat_len: i64 = std::runtime::mem::load_u64(rules_ptr, off + 8) as i64;
-  let flags: u64 = std::runtime::mem::load_u64(rules_ptr, off + 16);
-  return RuleRec{ pat_off: pat_off, pat_len: pat_len, flags: flags };
+  let pat_off: i64 = mem::load_u64(rules_ptr, off + 0) as i64;
+  let pat_len: i64 = mem::load_u64(rules_ptr, off + 8) as i64;
+  let flags: u64 = mem::load_u64(rules_ptr, off + 16);
+  let aux: i64 = mem::load_u64(rules_ptr, off + 24) as i64;
+  return RuleRec{ pat_off: pat_off, pat_len: pat_len, flags: flags, aux: aux };
 }
 
 fn dirs_get (dirs_ptr: u64, index: i64) -> DirRec {
   let off: i64 = index * DIR_REC_SIZE;
-  let base_len: i64 = std::runtime::mem::load_u64(dirs_ptr, off + DIR_OFF_BASE_LEN) as i64;
-  let content_ptr: u64 = std::runtime::mem::load_u64(dirs_ptr, off + DIR_OFF_CONTENT_PTR);
-  let content_len: i64 = std::runtime::mem::load_u64(dirs_ptr, off + DIR_OFF_CONTENT_LEN) as i64;
-  let rules_ptr: u64 = std::runtime::mem::load_u64(dirs_ptr, off + DIR_OFF_RULES_PTR);
-  let rules_len: i64 = std::runtime::mem::load_u64(dirs_ptr, off + DIR_OFF_RULES_LEN) as i64;
+  let base_len: i64 = mem::load_u64(dirs_ptr, off + DIR_OFF_BASE_LEN) as i64;
+  let content_ptr: u64 = mem::load_u64(dirs_ptr, off + DIR_OFF_CONTENT_PTR);
+  let content_len: i64 = mem::load_u64(dirs_ptr, off + DIR_OFF_CONTENT_LEN) as i64;
+  let rules_ptr: u64 = mem::load_u64(dirs_ptr, off + DIR_OFF_RULES_PTR);
+  let rules_len: i64 = mem::load_u64(dirs_ptr, off + DIR_OFF_RULES_LEN) as i64;
   return DirRec{
     base_len: base_len,
     content_ptr: content_ptr,
@@ -394,17 +385,16 @@ fn dirs_get (dirs_ptr: u64, index: i64) -> DirRec {
 }
 
 fn dirs_push (mut dirs: &BufferU8, base_len: i64, content_ptr: u64, content_len: i64, rules_ptr: u64, rules_len: i64) -> bool {
-  let err: OutOfMemory? = dirs.reserve_additional(DIR_REC_SIZE);
-  if err != None {
+  if dirs.reserve_additional(DIR_REC_SIZE) != None {
     return false;
   }
 
   let off: i64 = dirs.len;
-  std::runtime::mem::store_u64(dirs.ptr, off + DIR_OFF_BASE_LEN, base_len as u64);
-  std::runtime::mem::store_u64(dirs.ptr, off + DIR_OFF_CONTENT_PTR, content_ptr);
-  std::runtime::mem::store_u64(dirs.ptr, off + DIR_OFF_CONTENT_LEN, content_len as u64);
-  std::runtime::mem::store_u64(dirs.ptr, off + DIR_OFF_RULES_PTR, rules_ptr);
-  std::runtime::mem::store_u64(dirs.ptr, off + DIR_OFF_RULES_LEN, rules_len as u64);
+  mem::store_u64(dirs.ptr, off + DIR_OFF_BASE_LEN, base_len as u64);
+  mem::store_u64(dirs.ptr, off + DIR_OFF_CONTENT_PTR, content_ptr);
+  mem::store_u64(dirs.ptr, off + DIR_OFF_CONTENT_LEN, content_len as u64);
+  mem::store_u64(dirs.ptr, off + DIR_OFF_RULES_PTR, rules_ptr);
+  mem::store_u64(dirs.ptr, off + DIR_OFF_RULES_LEN, rules_len as u64);
   dirs.len = dirs.len + DIR_REC_SIZE;
   return true;
 }
@@ -415,12 +405,12 @@ fn trim_line_end (ptr: u64, start: i64, end: i64) -> i64 {
     return e;
   }
   // Drop CR.
-  if std::runtime::mem::load_u8(ptr, e - 1) == 13 {
+  if mem::load_u8(ptr, e - 1) == 13 {
     e = e - 1;
   }
   // Drop trailing spaces/tabs (common in hand-edited ignore files).
   while e > start {
-    let b: u8 = std::runtime::mem::load_u8(ptr, e - 1);
+    let b: u8 = mem::load_u8(ptr, e - 1);
     if b != 32 && b != 9 {
       break;
     }
@@ -449,6 +439,64 @@ fn line_has_glob (ptr: u64, start: i64, end: i64) -> bool {
   return memchr(p, 42, n) != 0 || memchr(p, 63, n) != 0;
 }
 
+fn literal_prefix_len_before_glob (ptr: u64, start: i64, end: i64) -> i64 {
+  if ptr == 0 || end <= start {
+    return 0;
+  }
+
+  var i: i64 = start;
+  while i < end {
+    let b: u8 = mem::load_u8(ptr, i);
+    if b == 42 || b == 63 {
+      return i - start;
+    }
+
+    i = i + 1;
+  }
+
+  return 0;
+}
+
+fn literal_suffix_len_after_glob (ptr: u64, start: i64, end: i64) -> i64 {
+  if ptr == 0 || end <= start {
+    return 0;
+  }
+
+  var i: i64 = end - 1;
+  while i >= start {
+    let b: u8 = mem::load_u8(ptr, i);
+    if b == 42 || b == 63 {
+      return (end - i) - 1;
+    }
+
+    i = i - 1;
+  }
+
+  return 0;
+}
+
+fn pack_glob_aux (prefix_len: i64, suffix_len: i64) -> i64 {
+  var p: u64 = 0;
+  var s: u64 = 0;
+  if prefix_len > 0 {
+    p = prefix_len as u64;
+  }
+
+  if suffix_len > 0 {
+    s = suffix_len as u64;
+  }
+
+  return ((s << 32) | (p & 4294967295)) as i64;
+}
+
+fn glob_aux_prefix_len (aux: i64) -> i64 {
+  return ((aux as u64) & 4294967295) as i64;
+}
+
+fn glob_aux_suffix_len (aux: i64) -> i64 {
+  return (((aux as u64) >> 32) & 4294967295) as i64;
+}
+
 fn parse_rules_range (content_ptr: u64, start_off: i64, len: i64, mut rules: &BufferU8) -> bool {
   if content_ptr == 0 || len <= 0 {
     return true;
@@ -463,7 +511,7 @@ fn parse_rules_range (content_ptr: u64, start_off: i64, len: i64, mut rules: &Bu
     let b: u8 = if at_end {
       10
     } else {
-      std::runtime::mem::load_u8(content_ptr, off)
+      mem::load_u8(content_ptr, off)
     };
     if b != 10 {
       off = off + 1;
@@ -480,14 +528,14 @@ fn parse_rules_range (content_ptr: u64, start_off: i64, len: i64, mut rules: &Bu
     }
 
     // Comment line (`#...`).
-    if std::runtime::mem::load_u8(content_ptr, start) == 35 {
+    if mem::load_u8(content_ptr, start) == 35 {
       continue;
     }
 
     var flags: u64 = 0;
 
     // Negation (`!...`).
-    if std::runtime::mem::load_u8(content_ptr, start) == 33 {
+    if mem::load_u8(content_ptr, start) == 33 {
       flags = flags | FLAG_NEGATED;
       start = start + 1;
       if end <= start {
@@ -496,7 +544,7 @@ fn parse_rules_range (content_ptr: u64, start_off: i64, len: i64, mut rules: &Bu
     }
 
     // Leading '/' anchor.
-    if std::runtime::mem::load_u8(content_ptr, start) == 47 {
+    if mem::load_u8(content_ptr, start) == 47 {
       flags = flags | FLAG_ANCHORED;
       start = start + 1;
       if end <= start {
@@ -505,7 +553,7 @@ fn parse_rules_range (content_ptr: u64, start_off: i64, len: i64, mut rules: &Bu
     }
 
     // Trailing '/' means "directory-only".
-    if end > start && std::runtime::mem::load_u8(content_ptr, end - 1) == 47 {
+    if end > start && mem::load_u8(content_ptr, end - 1) == 47 {
       flags = flags | FLAG_DIR_ONLY;
       end = end - 1;
       if end <= start {
@@ -521,7 +569,14 @@ fn parse_rules_range (content_ptr: u64, start_off: i64, len: i64, mut rules: &Bu
       flags = flags | FLAG_HAS_GLOB;
     }
 
-    if !rules_push(mut rules, start, end - start, flags) {
+    var aux: i64 = 0;
+    if (flags & FLAG_HAS_GLOB) != 0 {
+      let prefix_len: i64 = literal_prefix_len_before_glob(content_ptr, start, end);
+      let suffix_len: i64 = literal_suffix_len_after_glob(content_ptr, start, end);
+      aux = pack_glob_aux(prefix_len, suffix_len);
+    }
+
+    if !rules_push(mut rules, start, end - start, flags, aux) {
       return false;
     }
   }
@@ -529,37 +584,45 @@ fn parse_rules_range (content_ptr: u64, start_off: i64, len: i64, mut rules: &Bu
   return true;
 }
 
-fn mmap_append_file (mut content: &BufferU8, mut rules: &BufferU8, path: string) -> bool {
-  let fd = std::runtime::posix::fs::open(path, std::runtime::posix::fs::O_RDONLY, 0);
-  if fd < 0 {
-    let e: int = errno();
-    if e == ENOENT {
-      return true;
-    }
+fn pathbuf_string (path: &PathBuf) -> string {
+  if path.ptr == 0 || path.len <= 0 {
+    return ".";
+  }
+
+  return path.ptr as string(path.len);
+}
+
+fn append_ignore_file (mut content: &BufferU8, mut rules: &BufferU8, path: &PathBuf) -> bool {
+  if path.ptr == 0 {
+    return true;
+  }
+
+  let mut move Ok(file) = File.open_read(pathbuf_string(path)) else {
     // Ignore-file failures should not make the whole run fail; just treat it
     // as absent (best-effort).
     return true;
-  }
+  };
 
-  let size: i64 = std::runtime::posix::fs::lseek(fd, 0, std::runtime::posix::fs::SEEK_END);
+  let Ok(size) = file.metadata_size() else {
+    file.close();
+    return true;
+  };
   if size <= 0 {
-    let _ = std::runtime::posix::fs::close(fd);
+    file.close();
     return true;
   }
 
-  let map_len: u64 = size as u64;
-  let ptr: u64 = mmap(0, map_len, PROT_READ, MAP_PRIVATE, fd, 0);
-  if ptr == MAP_FAILED {
-    let _ = std::runtime::posix::fs::close(fd);
+  let mut move Ok(map) = file.mmap_readonly_range(0, size) else {
+    file.close();
     return true;
-  }
+  };
+  file.close();
 
   let start_off: i64 = content.len;
-  let err: OutOfMemory? = content.push_ptr_len(ptr, size);
-  let _ = munmap(ptr, map_len);
-  let _ = std::runtime::posix::fs::close(fd);
+  let ok: bool = content.push_ptr_len(map.ptr, map.len) == None;
+  map.drop();
 
-  if err != None {
+  if !ok {
     return false;
   }
 
@@ -586,14 +649,12 @@ fn load_one_ignore_file (
   base_len: i64,
   name: string
 ) -> bool {
-  let perr = path.push(name);
-  if perr != None {
+  if path.push(name) != None {
     path_truncate(mut path, base_len);
     return false;
   }
 
-  let file_path: string = path.as_string();
-  let ok: bool = mmap_append_file(mut content, mut rules, file_path);
+  let ok: bool = append_ignore_file(mut content, mut rules, path);
   path_truncate(mut path, base_len);
   return ok;
 }
@@ -668,7 +729,7 @@ fn is_globstar_segment (ptr: u64, off: i64, len: i64) -> bool {
     return false;
   }
 
-  return std::runtime::mem::load_u8(ptr, off) == 42 && std::runtime::mem::load_u8(ptr, off + 1) == 42;
+  return mem::load_u8(ptr, off) == 42 && mem::load_u8(ptr, off + 1) == 42;
 }
 
 fn match_component (pat_ptr: u64, pat_len: i64, text_ptr: u64, text_len: i64) -> bool {
@@ -679,9 +740,9 @@ fn match_component (pat_ptr: u64, pat_len: i64, text_ptr: u64, text_len: i64) ->
   var star_ti: i64 = -1;
 
   while ti < text_len {
-    if pi < pat_len && std::runtime::mem::load_u8(pat_ptr, pi) == 42 {
+    if pi < pat_len && mem::load_u8(pat_ptr, pi) == 42 {
       // Collapse consecutive `*`.
-      while pi < pat_len && std::runtime::mem::load_u8(pat_ptr, pi) == 42 {
+      while pi < pat_len && mem::load_u8(pat_ptr, pi) == 42 {
         pi = pi + 1;
       }
 
@@ -691,8 +752,8 @@ fn match_component (pat_ptr: u64, pat_len: i64, text_ptr: u64, text_len: i64) ->
     }
 
     if pi < pat_len {
-      let pc: u8 = std::runtime::mem::load_u8(pat_ptr, pi);
-      let tc: u8 = std::runtime::mem::load_u8(text_ptr, ti);
+      let pc: u8 = mem::load_u8(pat_ptr, pi);
+      let tc: u8 = mem::load_u8(text_ptr, ti);
       if pc == 63 || pc == tc {
         pi = pi + 1;
         ti = ti + 1;
@@ -710,7 +771,7 @@ fn match_component (pat_ptr: u64, pat_len: i64, text_ptr: u64, text_len: i64) ->
     return false;
   }
 
-  while pi < pat_len && std::runtime::mem::load_u8(pat_ptr, pi) == 42 {
+  while pi < pat_len && mem::load_u8(pat_ptr, pi) == 42 {
     pi = pi + 1;
   }
 
@@ -784,7 +845,7 @@ fn match_path (pat_ptr: u64, pat_len: i64, text_ptr: u64, text_len: i64) -> bool
       }
 
       var j: i64 = i;
-      while j < pat_len && std::runtime::mem::load_u8(pat_ptr, j) != 47 {
+      while j < pat_len && mem::load_u8(pat_ptr, j) != 47 {
         j = j + 1;
       }
 
@@ -804,7 +865,7 @@ fn match_path (pat_ptr: u64, pat_len: i64, text_ptr: u64, text_len: i64) -> bool
       }
 
       var j: i64 = i;
-      while j < text_len && std::runtime::mem::load_u8(text_ptr, j) != 47 {
+      while j < text_len && mem::load_u8(text_ptr, j) != 47 {
         j = j + 1;
       }
 
@@ -910,7 +971,7 @@ fn rel_slice (full_ptr: u64, full_len: i64, base_len: i64) -> slg::buf::ByteSlic
   }
 
   var off: i64 = base_len;
-  if base_len > 0 && std::runtime::mem::load_u8(full_ptr, base_len - 1) != 47 {
+  if base_len > 0 && mem::load_u8(full_ptr, base_len - 1) != 47 {
     off = off + 1;
   }
 
@@ -941,6 +1002,17 @@ fn rule_matches (
       return bytes_eq(pat_ptr, r.pat_len, rel.ptr, rel.len);
     }
 
+    let prefix_len: i64 = glob_aux_prefix_len(r.aux);
+    if prefix_len > 0 {
+      if rel.len < prefix_len {
+        return false;
+      }
+
+      if memcmp(pat_ptr, rel.ptr, prefix_len as u64) != 0 {
+        return false;
+      }
+    }
+
     return match_path(pat_ptr, r.pat_len, rel.ptr, rel.len);
   }
 
@@ -952,6 +1024,30 @@ fn rule_matches (
 
   if (r.flags & FLAG_HAS_GLOB) == 0 {
     return bytes_eq(pat_ptr, r.pat_len, name_ptr, name_len);
+  }
+
+  let prefix_len: i64 = glob_aux_prefix_len(r.aux);
+  let suffix_len: i64 = glob_aux_suffix_len(r.aux);
+  if prefix_len > 0 {
+    if name_len < prefix_len {
+      return false;
+    }
+
+    if memcmp(pat_ptr, name_ptr, prefix_len as u64) != 0 {
+      return false;
+    }
+  }
+
+  if suffix_len > 0 {
+    if name_len < suffix_len || prefix_len + suffix_len > name_len {
+      return false;
+    }
+
+    let pat_suffix: u64 = pat_ptr + ((r.pat_len - suffix_len) as u64);
+    let name_suffix: u64 = name_ptr + ((name_len - suffix_len) as u64);
+    if memcmp(pat_suffix, name_suffix, suffix_len as u64) != 0 {
+      return false;
+    }
   }
 
   return match_component(pat_ptr, r.pat_len, name_ptr, name_len);
@@ -997,10 +1093,10 @@ export fn is_ignored_ptr_len (stack: &IgnoreStack, full_ptr: u64, full_len: i64,
 }
 
 export fn is_ignored (stack: &IgnoreStack, full_path: string, name: string, is_dir: bool) -> bool {
-  let full_ptr: u64 = std::runtime::mem::string_ptr(full_path);
-  let full_len: i64 = std::runtime::mem::string_len(full_path);
-  let name_ptr: u64 = std::runtime::mem::string_ptr(name);
-  let name_len: i64 = std::runtime::mem::string_len(name);
+  let full_ptr: u64 = full_path as raw u64;
+  let full_len: i64 = sizeof(full_path) as i64;
+  let name_ptr: u64 = name as raw u64;
+  let name_len: i64 = sizeof(name) as i64;
   return is_ignored_ptr_len_impl(stack, full_ptr, full_len, name_ptr, name_len, is_dir);
 }
 
@@ -1029,14 +1125,14 @@ fn pop_dirs_to (mut dirs: &BufferU8, mark: i64) -> void {
 
   var off: i64 = dirs.len - DIR_REC_SIZE;
   while off >= m {
-    let content_ptr: u64 = std::runtime::mem::load_u64(dirs.ptr, off + DIR_OFF_CONTENT_PTR);
-    let content_len: i64 = std::runtime::mem::load_u64(dirs.ptr, off + DIR_OFF_CONTENT_LEN) as i64;
-    let rules_ptr: u64 = std::runtime::mem::load_u64(dirs.ptr, off + DIR_OFF_RULES_PTR);
+    let content_ptr: u64 = mem::load_u64(dirs.ptr, off + DIR_OFF_CONTENT_PTR);
+    let content_len: i64 = mem::load_u64(dirs.ptr, off + DIR_OFF_CONTENT_LEN) as i64;
+    let rules_ptr: u64 = mem::load_u64(dirs.ptr, off + DIR_OFF_RULES_PTR);
     // `content_len < 0` marks a borrowed ignore entry (pointers owned by the
     // per-thread ignore cache).
     if content_len >= 0 {
-      std::runtime::mem::free(content_ptr);
-      std::runtime::mem::free(rules_ptr);
+      mem::free(content_ptr);
+      mem::free(rules_ptr);
     }
 
     off = off - DIR_REC_SIZE;
@@ -1074,8 +1170,8 @@ export fn push_dir (enabled: bool, mut stack: &IgnoreStack, mut path: &PathBuf) 
     loaded.rules_len
   );
   if !ok {
-    std::runtime::mem::free(loaded.content_ptr);
-    std::runtime::mem::free(loaded.rules_ptr);
+    mem::free(loaded.content_ptr);
+    mem::free(loaded.rules_ptr);
   }
 }
 
@@ -1098,15 +1194,15 @@ export fn push_dir_cached (enabled: bool, mut stack: &IgnoreStack, mut path: &Pa
 
   if p.hit_slot >= 0 {
     let sp: u64 = cache_slot_ptr(cache, p.hit_slot);
-    let kind: u64 = std::runtime::mem::load_u64(sp, CACHE_OFF_KIND);
+    let kind: u64 = mem::load_u64(sp, CACHE_OFF_KIND);
     if kind == CACHE_KIND_NONE {
       return;
     }
 
-    let cptr: u64 = std::runtime::mem::load_u64(sp, CACHE_OFF_CONTENT_PTR);
-    let clen: i64 = std::runtime::mem::load_u64(sp, CACHE_OFF_CONTENT_LEN) as i64;
-    let rptr: u64 = std::runtime::mem::load_u64(sp, CACHE_OFF_RULES_PTR);
-    let rlen: i64 = std::runtime::mem::load_u64(sp, CACHE_OFF_RULES_LEN) as i64;
+    let cptr: u64 = mem::load_u64(sp, CACHE_OFF_CONTENT_PTR);
+    let clen: i64 = mem::load_u64(sp, CACHE_OFF_CONTENT_LEN) as i64;
+    let rptr: u64 = mem::load_u64(sp, CACHE_OFF_RULES_PTR);
+    let rlen: i64 = mem::load_u64(sp, CACHE_OFF_RULES_LEN) as i64;
 
     let base_len: i64 = path.len;
     // Push a borrowed ignore entry: these pointers remain valid for the
@@ -1146,7 +1242,7 @@ export fn push_dir_cached (enabled: bool, mut stack: &IgnoreStack, mut path: &Pa
 
     let ok: bool = cache_insert_entry(mut cache, hash, CACHE_KIND_NONE, key_copy, key_len, 0, 0, 0, 0, p.empty_slot);
     if !ok && key_copy != 0 {
-      std::runtime::mem::free(key_copy);
+      mem::free(key_copy);
     }
 
     return;
@@ -1180,7 +1276,7 @@ export fn push_dir_cached (enabled: bool, mut stack: &IgnoreStack, mut path: &Pa
       if ok_cache {
         cached = true;
       } else {
-        std::runtime::mem::free(key_copy);
+        mem::free(key_copy);
         key_copy = 0;
       }
     }
@@ -1231,14 +1327,14 @@ export fn push_dir_cached (enabled: bool, mut stack: &IgnoreStack, mut path: &Pa
     loaded.rules_len
   );
   if !ok {
-    std::runtime::mem::free(loaded.content_ptr);
-    std::runtime::mem::free(loaded.rules_ptr);
+    mem::free(loaded.content_ptr);
+    mem::free(loaded.rules_ptr);
   }
 }
 
 // NOTE: popping/dropping is handled by `pop_to` / `drop_stack`.
 
-impl IgnoreCache as std::interfaces::Drop {
+impl IgnoreCache as Drop {
   public fn drop (mut self: &IgnoreCache) -> void {
     if self.ptr == 0 || self.cap <= 0 {
       self.ptr = 0;
@@ -1254,7 +1350,7 @@ impl IgnoreCache as std::interfaces::Drop {
       slot = slot + 1;
     }
 
-    std::runtime::mem::free(self.ptr);
+    mem::free(self.ptr);
     self.ptr = 0;
     self.cap = 0;
     self.mask = 0;

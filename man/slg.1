@@ -61,13 +61,13 @@ Limit recursion depth.
 Use \fB0\fR for only the root(s).
 .TP
 .B --no-ignore
-Do not respect any ignore sources (common heavy directories, VCS directories, ignore files).
+Do not respect any ignore sources (common heavy paths, VCS directories, ignore files).
 .TP
 .B --ignore
 Re-enable ignore behavior (default).
 .TP
 .B --ignore-common
-Re-enable skipping common heavy directories (default).
+Re-enable skipping common heavy paths (default).
 .TP
 .B --ignore-vcs
 Re-enable skipping \fB.git\fR/\fB.hg\fR/\fB.svn\fR directories (default).
@@ -76,7 +76,7 @@ Re-enable skipping \fB.git\fR/\fB.hg\fR/\fB.svn\fR directories (default).
 Re-enable reading ignore files (default).
 .TP
 .B --no-ignore-common
-Do not skip common heavy directories (by default: \fBnode_modules\fR, \fBbuild\fR, \fBdist\fR, \fBtarget\fR, \fBtmp\fR, \fB.cache\fR).
+Do not skip common heavy paths (by default: \fBnode_modules\fR, \fBbuild\fR, \fBdist\fR, \fBtarget\fR, \fBtags\fR, \fBtmp\fR, \fB.cache\fR).
 .TP
 .B --no-ignore-files
 Do not read per-directory ignore files (\fB.gitignore\fR, \fB.ignore\fR, \fB.agignore\fR).
@@ -88,10 +88,10 @@ Note: these names are also hidden; use \fB--hidden\fR to traverse them.
 .TP
 .BR -j ", " --jobs " " \fIn\fR
 Parallel tasks.
-\fB0\fR means auto (use available CPUs, capped to 16 by default, and clamped to a hard safety limit).
+\fB0\fR means auto (use available CPUs; search is capped to 8, file-list traversal to 9, and both are clamped to a hard safety limit).
 \fBauto\fR is accepted as an alias for \fB0\fR.
 \fB1\fR forces single-threaded mode.
-Note: worker tasks spawn OS threads in this snapshot.
+Note: worker concurrency is capped to avoid scheduler and filesystem contention.
 Values above \fB1024\fR are clamped to \fB1024\fR in this snapshot.
 .TP
 .BR --threads " " \fIn\fR
@@ -142,10 +142,10 @@ Values above \fB4096\fR are clamped to \fB4096\fR in this snapshot.
 Default: \fB0\fR.
 .TP
 .B --no-file-jobs
-Disable file-batch jobs (default: enabled).
+Disable file-batch jobs (default).
 .TP
 .B --file-jobs
-Enable file-batch jobs (default).
+Enable file-batch jobs for flat, file-heavy directories.
 .TP
 .B --parallel-files
 Parallelize \fB--files\fR traversal when \fB--jobs\fR > 1.

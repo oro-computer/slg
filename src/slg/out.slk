@@ -1,12 +1,15 @@
 module slg::out;
 
+import { from_raw as bytes_from_raw } from "std/bytes";
+import { Drop } from "std/interfaces";
+import { write_all as io_write_all } from "std/io";
 import { OutOfMemory } from "std/memory";
-import std::interfaces;
-import std::runtime::mem;
-import std::runtime::posix::io;
+import mem from "std/runtime/mem";
 
 import { BufferU8 } from "./buf.slk";
-import { EINTR, errno } from "./os.slk";
+
+let STDOUT_FD: int = 1;
+let STDERR_FD: int = 2;
 
 /**
  * Write all bytes to `fd` (blocking).
@@ -27,25 +30,7 @@ export fn write_all (fd: int, ptr: u64, len: i64) -> bool {
     return false;
   }
 
-  var off: i64 = 0;
-  while off < len {
-    let n: i64 = std::runtime::posix::io::write(fd as i32, ptr + (off as u64), len - off);
-    if n < 0 {
-      if errno() == EINTR {
-        continue;
-      }
-
-      return false;
-    }
-
-    if n == 0 {
-      return false;
-    }
-
-    off = off + n;
-  }
-
-  return true;
+  return io_write_all(fd, bytes_from_raw(ptr, len)) == None;
 }
 
 /**
@@ -54,8 +39,8 @@ export fn write_all (fd: int, ptr: u64, len: i64) -> bool {
  * @returns bool `true` on success.
  */
 export fn write_str (fd: int, s: string) -> bool {
-  let ptr: u64 = std::runtime::mem::string_ptr(s);
-  let len: i64 = std::runtime::mem::string_len(s);
+  let ptr: u64 = s as raw u64;
+  let len: i64 = sizeof(s) as i64;
   return write_all(fd, ptr, len);
 }
 
@@ -64,7 +49,7 @@ export fn write_str (fd: int, s: string) -> bool {
  *
  * Notes:
  * - This is intentionally small: `slg` keeps its own buffered writer for now.
- *   `std::io::println(...)` works in this workspace, but some `std::io`
+ *   `std/io` println works in this workspace, but some `std/io`
  *   buffering primitives have hit subset/backend support gaps in past
  *   snapshots (e.g., qualified struct literals).
  */
@@ -75,12 +60,10 @@ export struct Writer {
 }
 
 fn writer_init (fd: int, color: bool, cap: i64) -> Writer? {
-  let b_opt: BufferU8? = BufferU8.init(cap);
-  if b_opt == None {
+  let move Some(b) = BufferU8.init(cap) else {
     return None;
-  }
+  };
 
-  let b: BufferU8 = b_opt ?? BufferU8.empty();
   return Some(Writer{ fd: fd, color: color, buf: b });
 }
 
@@ -89,14 +72,14 @@ impl Writer {
    * Create a stdout writer.
    */
   public fn stdout (color: bool, cap: i64 = 16384) -> Writer? {
-    return writer_init(std::runtime::posix::io::STDOUT_FD, color, cap);
+    return writer_init(STDOUT_FD, color, cap);
   }
 
 /**
    * Create a stderr writer.
    */
   public fn stderr (color: bool, cap: i64 = 8192) -> Writer? {
-    return writer_init(std::runtime::posix::io::STDERR_FD, color, cap);
+    return writer_init(STDERR_FD, color, cap);
   }
 
 /**
@@ -146,16 +129,15 @@ impl Writer {
     var n: i64 = 0;
     while v != 0 {
       let digit: u64 = v % 10;
-      tmp[n] = std::runtime::mem::trunc_u8(48 + (digit as int));
+      tmp[n] = mem::trunc_u8(48 + (digit as int));
       n = n + 1;
       v = v / 10;
     }
 
     var i: i64 = n - 1;
     while i >= 0 {
-      let err: OutOfMemory? = self.buf.push_u8(tmp[i]);
-      if err != None {
-        return err;
+      if let Some(err) = self.buf.push_u8(tmp[i]) {
+        return Some(err);
       }
 
       i = i - 1;
@@ -174,9 +156,8 @@ impl Writer {
 
     var v: u64 = 0;
     if value < 0 {
-      let err0: OutOfMemory? = self.buf.push_u8(45);
-      if err0 != None {
-        return err0;
+      if let Some(err) = self.buf.push_u8(45) {
+        return Some(err);
       }
 
       v = (0 - value) as u64;
@@ -207,7 +188,7 @@ impl Writer {
   }
 }
 
-impl Writer as std::interfaces::Drop {
+impl Writer as Drop {
   public fn drop (mut self: &Writer) -> void {
     self.buf.drop();
     self.fd = -1;

@@ -81,15 +81,15 @@ slg --follow "TODO" .
 slg --max-depth 2 "TODO" .
 
 # Parallelism control:
-#   --jobs 0|auto = auto (default; capped to 16), --jobs 1 = single-threaded, --no-parallel = --jobs 1
+#   --jobs 0|auto = auto (default; search cap 8, file-list cap 9), --jobs 1 = single-threaded, --no-parallel = --jobs 1
 #   --threads is an alias for --jobs
 #   --max-workers 0 = no cap (default; capped by --jobs-1), --max-workers >= 1 caps worker tasks (clamped to 1023)
 #   --split-depth 0|auto = auto (default), --split-depth 1..8 bounds how deep the orchestrator splits directory subtrees into jobs
 #   --queue-cap 0|auto = auto (default), --queue-cap >= 1 sets the bounded job queue capacity
 #   --target-jobs 0|auto = auto (default), --target-jobs >= 1 stops splitting deeper once this many subtrees have been scheduled (enqueued + in-thread)
 #   --max-jobs-total 0|auto = auto (default), --max-jobs-total >= 1 caps the total number of enqueued jobs across the run
-#   --file-batch 0|auto = auto (default; currently 256), --file-batch >= 1 sets files per file-batch job (flat, file-heavy dirs)
-#   --no-file-jobs disables file-batch jobs, --file-jobs re-enables them (default: on)
+#   --file-batch 0|auto = auto (default; currently 512), --file-batch >= 1 sets files per file-batch job (flat, file-heavy dirs)
+#   --file-jobs enables file-batch jobs for flat, file-heavy dirs (default: off)
 #   Note: in this snapshot, --jobs is clamped to 1024 (hard safety limit)
 #   --parallel-files enables parallel traversal for --files when jobs > 1
 slg --jobs 1 "TODO" .
@@ -127,8 +127,8 @@ Use `--text` to force searching those files anyway.
 
 ## Ignores
 
-By default, `slg` skips a small set of common “heavy” directories:
-`node_modules`, `build`, `dist`, `target`, `tmp`, `.cache`.
+By default, `slg` skips a small set of common “heavy” paths:
+`node_modules`, `build`, `dist`, `target`, `tags`, `tmp`, `.cache`.
 
 Use `--no-ignore-common` to include them.
 
