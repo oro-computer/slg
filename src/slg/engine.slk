@@ -54,12 +54,7 @@ import {
   push_dir as ignore_push_dir,
   push_dir_cached as ignore_push_dir_cached,
 } from "./ignore.slk";
-import {
-  memchr,
-  memcmp,
-  memcpy,
-  memmem,
-} from "./os.slk";
+import { memchr, memcpy, memmem } from "./os.slk";
 import { Writer } from "./out.slk";
 import {
   Match,
@@ -676,56 +671,6 @@ fn complete_line_prefix_len (ptr: u64, len: i64) -> i64 {
   return 0;
 }
 
-fn fixed_anchor_score (b: u8) -> int {
-  // Lower scores are better anchors for typical source text.
-  if b == 120 || b == 122 || b == 113 || b == 106 { // x z q j
-    return 1;
-  }
-
-  if b == 107 || b == 118 || b == 98 || b == 112 || b == 121 { // k v b p y
-    return 2;
-  }
-
-  if b == 103 || b == 102 || b == 119 || b == 109 || b == 99 { // g f w m c
-    return 3;
-  }
-
-  if b == 117 || b == 100 || b == 108 || b == 114 || b == 115 { // u d l r s
-    return 5;
-  }
-
-  if b == 110 || b == 105 || b == 111 || b == 97 || b == 116 || b == 101 { // n i o a t e
-    return 9;
-  }
-
-  if b == 32 || b == 9 || b == 10 || b == 95 || b == 45 { // whitespace, _, -
-    return 10;
-  }
-
-  return 4;
-}
-
-fn fixed_anchor_offset (needle_ptr: u64, needle_len: i64) -> i64 {
-  var best_off: i64 = 0;
-  var best_score: int = 1000;
-  var i: i64 = 0;
-  while i < needle_len {
-    let b: u8 = mem::load_u8(needle_ptr, i);
-    let score: int = fixed_anchor_score(b);
-    if score < best_score {
-      best_score = score;
-      best_off = i;
-      if score == 1 {
-        return best_off;
-      }
-    }
-
-    i = i + 1;
-  }
-
-  return best_off;
-}
-
 fn find_fixed_case_sensitive (hay_ptr: u64, hay_len: i64, needle_ptr: u64, needle_len: i64) -> u64 {
   if hay_ptr == 0 || needle_ptr == 0 {
     return 0;
@@ -744,55 +689,9 @@ fn find_fixed_case_sensitive (hay_ptr: u64, hay_len: i64, needle_ptr: u64, needl
     return memchr(hay_ptr, b as int, hay_len);
   }
 
-  if needle_len >= 3 {
-    let anchor_off: i64 = fixed_anchor_offset(needle_ptr, needle_len);
-    let anchor: u8 = mem::load_u8(needle_ptr, anchor_off);
-    let first: u8 = mem::load_u8(needle_ptr, 0);
-    let last: u8 = mem::load_u8(needle_ptr, needle_len - 1);
-    let last_start: i64 = hay_len - needle_len;
-    var search_off: i64 = anchor_off;
-    while search_off < hay_len {
-      let tail_ptr: u64 = hay_ptr + (search_off as u64);
-      let tail_len: i64 = hay_len - search_off;
-      let p: u64 = memchr(tail_ptr, anchor as int, tail_len);
-      if p == 0 {
-        return 0;
-      }
-
-      let anchor_at: i64 = (p - hay_ptr) as i64;
-      if anchor_at >= anchor_off {
-        let cand: i64 = anchor_at - anchor_off;
-        if cand <= last_start {
-          let cand_ptr: u64 = hay_ptr + (cand as u64);
-          if mem::load_u8(cand_ptr, 0) == first && mem::load_u8(cand_ptr, needle_len - 1) == last {
-            var equal: bool = true;
-            if needle_len <= 8 {
-              // Avoid a libc call for the common short-needle path.
-              var i: i64 = 1;
-              while i < needle_len - 1 && equal {
-                if mem::load_u8(cand_ptr, i) != mem::load_u8(needle_ptr, i) {
-                  equal = false;
-                } else {
-                  i = i + 1;
-                }
-              }
-            } else {
-              equal = memcmp(cand_ptr, needle_ptr, needle_len as u64) == 0;
-            }
-
-            if equal {
-              return cand_ptr;
-            }
-          }
-        }
-      }
-
-      search_off = anchor_at + 1;
-    }
-
-    return 0;
-  }
-
+  // `std/bytes::memmem` is backed by the runtime's optimized substring search.
+  // It is faster than the previous per-call anchored loop on large `-l`
+  // searches, where this helper runs once per candidate file.
   return memmem(hay_ptr, hay_len, needle_ptr, needle_len);
 }
 
@@ -3997,13 +3896,19 @@ fn resolve_jobs (cfg: &Config) -> int {
   //   machines.
   // - Search mode benefits from some worker concurrency because file opens and
   //   prefix reads are I/O-heavy, but too many workers can still lose to task
-  //   scheduling and filesystem contention.
+  //   scheduling and filesystem contention. `-l` can use a little more
+  //   concurrency because it stops at the first match per file and emits far
+  //   less output than normal match-line mode.
   // - File-list mode stays conservative because it is mostly traversal +
   //   output and defaults to single-threaded unless `--parallel-files` is set.
   // - Users can always override via `--jobs N`.
   let auto_jobs_cap: int =
   if cfg.mode == Mode::Search {
-    8 // 7 workers + 1 orchestrator
+    if cfg.files_with_matches {
+      16 // 15 workers + 1 orchestrator
+    } else {
+      8 // 7 workers + 1 orchestrator
+    }
   } else {
     9 // 8 workers + 1 orchestrator
   };
@@ -4080,7 +3985,11 @@ export async fn run_parallel (cfg: Config) -> int {
     // because otherwise one worker can inherit a large subtree and dominate
     // the tail of the run while the other workers sit idle.
     split_depth = if mode == Mode::Search {
-      4
+      if cfg.files_with_matches {
+        5
+      } else {
+        4
+      }
     } else {
       2
     };
@@ -4099,7 +4008,11 @@ export async fn run_parallel (cfg: Config) -> int {
     // Auto mode: keep the orchestrator’s splitting work bounded while still
     // creating enough parallel work to keep workers busy.
     if mode == Mode::Search {
-      target_jobs = 512;
+      target_jobs = if cfg.files_with_matches {
+        2048
+      } else {
+        512
+      };
     } else {
       // File-list mode is output-heavy and remains more conservative.
       target_jobs = worker_budget * 4;

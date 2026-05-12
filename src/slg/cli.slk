@@ -265,7 +265,7 @@ TRAVERSAL OPTIONS:
       --no-ignore-files     Do not read .gitignore/.ignore/.agignore ignore files
 
 PARALLELISM:
-  -j, --jobs <n>            Parallel tasks (0|auto = auto (search cap 8, file-list cap 9), 1 = single-threaded, max: 1024)
+  -j, --jobs <n>            Parallel tasks (0|auto = auto (search cap 8, -l cap 16, file-list cap 9), 1 = single-threaded, max: 1024)
                             Note: worker concurrency is capped to avoid scheduler and filesystem contention.
       --threads <n>         Alias for --jobs
       --max-workers <n>     Cap worker tasks (0 = no cap, default: 0, max effective: 1023)
